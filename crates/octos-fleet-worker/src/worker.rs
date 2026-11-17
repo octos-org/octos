@@ -1183,22 +1183,52 @@ mod tests {
     use super::*;
     use crate::testutil::*;
     use octos_agent::sandbox::NoSandbox;
-    use octos_fleet::{AttemptStatus, ChildStatus};
+    use octos_fleet::{AcceptanceCriterion, AttemptStatus, ChildStatus};
+    use octos_llm::LlmProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
-
-    /// A fresh, empty escalation slot for a `run_attempt` call. The agent writes
-    /// into it via the `escalate` valve; `run_attempt` reads it after the turn.
-    fn slot() -> EscalationSlot {
-        Arc::new(Mutex::new(None))
-    }
 
     /// A fresh, shared token tracker for a `run_attempt` call. The pool creates
     /// one per attempt and shares it into the LaunchGuard; these direct-call
     /// tests only need the agent to have somewhere to fold its token counts.
     fn tracker() -> Arc<TokenTracker> {
         Arc::new(TokenTracker::new())
+    }
+
+    /// The shared direct-`run_attempt` invocation for the tests below: fleet
+    /// `f1` / task `a`, the fixed owner epoch + test clock, and a fresh
+    /// escalation slot + token tracker per run. `worktree` is `None` for the
+    /// scratch-cwd fallback; `Some` only for the grant-threading probe (whose
+    /// dummy ctx never reaches a real populate).
+    #[allow(clippy::too_many_arguments)] // mirrors run_attempt's own irreducible inputs
+    async fn run_scratch_attempt(
+        store: &Arc<FleetKernelStore>,
+        view: &TaskView,
+        attempt: &str,
+        factory: &AgentFactory,
+        work: &TempDir,
+        worktree: Option<&WorktreeContext>,
+        deadline: Duration,
+        reserved: u64,
+    ) -> AttemptOutcome {
+        run_attempt(
+            store.clone(),
+            "f1",
+            "a",
+            attempt,
+            view,
+            factory,
+            work.path(),
+            worktree,
+            deadline,
+            EPOCH,
+            slot(),
+            tracker(),
+            reserved,
+            || NOW,
+        )
+        .await
     }
 
     #[test]
@@ -1324,21 +1354,15 @@ mod tests {
             // The factory records the grant BEFORE any populate/agent step, so a
             // dummy worktree ctx (populate will no-op/fail on this non-repo tmp
             // dir) still captures the intended `repo_git_dir`.
-            let _ = run_attempt(
-                store.clone(),
-                "f1",
-                "a",
-                &attempt,
+            let _ = run_scratch_attempt(
+                &store,
                 &task_view,
+                &attempt,
                 &factory,
-                work.path(),
+                &work,
                 worktree.as_ref(),
                 Duration::from_secs(30),
-                EPOCH,
-                slot(),
-                tracker(),
                 PROJECTED,
-                || NOW,
             )
             .await;
         }
@@ -1416,21 +1440,15 @@ mod tests {
         let (_md, factory) = factory_for(Arc::new(WriteFileProvider::new("out.txt"))).await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
 
@@ -1499,21 +1517,15 @@ mod tests {
         );
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         // Platform-true verdict pin: on Unix the CommandExit validator runs and
@@ -1550,146 +1562,109 @@ mod tests {
     /// #1857 PR 5a fix (H1, codex round 2) — ATTEMPT-TIME fail-closed: the boot
     /// probe checks ONE sandbox, but the factory rebuilds the sandbox per attempt
     /// and `Auto` can fall through to `NoSandbox` if the backend vanished AFTER
-    /// boot. A no-op sandbox at attempt time must TERMINATE the attempt WITHOUT
-    /// building or running the agent — never run a fleet worker unsandboxed.
+    /// boot. A sandbox that cannot isolate at attempt time must TERMINATE the
+    /// attempt WITHOUT building or running the agent — never run a fleet worker
+    /// unsandboxed. Table rows:
+    /// - `run_attempt_terminates_when_sandbox_is_not_isolating`: a genuine no-op
+    ///   sandbox (the H1 gate).
+    /// - `run_attempt_terminates_when_sandbox_resolution_refuses`: a REFUSING
+    ///   sandbox resolution (explicit mode unhonorable on this host, or
+    ///   `sandbox.fail_closed` with no backend). Its `is_noop()` is `false`
+    ///   (nothing runs unconfined), so without the dedicated refusal check the
+    ///   agent would be built and every command would refuse one by one; the
+    ///   termination carries the typed refusal ("sandbox unavailable").
     #[tokio::test]
-    async fn run_attempt_terminates_when_sandbox_is_not_isolating() {
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], file_exists("out.txt"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, memory) = fresh_memory().await;
-        // A genuine no-op sandbox + a provider that MUST NOT be called: proving
-        // the attempt aborts BEFORE the agent (and thus any LLM call) is built.
-        let calls = Arc::new(AtomicUsize::new(0));
-        let factory = AgentFactory::new(
-            Arc::new(CountingProvider {
-                calls: calls.clone(),
-            }),
-            memory,
-            Arc::new(|_, _| Arc::new(NoSandbox) as Arc<dyn Sandbox>),
-        );
-        let task_view = view_of(&fleet, "a").await;
-
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Terminated { .. }
-                }
-            ),
-            "a no-op sandbox must Terminate the attempt, got {outcome:?}",
-        );
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "the agent/LLM must NEVER run under a no-op sandbox",
-        );
-        // Recorded via the normal completion path: the child ends terminal
-        // (Failed), not silently left running unsandboxed.
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
-    }
-
-    /// Fail-closed twin of the no-op gate: a REFUSING sandbox resolution at
-    /// attempt time (explicit mode unhonorable on this host, or
-    /// `sandbox.fail_closed` with no backend) must also terminate the attempt
-    /// before the agent is built — its `is_noop()` is `false` (nothing runs
-    /// unconfined), so without the dedicated refusal check the agent would be
-    /// built and every command would refuse one by one.
-    #[tokio::test]
-    async fn run_attempt_terminates_when_sandbox_resolution_refuses() {
+    async fn run_attempt_terminates_when_sandbox_cannot_isolate() {
         use octos_agent::sandbox::{RefusingSandbox, SandboxUnavailable};
 
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], file_exists("out.txt"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
+        let rows: Vec<(&str, crate::SandboxFactory, Option<&str>)> = vec![
+            // A genuine no-op sandbox (NoSandbox) — no refusal reason; the
+            // no-op gate fires first.
+            (
+                "no-op sandbox",
+                Arc::new(|_: &Path, _: SandboxGrant| Arc::new(NoSandbox) as Arc<dyn Sandbox>)
+                    as crate::SandboxFactory,
+                None,
+            ),
+            // A refusing sandbox resolution (RefusingSandbox with a typed
+            // SandboxUnavailable) — the termination must carry the refusal.
+            (
+                "refusing resolution",
+                Arc::new(|_: &Path, _: SandboxGrant| {
+                    Arc::new(RefusingSandbox {
+                        error: SandboxUnavailable {
+                            requested: "landlock".to_string(),
+                            reason: "test refusal".to_string(),
+                            remediation: "install a backend".to_string(),
+                        },
+                    }) as Arc<dyn Sandbox>
+                }) as crate::SandboxFactory,
+                Some("sandbox unavailable"),
+            ),
+        ];
 
-        let work = TempDir::new().unwrap();
-        let (_md, memory) = fresh_memory().await;
-        let calls = Arc::new(AtomicUsize::new(0));
-        let factory = AgentFactory::new(
-            Arc::new(CountingProvider {
-                calls: calls.clone(),
-            }),
-            memory,
-            Arc::new(|_, _| {
-                Arc::new(RefusingSandbox {
-                    error: SandboxUnavailable {
-                        requested: "landlock".to_string(),
-                        reason: "test refusal".to_string(),
-                        remediation: "install a backend".to_string(),
-                    },
-                }) as Arc<dyn Sandbox>
-            }),
-        );
-        let task_view = view_of(&fleet, "a").await;
+        for (name, sandbox_factory, expect_reason_substring) in rows {
+            let (_sd, store) = fresh_store().await;
+            let fleet = create_fleet(
+                store.clone(),
+                "f1",
+                vec![task_spec("a", &[], file_exists("out.txt"))],
+            )
+            .await;
+            let attempt = launch(&store, "f1", "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
+            let work = TempDir::new().unwrap();
+            let (_md, memory) = fresh_memory().await;
+            // A provider that MUST NOT be called: proving the attempt aborts
+            // BEFORE the agent (and thus any LLM call) is built.
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory = AgentFactory::new(
+                Arc::new(CountingProvider {
+                    calls: calls.clone(),
+                }),
+                memory,
+                sandbox_factory,
+            );
+            let task_view = view_of(&fleet, "a").await;
 
-        match outcome {
-            AttemptOutcome::Completed {
-                verdict: AcceptanceVerdict::Terminated { ref reason, .. },
-            } => {
-                assert!(
-                    reason.contains("sandbox unavailable"),
-                    "termination carries the typed refusal: {reason}"
-                );
+            let outcome = run_scratch_attempt(
+                &store,
+                &task_view,
+                &attempt,
+                &factory,
+                &work,
+                None,
+                Duration::from_secs(30),
+                PROJECTED,
+            )
+            .await;
+
+            match outcome {
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Terminated { ref reason, .. },
+                } => {
+                    if let Some(want) = expect_reason_substring {
+                        assert!(
+                            reason.contains(want),
+                            "[{name}] termination carries the typed refusal: {reason}"
+                        );
+                    }
+                }
+                other => panic!(
+                    "[{name}] a sandbox that cannot isolate must Terminate the attempt, \
+                     got {other:?}"
+                ),
             }
-            other => panic!("a refusing sandbox must Terminate the attempt, got {other:?}"),
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "[{name}] the agent/LLM must NEVER run under a sandbox that cannot isolate",
+            );
+            // Recorded via the normal completion path: the child ends terminal
+            // (Failed), not silently left running unsandboxed.
+            let child = store.get_child("f1", "a").await.unwrap().unwrap();
+            assert_eq!(child.status, ChildStatus::Failed, "[{name}]");
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "the agent/LLM must never run under a refusing sandbox",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
     }
 
     #[cfg(unix)]
@@ -1732,21 +1707,15 @@ mod tests {
         let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(2),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         assert!(
@@ -1769,105 +1738,72 @@ mod tests {
         );
     }
 
+    /// The acceptance gate fails closed — a run that "succeeded" but did not
+    /// satisfy its criteria ends `Rejected` (never passed on the agent's own
+    /// self-report). Table rows:
+    /// - `run_attempt_rejects_when_acceptance_fails`: `file_exists("out.txt")`
+    ///   — SuccessProvider ends the turn WITHOUT writing out.txt, so the run
+    ///   succeeds but the FileExists gate fails.
+    /// - `run_attempt_rejects_unsupported_validator_ref`: `validator_ref("tests")`
+    ///   — P1-5a: a `ValidatorRef`-only task the executor cannot mechanically
+    ///   verify fails closed (Rejected), even though the run succeeded.
+    /// The snapshot assertions are UNIFORM for both rows: all `Rejected`
+    /// verdicts flow through the same `complete_child` snapshot write.
     #[tokio::test]
-    async fn run_attempt_rejects_when_acceptance_fails() {
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], file_exists("out.txt"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
+    async fn run_attempt_rejects_on_failed_or_unsupported_acceptance() {
+        let rows: Vec<(&str, Vec<AcceptanceCriterion>)> = vec![
+            // Failed FileExists acceptance (artifact never written).
+            ("acceptance fails", file_exists("out.txt")),
+            // Unsupported ValidatorRef acceptance (fail closed).
+            ("unsupported ValidatorRef", validator_ref("tests")),
+        ];
 
-        let work = TempDir::new().unwrap();
-        // SuccessProvider ends the turn WITHOUT writing out.txt, so the run
-        // succeeds but the FileExists gate fails.
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let task_view = view_of(&fleet, "a").await;
+        for (name, acceptance) in rows {
+            let (_sd, store) = fresh_store().await;
+            let fleet =
+                create_fleet(store.clone(), "f1", vec![task_spec("a", &[], acceptance)]).await;
+            let attempt = launch(&store, "f1", "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
+            let work = TempDir::new().unwrap();
+            // SuccessProvider ends the turn successfully in both rows — only the
+            // gate distinguishes them.
+            let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
+            let task_view = view_of(&fleet, "a").await;
 
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Rejected { .. }
-                }
-            ),
-            "expected Completed/Rejected, got {outcome:?}",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
-        let att = store.get_attempt("a", &attempt).await.unwrap().unwrap();
-        let snap = att.result_snapshot.expect("snapshot recorded");
-        assert!(!snap.success, "rejected snapshot must record failure");
-        assert!(snap.error.is_some(), "rejection reason must be recorded");
-    }
+            let outcome = run_scratch_attempt(
+                &store,
+                &task_view,
+                &attempt,
+                &factory,
+                &work,
+                None,
+                Duration::from_secs(30),
+                PROJECTED,
+            )
+            .await;
 
-    #[tokio::test]
-    async fn run_attempt_rejects_unsupported_validator_ref() {
-        // P1-5a: a `ValidatorRef`-only task must NOT pass on the run's own
-        // self-report — the executor cannot verify it, so the gate fails
-        // closed (Rejected), even though the run succeeded.
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(
-            store.clone(),
-            "f1",
-            vec![task_spec("a", &[], validator_ref("tests"))],
-        )
-        .await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
-        let task_view = view_of(&fleet, "a").await;
-
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-
-        assert!(
-            matches!(
-                outcome,
-                AttemptOutcome::Completed {
-                    verdict: AcceptanceVerdict::Rejected { .. }
-                }
-            ),
-            "unsupported ValidatorRef must fail closed, got {outcome:?}",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(child.status, ChildStatus::Failed);
+            assert!(
+                matches!(
+                    outcome,
+                    AttemptOutcome::Completed {
+                        verdict: AcceptanceVerdict::Rejected { .. }
+                    }
+                ),
+                "[{name}] expected Completed/Rejected, got {outcome:?}",
+            );
+            let child = store.get_child("f1", "a").await.unwrap().unwrap();
+            assert_eq!(child.status, ChildStatus::Failed, "[{name}]");
+            let att = store.get_attempt("a", &attempt).await.unwrap().unwrap();
+            let snap = att.result_snapshot.expect("snapshot recorded");
+            assert!(
+                !snap.success,
+                "[{name}] rejected snapshot must record failure"
+            );
+            assert!(
+                snap.error.is_some(),
+                "[{name}] rejection reason must be recorded"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1884,21 +1820,15 @@ mod tests {
         .await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_millis(200),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
 
@@ -1935,21 +1865,15 @@ mod tests {
         let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
 
@@ -1989,21 +1913,15 @@ mod tests {
         let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         assert!(
@@ -2030,128 +1948,90 @@ mod tests {
         assert!(!b_attempt.is_empty(), "successor must be launchable");
     }
 
+    /// An escalation settle is budget-honest and deterministic. Table rows:
+    /// - `escalation_settle_never_zero_when_tokens_used` (codex round-4, defect
+    ///   1): a real-usage attempt that escalates must NEVER commit 0 — even when
+    ///   it RESERVED 0 tokens (launched with projected_tokens = 0, the corner the
+    ///   reservation floor cannot cover, so real usage MUST carry the settle).
+    ///   The provider escalates on turn 1 with real usage (7 in + 3 out = 10
+    ///   tracked tokens).
+    /// - `escalation_wins_regardless_of_turn_end` (DETERMINISM, codex round-2):
+    ///   even when the turn ends by hitting the DEADLINE (not a clean EndTurn), a
+    ///   recorded escalation still wins — run_attempt settles escalated, never
+    ///   Terminated. The provider escalates on turn 1, then sleeps 30s so the 2s
+    ///   deadline fires while the slot is already set; the settle commits the
+    ///   REAL tokens spent BEFORE the timeout (tracked live), never 0.
     #[tokio::test]
-    async fn escalation_settle_never_zero_when_tokens_used() {
-        // codex round-4 (defect 1): a real-usage attempt that escalates must NEVER
-        // commit 0 — even when it RESERVED 0 tokens. The settle reads the live
-        // shared tracker (the agent's real spend) reliably; it can only settle 0
-        // when reserved==0 AND nothing was tracked. Here the provider reports real
-        // usage, so the committed tokens must be > 0 despite the 0 reservation —
-        // otherwise the reservation would be released while committing nothing and
-        // a fresh post-grant attempt could double-spend.
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
+    async fn escalation_settles_real_tokens_and_wins_regardless_of_turn_end() {
+        // (row name, provider, attempt deadline, reserved tokens at launch)
+        let rows: Vec<(&str, Arc<dyn LlmProvider>, Duration, u64)> = vec![
+            (
+                "zero reservation, real usage",
+                Arc::new(EscalateProvider::new("blocked, but I did real work")),
+                Duration::from_secs(30),
+                0,
+            ),
+            (
+                "deadline-ended turn",
+                Arc::new(EscalateProvider::then_sleeping(
+                    "blocked past the deadline",
+                    Duration::from_secs(30),
+                )),
+                Duration::from_secs(2),
+                PROJECTED,
+            ),
+        ];
 
-        // Launch with a ZERO reservation (projected_tokens = 0) — the corner the
-        // reservation floor cannot cover, so real usage MUST carry the settle.
-        let attempt = match store
-            .launch_child("f1", "a", 0, NOW, EPOCH, TTL)
-            .await
-            .unwrap()
-        {
-            octos_fleet::LaunchOutcome::Launched { attempt_id } => attempt_id,
-            other => panic!("expected Launched, got {other:?}"),
-        };
+        for (name, provider, deadline, reserved) in rows {
+            let (_sd, store) = fresh_store().await;
+            let fleet = create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
 
-        let work = TempDir::new().unwrap();
-        // Escalates on turn 1 with real usage (7 in + 3 out = 10 tracked tokens).
-        let (_md, factory) = factory_for(Arc::new(EscalateProvider::new(
-            "blocked, but I did real work",
-        )))
-        .await;
-        let task_view = view_of(&fleet, "a").await;
+            // The 0-reservation row launches with projected_tokens = 0 (the
+            // corner the reservation floor cannot cover); the other takes the
+            // standard PROJECTED reservation.
+            let attempt = if reserved == 0 {
+                match store
+                    .launch_child("f1", "a", 0, NOW, EPOCH, TTL)
+                    .await
+                    .unwrap()
+                {
+                    octos_fleet::LaunchOutcome::Launched { attempt_id } => attempt_id,
+                    other => panic!("[{name}] expected Launched, got {other:?}"),
+                }
+            } else {
+                launch(&store, "f1", "a").await
+            };
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
-            0, // reserved_tokens: this attempt reserved ZERO
-            || NOW,
-        )
-        .await;
-        assert!(
-            matches!(outcome, AttemptOutcome::Escalated { .. }),
-            "got {outcome:?}",
-        );
+            let work = TempDir::new().unwrap();
+            let (_md, factory) = factory_for(provider).await;
+            let task_view = view_of(&fleet, "a").await;
 
-        // Despite the 0 reservation, the REAL tracked usage was committed (> 0).
-        let fleet_rec = store.get_fleet("f1").await.unwrap().unwrap();
-        assert!(
-            fleet_rec.budget.tokens_committed > 0,
-            "a real-usage escalation must commit > 0 even with a 0 reservation (committed={})",
-            fleet_rec.budget.tokens_committed,
-        );
-        assert_eq!(
-            store.get_child("f1", "a").await.unwrap().unwrap().status,
-            ChildStatus::Blocked,
-        );
-    }
+            let outcome = run_scratch_attempt(
+                &store, &task_view, &attempt, &factory, &work, None, deadline, reserved,
+            )
+            .await;
+            assert!(
+                matches!(outcome, AttemptOutcome::Escalated { .. }),
+                "[{name}] a recorded escalation must win (even over a deadline-ended turn), \
+                 got {outcome:?}",
+            );
 
-    #[tokio::test]
-    async fn escalation_wins_regardless_of_turn_end() {
-        // DETERMINISM: even when the turn ends by hitting the DEADLINE (not a
-        // clean EndTurn), a recorded escalation still wins — run_attempt settles
-        // escalated, never Terminated. The provider escalates on turn 1, then
-        // sleeps 30s so the 2s deadline fires while the slot is already set.
-        let (_sd, store) = fresh_store().await;
-        let fleet = create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
-        let attempt = launch(&store, "f1", "a").await;
-
-        let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(EscalateProvider::then_sleeping(
-            "blocked past the deadline",
-            Duration::from_secs(30),
-        )))
-        .await;
-        let task_view = view_of(&fleet, "a").await;
-
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
-            &task_view,
-            &factory,
-            work.path(),
-            None,
-            Duration::from_secs(2),
-            EPOCH,
-            slot(),
-            tracker(),
-            PROJECTED,
-            || NOW,
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, AttemptOutcome::Escalated { .. }),
-            "a deadline-ended turn with a set escalation slot must still escalate, got {outcome:?}",
-        );
-        let child = store.get_child("f1", "a").await.unwrap().unwrap();
-        assert_eq!(
-            child.status,
-            ChildStatus::Blocked,
-            "the escalation wins over the deadline terminate",
-        );
-        // BUDGET HONESTY (codex round-2): even though the turn ended by TIMEOUT
-        // (the TaskResult was dropped), the escalation settled the REAL tokens the
-        // agent spent BEFORE the timeout — captured live via the CostUpdate
-        // reporter — NOT 0. A 0-commit would let the fresh post-grant attempt
-        // spend the whole budget twice.
-        let fleet_rec = store.get_fleet("f1").await.unwrap().unwrap();
-        assert!(
-            fleet_rec.budget.tokens_committed > 0,
-            "a timeout-escalation must settle the REAL tokens used, never 0",
-        );
+            // The escalation wins over any terminate: the child is Blocked,
+            // parked on the operator's grant decision.
+            let child = store.get_child("f1", "a").await.unwrap().unwrap();
+            assert_eq!(child.status, ChildStatus::Blocked, "[{name}]");
+            // BUDGET HONESTY: the settle committed the REAL tokens used (> 0)
+            // despite a 0 reservation / a timeout-dropped TaskResult — a
+            // 0-commit would release the reservation while committing nothing,
+            // letting the fresh post-grant attempt double-spend the budget.
+            let fleet_rec = store.get_fleet("f1").await.unwrap().unwrap();
+            assert!(
+                fleet_rec.budget.tokens_committed > 0,
+                "[{name}] the escalation must settle the REAL tokens used, never 0 \
+                 (committed={})",
+                fleet_rec.budget.tokens_committed,
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2185,21 +2065,15 @@ mod tests {
         let (_md, factory) = factory_for(Arc::new(EscalateProvider::new("blocked"))).await;
         let task_view = view_of(&fleet, "a").await;
 
-        let outcome = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &attempt,
+        let outcome = run_scratch_attempt(
+            &store,
             &task_view,
+            &attempt,
             &factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         assert!(
@@ -2239,21 +2113,15 @@ mod tests {
             !view1.grant.tools.contains(&"web_fetch".to_string()),
             "attempt 1 is minimal — no web_fetch",
         );
-        let out1 = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &a1,
+        let out1 = run_scratch_attempt(
+            &store,
             &view1,
+            &a1,
             &esc_factory,
-            work.path(),
+            &work,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         assert!(
@@ -2303,21 +2171,15 @@ mod tests {
         )))
         .await;
         let work2 = TempDir::new().unwrap();
-        let out2 = run_attempt(
-            store.clone(),
-            "f1",
-            "a",
-            &a2,
+        let out2 = run_scratch_attempt(
+            &store,
             &view2,
+            &a2,
             &write_factory,
-            work2.path(),
+            &work2,
             None,
             Duration::from_secs(30),
-            EPOCH,
-            slot(),
-            tracker(),
             PROJECTED,
-            || NOW,
         )
         .await;
         assert!(

@@ -252,14 +252,20 @@ pub fn build_fleet_worker_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::slot;
     use octos_agent::sandbox::NoSandbox;
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    /// A fresh, empty escalation slot for a test build.
-    fn slot() -> EscalationSlot {
-        Arc::new(Mutex::new(None))
+    /// A registry build over a no-op sandbox with the default 30s shell cap and
+    /// a fresh escalation slot — the shared setup for the registry tests below.
+    fn build_worker_registry(
+        cwd: &Path,
+        grant: &WorkerGrant,
+        violation_sink: Option<WriteGrantViolationSink>,
+    ) -> Result<ToolRegistry> {
+        build_fleet_worker_registry(cwd, Arc::new(NoSandbox), 30, grant, slot(), violation_sink)
     }
 
     /// The audit key for a worker registry: the granted tools PLUS the always-on
@@ -340,15 +346,8 @@ mod tests {
         // base seven, workspace-write, no network tools. The audit compares
         // against `grant.sorted_tools()` (== the old `ALLOWED` for minimal).
         let grant = WorkerGrant::minimal();
-        let reg = build_fleet_worker_registry(
-            Path::new("/tmp/fleet-worker-audit"),
-            Arc::new(NoSandbox),
-            30,
-            &grant,
-            slot(),
-            None,
-        )
-        .expect("minimal grant builds");
+        let reg = build_worker_registry(Path::new("/tmp/fleet-worker-audit"), &grant, None)
+            .expect("minimal grant builds");
 
         // EXHAUSTIVE: the registry contains EXACTLY the granted tools PLUS the
         // always-on `escalate` valve (PR B) — nothing more.
@@ -421,14 +420,7 @@ mod tests {
             tools: vec!["read_file".into(), "definitely_not_a_tool".into()],
             ..WorkerGrant::minimal()
         };
-        let result = build_fleet_worker_registry(
-            Path::new("/tmp/fleet-bad"),
-            Arc::new(NoSandbox),
-            30,
-            &grant,
-            slot(),
-            None,
-        );
+        let result = build_worker_registry(Path::new("/tmp/fleet-bad"), &grant, None);
         let err = result
             .err()
             .expect("unknown tool must be rejected")
@@ -445,15 +437,8 @@ mod tests {
     /// (before any child is spawned).
     #[tokio::test]
     async fn closed_worker_shell_refuses_background() {
-        let reg = build_fleet_worker_registry(
-            &std::env::temp_dir(),
-            Arc::new(NoSandbox),
-            30,
-            &WorkerGrant::minimal(),
-            slot(),
-            None,
-        )
-        .expect("minimal grant builds");
+        let reg = build_worker_registry(&std::env::temp_dir(), &WorkerGrant::minimal(), None)
+            .expect("minimal grant builds");
         let shell = reg.get("shell").expect("shell tool present");
 
         let explicit = shell
@@ -495,12 +480,9 @@ mod tests {
         };
         let seen: Arc<Mutex<Vec<WriteGrantViolation>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
-        let reg = build_fleet_worker_registry(
+        let reg = build_worker_registry(
             cwd.path(),
-            Arc::new(NoSandbox),
-            30,
             &grant,
-            slot(),
             Some(Arc::new(move |v| sink_seen.lock().unwrap().push(v))),
         )
         .expect("fenced grant builds");
