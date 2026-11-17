@@ -46,14 +46,14 @@ Categories: **1** cross-system; **2** cross-feature; **3** authorization/securit
 | 1 | `tests/bundled_manifests_validate.rs::bundled_app_skills_manifests_pass_strict_validator` | Real bundled app-skill manifests all pass the strict production validator. |
 | 3 | `tests/lifecycle_sandbox.rs::blocked_env_vars_match_core_canonical_list` | Plugin lifecycle and core share the canonical forbidden-environment list. |
 | 1 | `tests/lifecycle_sandbox.rs::pick_and_place_lifecycle_example_runs_end_to_end` | A real lifecycle example runs through the sandboxed process chain end to end. |
-| 4 | `tests/lifecycle_sandbox.rs::should_abort_phase_when_critical_step_fails` | A critical lifecycle step failure aborts the phase instead of continuing into an invalid state. |
-| 5 | `tests/lifecycle_sandbox.rs::should_continue_phase_when_non_critical_step_fails` | The intentional non-critical failure policy continues without hiding the step outcome. |
+| 4 | `tests/lifecycle_sandbox.rs::critical_step_failure_aborts_phase_but_non_critical_continues` | Same three-step chain exercises both criticality policies with all assertions inline: a critical failure aborts the phase and the trailing step never dispatches; a non-critical failure is recorded (`Ok/Failed/Ok`) and the phase completes. |
+| 3 | `tests/lifecycle_sandbox.rs::lifecycle_env_allowlist_drops_secret_and_backend_injected_values` | The declared env allowlist keeps manifest-declared variables while stripping inherited credentials and backend-injected secrets before child execution (added by #3202; recorded here so the inventory matches `--list`). |
 | 3 | `tests/lifecycle_sandbox.rs::should_apply_blocked_env_vars_to_lifecycle_steps` | Forbidden environment values are stripped before real lifecycle child execution. |
 | 4 | `tests/lifecycle_sandbox.rs::should_kill_child_when_step_timeout_exceeded` | Timeout kills the child process instead of leaving orphaned work after cancellation. |
 | 3 | `tests/lifecycle_sandbox.rs::should_not_dispatch_when_safepolicy_denies_with_extra_whitespace` | Whitespace-mangled dangerous commands cannot bypass SafePolicy dispatch denial. |
 | 3 | `tests/lifecycle_sandbox.rs::should_run_preflight_steps_through_sandbox` | Preflight commands execute through the sandbox rather than an unconfined host path. |
 
-共 **34 项**。
+共 **34 项**（第二轮去重 T-0647 后：critical/非critical 失败策略两测同链路合并为一名，断言全保留；补记 #3202 引入的 allowlist 测试；shared setup：`strict_input_errors`、`sign_with`、`discover_from_user_root`、`recording_executor`，无生产接口改动）。
 
 ## Cross-cutting audit
 

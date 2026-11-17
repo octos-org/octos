@@ -13,6 +13,18 @@ import { loadFixtureJson, normalizeEvent } from './lib/json-loader.js';
 import { replayFixture } from './lib/replay-fixture.js';
 import { fixedReducer } from './lib/fixed-reducer.js';
 
+// The two loader tests pin the same thread outcome; keep one definition.
+const THREAD_A_ASSERTION = {
+  kind: 'thread_equals',
+  turn_id: 'A',
+  expect: { user: 'q', asst: 'a' },
+} as const;
+
+function expectReplayPasses(fixture: ReturnType<typeof loadFixtureJson>) {
+  expect(replayFixture(fixture, fixedReducer).pass).toBe(true);
+}
+
+
 describe('Layer 1: JSON fixture loader', () => {
   it('loads flat-form fixtures (round-trips with replay engine)', () => {
     const flat = {
@@ -37,17 +49,10 @@ describe('Layer 1: JSON fixture loader', () => {
           text: 'a',
         },
       ],
-      assertions: [
-        {
-          kind: 'thread_equals',
-          turn_id: 'A',
-          expect: { user: 'q', asst: 'a' },
-        },
-      ],
+      assertions: [THREAD_A_ASSERTION],
     };
     const fixture = loadFixtureJson(flat);
-    const result = replayFixture(fixture, fixedReducer);
-    expect(result.pass).toBe(true);
+    expectReplayPasses(fixture);
   });
 
   it('normalizes wrapped-form (UI Protocol method/params) to flat', () => {
@@ -87,20 +92,13 @@ describe('Layer 1: JSON fixture loader', () => {
           },
         },
       ],
-      assertions: [
-        {
-          kind: 'thread_equals',
-          turn_id: 'A',
-          expect: { user: 'q', asst: 'a' },
-        },
-      ],
+      assertions: [THREAD_A_ASSERTION],
     };
     const fixture = loadFixtureJson(wrapped);
     expect(fixture.events[0]!.type).toBe('user_sent');
     expect(fixture.events[1]!.type).toBe('turn_started');
     expect(fixture.events[2]!.type).toBe('message_delta');
-    const result = replayFixture(fixture, fixedReducer);
-    expect(result.pass).toBe(true);
+    expectReplayPasses(fixture);
   });
 
   it('rejects unknown UI Protocol methods with a clear message', () => {

@@ -39,8 +39,7 @@ cargo test -p octos-services --all-targets -- --list
 | `cli_agent_adapter::tests::argv_config_does_not_invoke_shell_metacharacters` | 3 | 配置参数直接成为 argv，shell 元字符不能变成命令注入。 |
 | `cli_agent_adapter::tests::blocked_env_vars_do_not_reach_child_via_config_env` | 3 | 配置显式 env 也不能向子进程注入被禁变量。 |
 | `cli_agent_adapter::tests::blocked_parent_env_vars_are_scrubbed_but_inheritance_survives` | 3 | 父进程危险变量被清理且正常环境继承不被误删。 |
-| `cli_agent_adapter::tests::cancel_reports_cancelled_and_stops_process` | 4 | 取消可终止真实子进程并返回一致取消状态。 |
-| `cli_agent_adapter::tests::times_out_and_kills_child` | 4 | 超时 kill/reap 真实子进程，防止后台泄漏。 |
+| `cli_agent_adapter::tests::timeout_and_cancel_both_stop_the_child_process` | 4 | 同一 slow-child fixture 上的两个提前终止触发：超时由 `run_cli_agent_command` kill/reap 真实子进程且标记位不落盘；显式取消经 `CliAgentProcess` 返回一致 Cancelled 状态并终止进程。 |
 | `cli_agent_adapter::tests::transcript_capture_is_bounded_and_marks_truncation` | 4 | 子进程输出有界且截断显式可见。 |
 | `cli_agent_adapter::tests::relative_declared_artifacts_resolve_against_child_cwd` | 2 | artifact 声明与真实子进程工作目录保持同一解析基准。 |
 
@@ -121,4 +120,12 @@ cargo test -p octos-services --all-targets -- --list
 | `updater::tests::update_refuses_size_mismatch_before_installing` | 3 | 下载大小不符在安装前拒绝，截断包不能进入替换流程。 |
 | `updater::tests::update_refuses_when_the_sidecar_cannot_be_fetched` | 3 | 校验 sidecar 获取失败时 fail-closed，而非无校验更新。 |
 
-共 **78 项**。除此之外的测试只有在补写出上述某一类别的具体守护性质后才可加入；不得用模块名、代码行数或“以后可能有用”代替测试级证据。
+共 **77 项**。除此之外的测试只有在补写出上述某一类别的具体守护性质后才可加入；不得用模块名、代码行数或“以后可能有用”代替测试级证据。
+
+## 第二轮去重（T-0641）改动说明
+
+只处理上述保留测试，不恢复首轮已删覆盖，无生产接口改动：
+
+- **同链路合并（78 → 77）**：`cli_agent_adapter` 的 `times_out_and_kills_child` 与 `cancel_reports_cancelled_and_stops_process` 共享同一 slow-child fixture，合并为 `timeout_and_cancel_both_stop_the_child_process`，超时与取消两套断言原样保留。
+- **共享 setup 提取**（断言不迁移、语义不变）：`config_context::with_pivoted_home`（模块级 `#[cfg(test)]`，EnvGuard 上移，panic 安全恢复）统一 config/config_context 两个模块的 HOME/OCTOS/XDG pivot——config.rs 的 `load_default_uses_defaults_when_no_config_anywhere`、`load_explicit_never_reads_host_legacy_octos`、`get_api_key_reads_global_xdg_auth_store` 三处内联 save/set/restore 块与 config_context 四个测试全部改用它；config.rs 的 `with_isolated_home` 改为在其上叠加 provider key 清理；`auth::keychain::tests::secrets_root_with_outside` 统一三个 account-link 测试（symlink 读拒/替换、hardlink 替换）的 secrets-root+outside 夹具；`updater::tests::update_must_refuse` 统一六个 update 拒绝链路的 update+expect_err 驱动，各测试保留各自失败原因与 bin 目录为空断言。
+- 未合并项保持独立的理由：embed_model 两个本地 HTTP 测试共享的 `drain_request_head` 已是 helper，stall/完整 body 是不同失败阶段；keychain 的 symlinked-dir/FIFO/atomic-replace 失败路径夹具形状不同（root 本身是链接 / 非常规文件 / 目录占位）；updater 五个拒绝测试各守一类安全边界（checksum/size/sidecar 覆盖/sidecar 获取/白名单为空），保留逐名粒度；`should_keep_owner_read_write_permissions_under_restrictive_umask` 的 umask 子进程 re-exec 结构独立。
