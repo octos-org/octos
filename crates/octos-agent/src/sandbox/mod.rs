@@ -210,9 +210,11 @@ pub struct SandboxConfig {
     /// - macOS: `(deny file-read* file-write* (subpath <folder>))` for each,
     ///   last, so it wins over every grant, and `(deny file-write* (literal
     ///   <parent>))` for each folder between the cwd and it.
-    /// - Landlock, Docker, AppContainer and no sandbox cannot hide a folder
-    ///   inside one they grant: a command whose cwd or a configured read
-    ///   path holds one refuses to run.
+    /// - Landlock, Docker and AppContainer cannot hide a folder inside one
+    ///   they grant: a command whose cwd or a configured read path holds one
+    ///   refuses to run.
+    /// - No sandbox grants every path: every command refuses while a hidden
+    ///   folder holds anything.
     #[serde(skip)]
     pub hidden_folders: Option<octos_core::HiddenFolders>,
 }
@@ -1184,8 +1186,10 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
 
 /// A backend that cannot hide a folder inside one it grants
 /// ([`SandboxConfig::hidden_folders`]): a command whose cwd or a configured
-/// read path holds a hidden folder, or lies in one, refuses to run. Any other
-/// runs as the backend runs it.
+/// read path holds a hidden folder, or lies in one, refuses to run. No
+/// sandbox grants every path the server can read, so under it every command
+/// refuses while a hidden folder holds anything. Any other runs as the
+/// backend runs it.
 struct HiddenFolderGuard {
     inner: Box<dyn Sandbox>,
     hidden: octos_core::HiddenFolders,
@@ -1194,6 +1198,11 @@ struct HiddenFolderGuard {
 
 impl HiddenFolderGuard {
     fn exposes_hidden(&self, cwd: &Path) -> bool {
+        if self.inner.is_noop() {
+            let holds =
+                |folder: &PathBuf| std::fs::read_dir(folder).is_ok_and(|mut e| e.next().is_some());
+            return self.hidden.folders().iter().any(holds);
+        }
         let canonical = |path: &Path| std::fs::canonicalize(path).ok();
         let cwd = canonical(cwd);
         let read: Vec<PathBuf> = self
@@ -1214,14 +1223,19 @@ impl HiddenFolderGuard {
 
     fn refuse(&self, cwd: &Path) -> Command {
         let backend = self.inner.backend_name();
-        refusing_command(
-            &format!(
+        let line = if self.inner.is_noop() {
+            "sandbox none: commands run without a sandbox here, which cannot hide chat folders \
+             from the shell. Refusing to run the command. Install a sandbox backend; octos \
+             doctor shows which."
+                .to_string()
+        } else {
+            format!(
                 "sandbox {backend}: this folder holds chat folders, which this sandbox cannot \
                  hide from the shell. Refusing to run the command. Work in a folder that does \
                  not hold the octos data directory."
-            ),
-            cwd,
-        )
+            )
+        };
+        refusing_command(&line, cwd)
     }
 }
 

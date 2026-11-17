@@ -200,6 +200,30 @@ pub(crate) async fn shell_says(
     said
 }
 
+/// A workspace snapshot manager for `workspace`, kept in `profile`'s data
+/// directory.
+pub(crate) fn snapshot_manager(
+    profile: &crate::runtime::ProfileRuntime,
+    workspace: &Path,
+) -> octos_agent::SnapshotManager {
+    let root = profile.data_dir.join("snapshots");
+    octos_agent::SnapshotManager::new(root, workspace, 10).expect("a git binary")
+}
+
+/// The files of snapshot `id`, one per line.
+pub(crate) fn snapshot_files(
+    manager: &octos_agent::SnapshotManager,
+    id: &octos_agent::SnapshotId,
+) -> String {
+    let listed = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(manager.git_dir())
+        .args(["ls-tree", "-r", "--name-only", id.as_str()])
+        .output()
+        .expect("git");
+    String::from_utf8_lossy(&listed.stdout).into_owned()
+}
+
 /// [`writable_runtime`] with no sandbox at all.
 pub(crate) async fn unconfined_runtime(
     profile: &Arc<crate::runtime::ProfileRuntime>,

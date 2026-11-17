@@ -313,6 +313,44 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     }
     let record = std::fs::read_to_string(&record).unwrap();
     assert!(!record.contains("planted"), "{record}");
+    // From a folder beside them only the sandbox stands between the shell and
+    // the chats: with none, every command refuses.
+    let beside = temp.path().join("beside");
+    std::fs::create_dir(&beside).unwrap();
+    let reach = [format!("cat {} {}", secret.display(), theirs.display())];
+    let none = unconfined_runtime(&profile, &chat_key("code"), &beside).await;
+    let said = shell_says(&none.expect("unconfined runtime"), &reach).await;
+    assert!(
+        said.contains("cannot hide") && !said.contains("theirs"),
+        "{said}"
+    );
+    let sandboxed = writable_runtime(&profile, &chat_key("code"), &beside).await;
+    let said = shell_says(&sandboxed.expect("code runtime"), &reach).await;
+    assert!(!said.contains("theirs"), "{said}");
+    // Workspace snapshots leave them out whatever the workspace's ignore rules
+    // say, and a restore never writes them back, even from a snapshot taken
+    // before they were hidden.
+    std::fs::write(top.join(".gitignore"), "!**/chats/\n!**/chats/**\n").unwrap();
+    let draft = root_b.join("draft.txt");
+    std::fs::write(&draft, "draft one").unwrap();
+    let hiding =
+        snapshot_manager(&profile, &top).with_hidden_folders(chat_workspace::reserved_folders());
+    let hidden = hiding.take_snapshot("hidden").unwrap();
+    let old = snapshot_manager(&profile, &top)
+        .take_snapshot("unhidden")
+        .unwrap();
+    assert!(snapshot_files(&hiding, &old).contains("draft.txt"));
+    std::fs::write(&draft, "draft two").unwrap();
+    hiding.restore(&old).unwrap();
+    assert_eq!(std::fs::read_to_string(&draft).unwrap(), "draft two");
+    for id in [hidden, hiding.take_snapshot("after").unwrap()] {
+        let files = snapshot_files(&hiding, &id);
+        assert!(
+            files.contains("project.txt") && !files.contains("chats/"),
+            "{files}"
+        );
+    }
+    std::fs::remove_file(top.join(".gitignore")).unwrap();
     // So do the session file RPCs, on the root `session/open` bound.
     let code_id = chat_key("code");
     session_workspaces().set_resolved(PROFILE, code_id.clone(), top, None);

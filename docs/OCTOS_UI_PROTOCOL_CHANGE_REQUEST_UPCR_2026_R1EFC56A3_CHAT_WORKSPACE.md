@@ -81,13 +81,19 @@ A connection that does not request it sees byte-identical replies.
     binding each folder between a writable working folder and it over itself,
     so a command cannot rename one to move a reserved folder out from under
     the next command. macOS denies reading and writing them, and writing the
-    folders between the working folder and them. Landlock, Docker,
-    AppContainer and an unsandboxed shell cannot hide a folder inside one
-    they grant, so there a command whose working folder (or a configured read
-    path) holds one refuses to run. A profile's `chats` folder is made when
-    the profile is reserved, so it is hidden before its first chat exists;
-  - workspace snapshots: those folders are left out, so neither a snapshot
-    nor a restore reads or rewrites them;
+    folders between the working folder and them. Landlock, Docker and
+    AppContainer cannot hide a folder inside one they grant, so there a
+    command whose working folder (or a configured read path) holds one
+    refuses to run. Without a sandbox (`sandbox.enabled = false`,
+    `mode = "none"`, or `auto` finding no backend) a command can read any
+    path the server can, so every command refuses while any of those
+    folders holds a chat. A profile's `chats` folder is made when the
+    profile is reserved, so it is hidden before its first chat exists;
+  - workspace snapshots: those folders are left out by git pathspec
+    exclusions, which no ignore file in the workspace can override, and
+    whatever an earlier snapshot staged from them leaves the snapshot index.
+    A restore never writes them back or deletes anything in them, even from
+    a snapshot taken before they were hidden;
   - `session/files/read`: a file there fails with `permission_denied` and
     `data.kind = "chat_workspace_reserved"`;
   - `session/files.list`: those folders are not listed, and a `prefix`
