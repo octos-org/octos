@@ -23,6 +23,10 @@ description: "制作或修改可编辑 PPTX，尤其适用于沿用既有插画�
 
 使用页面 JSON 与原生构建回执的整稿 page-first 流程，首次制作前按 `help topic:page_gate` 建立 `.octos/pptx-page-plan.json`，确认 `doctor.page_first_gate.supported` 与 `active`。每页由独立 reviewer 对**当前确切候选**打分，默认至少 95/100（用户明确要求优先）、零 critical、无未关闭必修项。全部页面通过后才合并；包括试验稿在内，不提前构建多页 PPTX。支持该能力的原生 `build`/`cycle`/`batch` 在写出多页文件前复核门禁。旧版本或没有源数据/构建回执的路线明确只有派工与验收约定，不伪造回执、不宣称已硬拦截。合并后仍由独立 reviewer 评审最终文件。
 
+新任务先在实际 profile 上走通一页。确认底图来自该页获准的素材或生图作业，禁止脚本加工时直接绑定获准底图；核对画布与渲染尺寸、reviewer 实收像素、评审提交和外环接续。在计划中固定计分项、允许保留位图的范围及各页独立 reviewer。已确定的原始底图可用计划行的 `approved_background` 绑定；这验证字节来源，需要另有生图作业记录证明工具来源。没有获准素材时不能自行换路线。
+
+宿主 `doctor.page_first_gate.review_submission` 为真时，优先用 `cycle(publish_candidate:true, freeze_inputs:true)` 发布单页，reviewer 用 `page_review_submit` 对该 `candidate_id` 一次提交。Maker 和 reviewer 分别使用产物的 `candidate_id`、`verdict_id` 作为原生 `peer_publish.handoff_id`（先确认宿主工具声明此参数）。相同交付重试复用该 ID，协调者按页派下一步，无需等其他页面。保留有效审核引用；报告格式更正和派工重试不新建 PPTX。下面的 [independent pages](references/independent-pages.md) 包含字段与旧版本兼容方式。
+
 先约定必修项、可选微调、停滞窗口和用户已有预算。必修项关闭且整稿复核通过就交付；连续无实质改善就退出当前修法；真实阻塞或预算耗尽时交回未完成结果。偏好性微调不能无限重开返修。
 
 等待 peer 时先用 `peer_list` 查当前回合状态，以 `peer_gather` 的 `wait_ms:0` 或不带等待时间读取已有结果；分别看当前执行状态和历史结果，旧结果的完成文字不能覆盖新一轮的运行/排队状态。已结束的回合不再等下一次黑板变化。先派出其他就绪独立工作，只有相关工作仍在运行时才使用有界等待；黑板变化和等待超时本身都不证明当前回合已完成。
@@ -56,7 +60,7 @@ Octos 制作流程按 [continuation evidence](references/continuation-evidence.m
    遇到倾斜铭牌、斜向文字或透视面，按 [标签几何](references/label-geometry.md) 测量具体标签四角，重建局部文字框及旋转；检查字形与斜边、基线的关系。整个场景面板不能替代局部标签边界，旋转也不等于透视变形。
 3. 先从底图确定局部放字区域、方向及同类字号，再用 `pptx_tool` 的 `fit` 定位字形；同类文字声明 `typography_groups` 并使用 `group` 固定共同字号，放不下时看具体冲突，不按每个 OCR 框分别放大或缩小。跨多个图形的文字可用 `split_text` 保留原文映射后拆框。接口见 [字体提案与修订](references/fit-and-revise.md)。实际渲染与测量共用 DeckCraft 字体引擎，不以测量代替看图。
    同组标签已有明确局部 owner 时，用 `layout_region` 一次比较几个共同字号的完整方案；工具联合检查行数、邻接文字和声明的障碍，返回实际 PPTX 预览。底图已有的箭头/运算符可在冻结契约前用 `represent_symbol` 保留原文映射，不能重复叠字或删除原文；文字和数字不适用。见 [语义与区域排版](references/semantic-authoring.md)。
-4. 制作/返修阶段每个 maker 用带 `page` 选择器的单页 `cycle` 完成构建、重开、全稿/无字稿 PNG 和检查；全部页面独立验收通过后再跑有序根 spec 的整稿 `cycle`。批量修正数据用 `patch`，新候选用新目录。有参考设计的页必须声明 `design`；逐页完整分类差分标记与未标记区域，不只挑封面或已知缺陷。缺失、过期或未判定不能算通过。复用未改部分的有效证据，用 `crop` 看有上下文的局部；差分与零越界不能代替看图。无参考的原生页面不虚构参考。接口及旧稿补检见 [Rust runtime](references/rust-runtime.md)。
+4. 制作/返修阶段每个 maker 用带 `page` 选择器的单页 `cycle` 完成构建、重开、全稿/无字稿 PNG 和检查；全部页面独立验收通过后，优先用 `page_assemble` 按计划顺序合并已审核的实际单页 PPTX，再渲染做独立整稿审核。源数据能完整复现已验收页时，也可使用有序根 spec。批量修正数据用 `patch`，新候选用新目录。有参考设计的页必须声明 `design`；逐页完整分类差分标记与未标记区域，不只挑封面或已知缺陷。缺失、过期或未判定不能算通过。复用未改部分的有效证据，用 `crop` 看有上下文的局部；差分与零越界不能代替看图。无参考的原生页面不虚构参考。接口及旧稿补检见 [Rust runtime](references/rust-runtime.md)。
 5. 按 [三项独立核对](references/review-evidence.md) 检查最终 PPTX：原稿与原生文字的完整意思、有字设计与无字底图的图形变化、实际渲染的阅读与标签归属。另按 [视觉验收](references/visual-review.md) 比较整页图文关系、信息密度和全稿节奏。全页检查不局限于检测器标记的对象；密集区域用清晰的上下文裁图。检查结果中的未知项保留为未知，复用未改变部分的有效证据。首个可读 cycle 完成文件/构建检查就发布交接，不先进行完整逐对象视觉自审；完整审查由独立 Reviewer 负责。制作 peer 返修后只自查改动及相邻对象，再发布新候选，按退出标准完成，不要求用户逐轮批准。
 
 Maker 首次发布前只核对构建成功、文件存在与页数，不制作完整 review_pack、不填逐对象验收模板，也不等待“自己满意”。完整首轮视觉审查只由 Reviewer 执行；Maker 可直接查看必要的局部图来实施修复。首次可读的 `cycle` 就把返回值中的 `peer_review_handoff` 数据交给评审主会话；它不是工具名，不要搜索或调用同名工具，也不自动发送通知。Octos 制作 peer 用 `peer_publish` 发布中间成果，协调者用 `peer_gather` 读取并用 `peer_send_input` 派发评审，不能先自修几十轮。该字段绑定实际文件；评审与后续制作复用同一组缺陷 ID，参见 peer 退出规则。

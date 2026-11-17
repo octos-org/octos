@@ -91,7 +91,15 @@ while review is in flight. A newer pass gets a new immutable source/output
 directory and a new candidate binding; keep the current publication pointer
 unambiguous. Do not compare a frozen cycle with an unrelated mutable draft.
 
-Only the independent reviewer writes the assigned review JSON:
+For a new plan use [native page verdict submission](page-verdict.md). The
+reviewer passes the publisher's opaque candidate ID, visual decision and
+existing evidence. The tool binds the exact page and host reviewer, checks all
+decision fields, preserves immutable revisions and writes the assigned review.
+`cycle(publish_candidate:true, freeze_inputs:true)` can bind content-addressed
+page/root snapshots. Bind an approved reference background in the page row's
+optional `approved_background` when byte-for-byte reuse is required.
+
+The following on-disk shape is also supported for existing independent reviews:
 
 ```json
 {
@@ -124,8 +132,7 @@ accepted page-source bindings, resolved pages and shared canvas/styles. A root
 spec that changes fonts, sizes or canvas cannot reuse unchanged page-source
 hashes as approval. Batch exports must have the planned page count;
 their slide identity, dependencies, editability and fidelity still need final
-integration checks. A source rebuild must replay any approved native post-build
-repairs before final review.
+integration checks. A source-only rebuild refuses candidates with content-changing post-build edits. Reuse those approved slide artifacts in plan order with original formatting and verify the assembled file against them.
 
 The check rehashes candidate/source/artifact/render/dependencies/receipts and
 review evidence, checks the one-slide package and image header, and requires the

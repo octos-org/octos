@@ -76,3 +76,8 @@ external waiting. It never turns an unavailable/foreign peer into capacity.
 Dispatch every ready independent page before long global audits or waiting.
 Before reassigning queued work, confirm the old assignment is stood down; preserve
 all review/finding history and avoid duplicate writers or reviewer shopping.
+
+
+A current native review can route a page to `needs_disposition` with a named
+owner and a specific condition for resuming. The page remains incomplete and
+requires coordinator action. It is excluded from automatic maker/reviewer retry.

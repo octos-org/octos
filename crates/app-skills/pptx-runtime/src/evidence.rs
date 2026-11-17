@@ -27,30 +27,8 @@ mod tests {
     }
 }
 
-struct EvidenceLock(std::fs::File);
-
-impl Drop for EvidenceLock {
-    fn drop(&mut self) {
-        // A concurrent fork can temporarily inherit the file descriptor, so
-        // closing this handle alone may not release the lock before exec.
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
-
-fn lock(ctx: &Context) -> Result<EvidenceLock> {
-    use fs2::FileExt;
-    let dir = ctx.path(".octos")?;
-    std::fs::create_dir_all(&dir)?;
-    ctx.path(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(ctx.path(".octos/pptx-evidence.lock")?)?;
-    file.try_lock_exclusive()
-        .map_err(|e| anyhow::anyhow!("another evidence writer is active: {e}"))?;
-    Ok(EvidenceLock(file))
+fn lock(ctx: &Context) -> Result<crate::fs::WorkspaceLock> {
+    ctx.lock_file(".octos/pptx-evidence.lock")
 }
 
 pub fn init(ctx: &Context, r: &Value) -> Result<Value> {

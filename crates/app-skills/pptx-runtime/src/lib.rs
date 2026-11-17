@@ -18,8 +18,11 @@ pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
 pub mod operations;
+mod page_assembly;
 pub mod page_dispatch;
 pub mod page_gate;
+mod page_snapshot;
+mod page_verdict;
 pub mod placement;
 pub mod qa;
 pub mod raster_overlap;
@@ -38,7 +41,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-pub const ENGINE_REV: &str = "581ffb43217be6aa9850b23eea38473ded6043fd";
+pub const ENGINE_REV: &str = "2c97539d8a29a597dc01fb8743ecc970329ffef0";
 pub struct Context {
     pub root: PathBuf,
     pub continuation_owner: Option<String>,
@@ -71,6 +74,9 @@ impl Context {
                 "batch" => Ok(json!({"topic":"batch","supports_guarded_text_edits":true,
                     "guarded_text_edits":"Optional boolean; rejects text.set and requires a specific text.find match for text.replace.",
                     "quality_approved":false})),
+                "page_review_submit" => Ok(json!({"topic":"page_review_submit","documentation":include_str!("../references/page-verdict.md"),"quality_approved":false})),
+                "page_assemble" => Ok(json!({"topic":"page_assemble","required":["output"],"example":{"action":"page_assemble","output":"final.pptx"},
+                    "documentation":"Assemble the actual accepted one-slide PPTX artifacts in active plan order with source formatting. Give a fresh .pptx output path. The response binds the ordered candidates and reviews. Independently review the combined PPTX.","quality_approved":false})),
                 "page_gate" => Ok(json!({"topic":"page_gate","documentation":include_str!("../references/page-first.md"),"quality_approved":false})),
                 "page_dispatch" => Ok(json!({"topic":"page_dispatch","documentation":include_str!("../references/page-dispatch.md"),"quality_approved":false})),
                 "page_publish" => Ok(json!({"required":["page","cycle"],"optional":["artifact","render_receipt","receipts"],"quality_approved":false,
@@ -79,20 +85,22 @@ impl Context {
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","page_gate","page_dispatch","page_publish","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["operations","review_view","finding_register","doctor","page_gate","page_dispatch","page_publish","page_review_submit","page_assemble","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
             "doctor" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,"runtime":"rust","ocr":ocr::capabilities(),"bundled_fonts":env!("OCTOS_PPTX_BUNDLED_FONTS")=="true","python_required":false,"libreoffice_required":false,"node_required":false,
-                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists(),"dispatch_coverage_check":true},
+                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists(),"dispatch_coverage_check":true,"review_submission":true,"freeze_inputs":true,"artifact_assembly":true},
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),
             "build" | "cycle" => deck::build(self, &request),
             "page_gate" => page_gate::check(self),
+            "page_assemble" => page_assembly::assemble(self, &request),
             "page_dispatch" => page_dispatch::check(self, &request),
             "page_publish" => page_gate::publish(self, &request),
+            "page_review_submit" => page_verdict::submit(self, &request),
             "render" => deck::render(self, &request),
             "inspect" => review::inspect(self, &request),
             "review_pack" => feedback::create(self, &request),

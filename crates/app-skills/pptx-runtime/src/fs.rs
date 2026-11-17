@@ -8,7 +8,33 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(crate) struct WorkspaceLock(pub(crate) std::fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // A child may have inherited the descriptor before exec.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Context {
+    pub(crate) fn lock_file(&self, name: &str) -> Result<WorkspaceLock> {
+        let path = self.path(name)?;
+        let parent = path.parent().context("missing lock directory")?;
+        fs::create_dir_all(parent)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.path(path)?)?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("another writer is active; retry after its publication")?;
+        Ok(WorkspaceLock(file))
+    }
+
     pub fn path(&self, p: impl AsRef<Path>) -> Result<PathBuf> {
         let p = p.as_ref();
         let joined = if p.is_absolute() {
@@ -49,7 +75,7 @@ impl Context {
         let p = self.path(p)?;
         ensure!(p.is_file(), "not a regular file: {}", p.display());
         ensure!(
-            fs::metadata(&p)?.len() <= 256 * 1024 * 1024,
+            fs::metadata(&p)?.len() <= MAX_FILE_BYTES,
             "file exceeds 256 MiB"
         );
         Ok(fs::read(p)?)

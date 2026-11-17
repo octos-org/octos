@@ -73,6 +73,144 @@ fn gate(ctx: &Context) -> Value {
     ctx.execute(json!({"action":"page_gate"})).unwrap()
 }
 
+fn verdict_request(ctx: &Context) -> Value {
+    let state = gate(ctx);
+    json!({"action":"page_review_submit","page":"alpha",
+        "candidate_id":state["pages"][0]["candidate_id"],
+        "verdict":{"score":94, "accepted":false, "critical_defects":[],
+            "open_required_findings":["F1"],"evidence":["evidence.json"]}})
+}
+
+#[test]
+fn reviewer_can_publish_and_revise_one_bound_verdict_without_rebuilding() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("session:reviewer".into());
+    let mut req = verdict_request(&ctx);
+    let first = ctx.execute(req.clone()).unwrap();
+    assert_eq!(first["score"], 94);
+    assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "repair");
+    assert_eq!(ctx.execute(req.clone()).unwrap(), first);
+    let before_candidate = ctx.binding("alpha-candidate.json").unwrap();
+    req["verdict"]["score"] = json!(96);
+    req["verdict"]["accepted"] = json!(true);
+    req["verdict"]["open_required_findings"] = json!([]);
+    assert!(ctx.execute(req.clone()).is_err(), "must compare revision");
+    req["replaces_verdict_id"] = first["verdict_id"].clone();
+    ctx.continuation_owner = Some("another reviewer".into());
+    assert!(
+        ctx.execute(req.clone()).is_err(),
+        "reviewer cannot take over"
+    );
+    ctx.continuation_owner = Some("session:reviewer".into());
+    let second = ctx.execute(req.clone()).unwrap();
+    assert_ne!(first["archive"], second["archive"]);
+    ctx.verify(&first["archive"]).unwrap();
+    assert_eq!(ctx.execute(req.clone()).unwrap(), second);
+    assert_eq!(gate(&ctx)["accepted_pages"], 1);
+    assert_eq!(
+        ctx.binding("alpha-candidate.json").unwrap(),
+        before_candidate
+    );
+    req["candidate_id"] = json!("old");
+    assert!(
+        ctx.execute(req)
+            .unwrap_err()
+            .to_string()
+            .contains("candidate")
+    );
+    assert_eq!(ctx.binding("alpha-review.json").unwrap(), second["review"]);
+}
+
+#[test]
+fn submission_checks_all_fields_identity_frozen_rubric_and_evidence_before_writing() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    let mut p = ctx.json(".octos/pptx-page-plan.json").unwrap();
+    p["rubric"] = json!({"design":60,"editable":40});
+    p["pages"][0]["reviewer_session"] = json!("reviewer");
+    ctx.replace_json(".octos/pptx-page-plan.json", &p).unwrap();
+    let mut req = verdict_request(&ctx);
+    for owner in [
+        None,
+        Some("session:maker-alpha"),
+        Some("coordinator"),
+        Some("other"),
+    ] {
+        ctx.continuation_owner = owner.map(str::to_owned);
+        assert!(ctx.execute(req.clone()).is_err());
+    }
+    ctx.continuation_owner = Some("reviewer".into());
+    req["verdict"]["evidence"] = json!({"bad":"shape"});
+    req["verdict"]["critical_defects"] = Value::Null;
+    let err = ctx.execute(req.clone()).unwrap_err().to_string();
+    for key in ["evidence", "critical_defects", "component_scores"] {
+        assert!(err.contains(key), "{err}");
+    }
+    assert!(!t.path().join("alpha-review.json").exists());
+    req["verdict"]["critical_defects"] = json!([]);
+    req["verdict"]["evidence"] = json!(["evidence.json"]);
+    req["verdict"]["component_scores"] = json!({"design":55,"editable":37});
+    assert!(
+        ctx.execute(req.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("sum")
+    );
+    req["verdict"]["component_scores"]["design"] = json!(57);
+    ctx.execute(req).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["review_current"], true);
+    p["rubric"] = json!({"design":59,"editable":41});
+    ctx.replace_json(".octos/pptx-page-plan.json", &p).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["review_current"], false);
+}
+
+#[test]
+fn below_threshold_without_a_maker_fix_routes_to_a_specific_owner() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("reviewer".into());
+    let mut req = verdict_request(&ctx);
+    req["verdict"]["open_required_findings"] = json!([]);
+    assert!(
+        ctx.execute(req.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("disposition")
+    );
+    req["verdict"]["disposition"] = json!({"owner":"tool_maintainer","reason":"Requested face cannot be resolved.",
+        "resume_when":"The installed face resolves in a rendered fixture."});
+    ctx.execute(req).unwrap();
+    let inventory = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
+    assert_eq!(inventory["needs_disposition"][0]["page"], "alpha");
+    assert_eq!(inventory["ready_unassigned"].as_array().unwrap().len(), 1);
+    assert_eq!(inventory["ready_unassigned"][0]["page"], "beta");
+    assert_eq!(inventory["declared_coverage_complete"], false);
+    assert_eq!(gate(&ctx)["ready_for_assembly"], false);
+}
+
+#[test]
+fn native_submission_preserves_legacy_verdict_and_rejects_changed_sources() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("reviewer".into());
+    let req = verdict_request(&ctx);
+    approve(&ctx, "alpha");
+    let before = ctx.binding("alpha-review.json").unwrap();
+    assert!(
+        ctx.execute(req.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("preserve existing")
+    );
+    assert_eq!(ctx.binding("alpha-review.json").unwrap(), before);
+    edit(&ctx, "alpha.json", |p| {
+        p["copy"]["label"] = json!("changed")
+    });
+    assert!(ctx.execute(req).is_err());
+    assert_eq!(ctx.binding("alpha-review.json").unwrap(), before);
+}
+
 #[test]
 fn dispatch_stages_follow_exact_bound_candidates_and_current_reviews() {
     let t = tempfile::tempdir().unwrap();
@@ -220,6 +358,62 @@ fn should_preserve_an_accepted_candidate_until_reviewer_release() {
     let error = publish_alpha(&ctx).unwrap_err();
     assert!(error.to_string().contains("accepted candidate"));
     assert_eq!(ctx.binding("alpha-candidate.json").unwrap(), before);
+}
+
+#[test]
+fn bound_artwork_from_the_task_plan_cannot_be_substituted_by_the_maker() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    let mut p = ctx.json(".octos/pptx-page-plan.json").unwrap();
+    p["pages"][0]["approved_background"] = ctx.binding("design.png").unwrap();
+    ctx.replace_json(".octos/pptx-page-plan.json", &p).unwrap();
+    assert_eq!(gate(&ctx)["pages"][0]["candidate_current"], true);
+    image::RgbImage::from_pixel(40, 30, image::Rgb([85, 85, 85]))
+        .save(t.path().join("other.png"))
+        .unwrap();
+    p["pages"][0]["approved_background"] = ctx.binding("other.png").unwrap();
+    ctx.replace_json(".octos/pptx-page-plan.json", &p).unwrap();
+    let result = gate(&ctx);
+    assert_eq!(result["pages"][0]["candidate_current"], false);
+    assert!(
+        result["pages"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("approved artwork")
+    );
+}
+
+#[test]
+fn frozen_publication_survives_draft_edits_and_still_detects_snapshot_changes() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("maker-alpha".into());
+    edit(&ctx, "deck.json", |root| {
+        root["canvas"]["width_px"] = json!(320);
+        root["canvas"]["height_px"] = json!(240);
+    });
+    let result = ctx
+        .execute(
+            json!({"action":"cycle","page":"alpha","spec":"deck.json","output":"pass",
+        "publish_candidate":true,"freeze_inputs":true}),
+        )
+        .unwrap();
+    let published = &result["page_publication"]["handoff"];
+    let source = published["source"]["path"].as_str().unwrap();
+    assert!(source.starts_with(".octos/page-sources/"));
+    assert_eq!(
+        result["peer_review_handoff"]["candidate_id"],
+        published["candidate_id"]
+    );
+    approve(&ctx, "alpha");
+    edit(&ctx, "alpha.json", |page| {
+        page["notes"] = json!("draft notes")
+    });
+    assert_eq!(gate(&ctx)["accepted_pages"], 1);
+    edit(&ctx, source, |page| {
+        page["notes"] = json!("changed frozen input")
+    });
+    assert_eq!(gate(&ctx)["accepted_pages"], 0);
 }
 
 #[test]
@@ -554,4 +748,211 @@ fn page_gate_help_and_capability_are_discoverable_in_the_public_schema() {
     let doctor = ctx.execute(json!({"action":"doctor"})).unwrap();
     assert_eq!(doctor["page_first_gate"]["supported"], true);
     assert_eq!(doctor["page_first_gate"]["active"], true);
+}
+
+#[test]
+fn page_first_cycle_uses_the_declared_canvas_and_respects_explicit_width() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    // The native viewport comes from the declared design, even with 40x30 artwork.
+    edit(&ctx, "deck.json", |root| {
+        root["canvas"] = json!({"width_px":320,"height_px":80,"width_in":8,"height_in":2});
+    });
+    for (dir, width, expected) in [
+        ("native", None, (320, 80)),
+        ("preview", Some(160), (160, 40)),
+        ("standalone", None, (1920, 480)),
+    ] {
+        if dir == "standalone" {
+            std::fs::remove_file(t.path().join(".octos/pptx-page-plan.json")).unwrap();
+        }
+        let mut request = json!({"action":"cycle","spec":"deck.json","page":"alpha","output":dir});
+        if let Some(width) = width {
+            request["width"] = json!(width);
+        }
+        let cycle = ctx.execute(request).unwrap();
+        if dir == "native" {
+            let render = ctx
+                .execute(json!({"action":"render","input":cycle["editable"]["path"],
+                "output":"raw-render"}))
+                .unwrap();
+            assert_eq!(render["pages"][0]["width"], 1920);
+        }
+        for kind in ["editable", "blank"] {
+            let page = &cycle["renders"][kind]["pages"][0];
+            assert_eq!(
+                (page["width"].as_u64(), page["height"].as_u64()),
+                (Some(expected.0.into()), Some(expected.1.into()))
+            );
+            assert_eq!(
+                image::image_dimensions(ctx.verify(page).unwrap()).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn page_first_cycle_rejects_unrenderable_canvas_before_creating_an_attempt() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    for (name, width, height, inches) in [
+        ("over-limit", 9000, 6750, 4.0),
+        ("over-engine-scale", 6400, 4800, 4.0),
+        // The PPTX writer clamps physical sides shorter than one inch.
+        ("changed-roundtrip-aspect", 320, 240, 0.9),
+    ] {
+        edit(&ctx, "deck.json", |root| {
+            root["canvas"] = json!({"width_px":width,"height_px":height,
+                "width_in":inches,"height_in":inches * 0.75});
+        });
+        let error = ctx
+            .execute(json!({"action":"cycle","spec":"deck.json","page":"beta","output":name}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("page-first canvas"),
+            "{error:#}"
+        );
+        assert!(!t.path().join(name).exists());
+    }
+}
+
+#[test]
+fn source_assembly_rejects_postbuild_edits_and_artifact_reuse_keeps_the_approved_pages() {
+    let t = tempfile::tempdir().unwrap();
+    let ctx = fixture(t.path());
+    let repair = ctx.execute(json!({"action":"batch","input":"beta-postbuild.pptx","output":"repair.pptx",
+        "commands":[{"command":"slide.go","params":{"index":0}},
+        {"command":"shape.insert","params":{"preset":"rect","rect":[20,120,160,55],"text":"Approved addition"}}]})).unwrap();
+    ctx.write_json("repair.json", &repair).unwrap();
+    let render = ctx
+        .execute(
+            json!({"action":"render","input":"repair.pptx","width":64,"output":"repair-render"}),
+        )
+        .unwrap();
+    edit(&ctx, "beta-candidate.json", |candidate| {
+        candidate["artifact"] = repair["output"].clone();
+        candidate["render"] = render["pages"][0].clone();
+        candidate["render_receipt"] = ctx.binding("repair-render/render.json").unwrap();
+        candidate["receipts"]
+            .as_array_mut()
+            .unwrap()
+            .push(ctx.binding("repair.json").unwrap());
+    });
+    approve(&ctx, "alpha");
+    approve(&ctx, "beta");
+    assert_eq!(gate(&ctx)["ready_for_assembly"], true);
+    for action in ["build", "cycle"] {
+        let error = ctx
+            .execute(json!({"action":action,"spec":"deck.json","output":"lost-edits"}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("discard post-build edits on accepted page"),
+            "{error:#}"
+        );
+        assert!(!t.path().join("lost-edits").exists());
+    }
+    let first = ctx.json("alpha-candidate.json").unwrap();
+    let second = ctx.json("beta-candidate.json").unwrap();
+    assert!(
+        ctx.execute(json!({"action":"page_assemble","output":"wrong.pptx","input":"repair.pptx"}))
+            .is_err()
+    );
+    let assembled = ctx
+        .execute(json!({"action":"page_assemble","output":"assembled.pptx"}))
+        .unwrap();
+    assert_eq!(assembled["pages"][0]["page_id"], "alpha");
+    assert_eq!(assembled["pages"][1]["artifact"], second["artifact"]);
+    assert_eq!(assembled["requires_final_review"], true);
+    assert_eq!(assembled["quality_approved"], false);
+    assert!(
+        ctx.execute(json!({"action":"page_assemble","output":"assembled.pptx"}))
+            .is_err()
+    );
+    let combined = ctx.execute(json!({"action":"render","input":"assembled.pptx","width":64,"output":"assembled-render"})).unwrap();
+    assert_eq!(combined["pages"].as_array().unwrap().len(), 2);
+    for (page, accepted) in combined["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([first, second])
+    {
+        assert_eq!(page["sha256"], accepted["render"]["sha256"]);
+    }
+    let inspected = ctx.execute(json!({"action":"batch","input":"assembled.pptx","commands":[
+        {"command":"slide.inspect","params":{"index":0}},{"command":"slide.inspect","params":{"index":1}}]})).unwrap();
+    let shapes = |i: usize| inspected["results"][i]["shapes"].as_array().unwrap();
+    assert!(shapes(0).iter().any(|s| s["text"] == "alpha"));
+    assert!(shapes(1).iter().any(|s| s["text"] == "beta"));
+    assert!(shapes(1).iter().any(|s| s["text"] == "Approved addition"));
+}
+
+#[test]
+fn twenty_independent_native_page_owners_can_publish_review_and_assemble_in_order() {
+    use std::sync::Barrier;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let ctx = Context::new(root).unwrap();
+    image::RgbImage::from_pixel(96, 72, image::Rgb([210, 222, 225]))
+        .save(root.join("plate.png"))
+        .unwrap();
+    let mut pages = Vec::new();
+    for i in 0..20 {
+        let id = format!("slide-{i}");
+        let spec = json!({"schema_version":1,"canvas":{"width_px":96,"height_px":72,"width_in":4,"height_in":3},
+            "styles":{"title":{"font":"Inter","size_pt":10+i}},
+            "pages":[{"id":id,"background":"plate.png","copy":{"title":id},
+                "texts":[{"id":"title","text":id,"style":"title","box":[1,1,94,66]}]}]});
+        ctx.write_json(format!("{id}.json"), &spec).unwrap();
+        pages.push(json!({"id":id,"maker_session":format!("maker-{i}"),"reviewer_session":format!("reviewer-{i}"),
+            "candidate":format!("{id}-candidate.json"),"review":format!("{id}-verdict.json")}));
+    }
+    ctx.write_json(
+        ".octos/pptx-page-plan.json",
+        &json!({"schema_version":1,"min_score":95,
+        "coordinator_session":"outer","rubric":{"visual":100},"pages":pages}),
+    )
+    .unwrap();
+    assert!(
+        ctx.execute(json!({"action":"page_assemble","output":"early.pptx"}))
+            .is_err()
+    );
+    assert!(!root.join("early.pptx").exists());
+    let barrier = Barrier::new(20);
+    std::thread::scope(|scope| {
+        for i in 0..20 {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                let mut maker = Context::new(root).unwrap();
+                maker.continuation_owner = Some(format!("maker-{i}"));
+                let id = format!("slide-{i}");
+                barrier.wait();
+                let made = maker.execute(json!({"action":"cycle","spec":format!("{id}.json"),
+                    "output":format!("{id}-build"),"page":id,"publish_candidate":true,"freeze_inputs":true})).unwrap();
+                let mut reviewer = Context::new(root).unwrap();
+                reviewer.continuation_owner = Some(format!("reviewer-{i}"));
+                let decision = json!({"action":"page_review_submit","page":id,
+                    "candidate_id":made["peer_review_handoff"]["candidate_id"],
+                    "verdict":{"accepted":true,"score":96,"component_scores":{"visual":96},
+                        "critical_defects":[],"open_required_findings":[],"evidence":[made["inspection"]["report"]]}});
+                let receipt = reviewer.execute(decision.clone()).unwrap();
+                assert_eq!(reviewer.execute(decision).unwrap(),receipt);
+            });
+        }
+    });
+    assert_eq!(gate(&ctx)["accepted_pages"], 20);
+    let result = ctx
+        .execute(json!({"action":"page_assemble","output":"complete.pptx"}))
+        .unwrap();
+    assert_eq!(result["requires_final_review"], true);
+    let rendered = ctx
+        .execute(json!({"action":"render","input":"complete.pptx","width":96,"output":"renders"}))
+        .unwrap();
+    for i in 0..20 {
+        assert_eq!(result["pages"][i]["page_id"], format!("slide-{i}"));
+        assert_eq!(
+            rendered["pages"][i]["sha256"], result["pages"][i]["render"]["sha256"],
+            "render of slide {i}"
+        );
+    }
 }

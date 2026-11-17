@@ -49,7 +49,14 @@ The default page threshold is 95/100; an explicit user target takes precedence.
 Every page needs zero criticals and no open required findings, not a passing
 deck-wide average. Unless another rubric is agreed, use content 20, native
 editability 20, typography 20, readability/clipping 15, composition/fidelity 15,
-and sources 10. Freeze it for this task.
+and sources 10. Freeze the agreed component maxima as the numeric plan-level
+`rubric` map, and the reviewer per row as `reviewer_session`. Define the editable
+scope once in the brief. A raster illustration allowed by the task may still have
+a concrete fidelity defect; score that observed effect in the agreed category.
+For a previously approved or image-model-produced background, bind that page’s
+approved source in the plan row as `approved_background: {path, sha256}` and
+retain its authorized generation receipt. Select it from the approved input;
+a maker copying the hash of its own output does not establish provenance.
 
 Only the independent reviewer assigns scores/acceptance. The tool checks declared
 ownership and bound evidence; the host verifies real peer identities/execution.
@@ -113,7 +120,13 @@ the reviewed artifact and render must include those repairs. A base cycle's
 Use native `page_publish` to derive the candidate from the existing one-page
 cycle and its real source/render receipts; do not spend model turns calculating
 hashes or rebuild merely to publish. A new one-page `cycle` can combine both
-steps with `publish_candidate:true`. For post-build changes, supply the actual
+steps with `publish_candidate:true, freeze_inputs:true` when doctor advertises
+`freeze_inputs`. This captures page and root JSON once by content; the editable
+draft and subsequent notes can change while the reviewer reads the frozen
+candidate. Keep artwork bytes fixed. Use the published source for assembly.
+Under an active page plan, a source-backed cycle defaults to its design width;
+bare PPTX render jobs should explicitly specify the intended width. Check returned
+dimensions once. For post-build changes, supply the actual
 `artifact`, `render_receipt` and ordered native `receipts`. Publication rejects
 changed dependencies and a caller other than the declared maker. It awards no
 score and sends no peer message itself.
@@ -121,7 +134,10 @@ score and sends no peer message itself.
 The Octos coordinator is the outer supervisor; page makers and independent
 reviewers are its native peers. After `page_publish`, the maker uses
 `peer_publish` to send the exact candidate/cycle paths to its native blackboard,
-freezes the submitted inputs, and returns. The coordinator calls `peer_gather`,
+using the tool’s optional `handoff_id` set to the returned `candidate_id` when
+advertised. The independent reviewer completes the visual checks, calls
+`page_review_submit(page, candidate_id, verdict)` and publishes its returned
+`verdict_id` as a new handoff. Use the same ID on retries. The coordinator calls `peer_gather`,
 checks the current peer/turn and candidate, then dispatches each ready page to an
 available independent reviewer with `peer_send_input`, following the coverage
 check above. It gathers each reviewer's complete page defect batch and routes it
@@ -186,6 +202,18 @@ Do not wait for a deck-wide findings round or dispatch one defect at a time.
 Shared causes go to the shared-part writer; invalidate dependent page evidence
 when that dependency changes.
 
+The native verdict writer supplies hashes and identity. For a changed judgment,
+the same reviewer supplies the current `replaces_verdict_id`; immutable versions
+are preserved. A schema repair reuses the existing visual work and PPTX. If a
+rejection needs a rubric clarification or an unavailable tool, submit a
+`disposition` with `owner`, `reason` and `resume_when`. Triage
+`page_dispatch.needs_disposition` separately from ready page work. Route one
+reproducible shared tool failure to its maintainer, resume affected original
+makers when a verified capability changes, and keep unaffected accepted pages
+frozen. Preserve the quality threshold and the existing reviewer. A task-owner
+decision is for genuine changes to scope, not a substitute for a tool repair.
+Earlier runtimes and pre-existing verdict files retain their original contracts.
+
 Keep the current dispatch record in the existing coordination files.
 Busy `peer_send_input` queues another turn; corrections do not replace old work.
 Do not treat a serial review queue as a dependency or keep it while eligible
@@ -201,7 +229,11 @@ Use page references in the root spec: `{"path":"pages/overview.json"}`. Resolve
 assets relative to that page file. The coordinator keeps an ordered inventory of
 accepted page sources and hashes. Verify current source/assets against the worker's
 cycle before assembly; do not accept a pretty preview from different bytes.
-Only after all current pages pass, assemble with the ordered root spec. Active
+After all current pages pass, prefer native `page_assemble(output)` when advertised.
+It reads each accepted one-slide file and its review from the plan in page order,
+preserving page-specific styles and native additions made after the base cycle.
+It returns the bound inputs and requires independent final review. For equivalent
+source-only pages the ordered root-spec route is available. Active
 native admission rejects multi-page `build`/`cycle`/`batch`, including probes and
 nested `operations`, until then. Use `page_gate` to see specific stale/missing
 evidence; do not remove the plan, lower its target or switch tools to evade it.

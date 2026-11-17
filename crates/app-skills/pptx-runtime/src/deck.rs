@@ -14,8 +14,14 @@ use serde_json::{Value, json};
 use std::{path::Path, sync::Arc};
 
 pub fn open(ctx: &Context, path: &Path) -> Result<Presentation> {
-    let bytes = ctx.read(path)?;
-    let (doc, damage) = file::open_checked(&path.to_string_lossy(), &bytes)?;
+    open_bytes(path, &ctx.read(path)?)
+}
+pub(crate) fn open_bytes(path: &Path, bytes: &[u8]) -> Result<Presentation> {
+    ensure!(
+        bytes.len() as u64 <= crate::fs::MAX_FILE_BYTES,
+        "file exceeds 256 MiB"
+    );
+    let (doc, damage) = file::open_checked(&path.to_string_lossy(), bytes)?;
     ensure!(
         damage.is_empty(),
         "input contains unreadable parts; refusing a partial import: {damage:?}"
@@ -219,7 +225,7 @@ pub fn blank(doc: &Presentation) -> Presentation {
 }
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
-    let (spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    let (spec, mut sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
     ensure!(
         r["publish_candidate"] != true || (r["action"] == "cycle" && spec.pages.len() == 1),
         "publish_candidate requires a one-page cycle"
@@ -227,9 +233,23 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     crate::page_gate::require_ready(ctx, spec.pages.len(), Some((&spec, &sources)))?;
     let out = ctx.path(string(r, "output")?)?;
     ensure!(!out.exists(), "use a fresh attempt directory");
-    std::fs::create_dir_all(&out)?;
+    if r["freeze_inputs"] == true {
+        ensure!(
+            r["publish_candidate"] == true,
+            "freeze_inputs requires a page publication"
+        );
+        crate::page_gate::maker_row(ctx, &crate::page_gate::plan(ctx)?, &spec.pages[0].id)?;
+        sources = crate::page_snapshot::freeze(ctx, &spec)?;
+    }
     let doc = from_spec(ctx, &spec)?;
-    let full = ctx.write_new(out.join("editable.pptx"), &file::save_bytes(&doc, "pptx")?)?;
+    let full = out.join("editable.pptx");
+    let full_bytes = file::save_bytes(&doc, "pptx")?;
+    let full_doc = open_bytes(&full, &full_bytes)?;
+    let render_width = (r["action"] == "cycle")
+        .then(|| cycle_width(ctx, r, &spec, &full_doc))
+        .transpose()?;
+    ctx.write_new(&full, &full_bytes)?;
+    drop(full_bytes);
     let blank = ctx.write_new(
         out.join("blank.pptx"),
         &file::save_bytes(&blank(&doc), "pptx")?,
@@ -238,7 +258,6 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
         out.join("resolved-spec.json"),
         &serde_json::to_value(&spec)?,
     )?;
-    let full_doc = open(ctx, &full)?;
     let blank_doc = open(ctx, &blank)?;
     ensure!(
         full_doc.slides.len() == spec.pages.len() && blank_doc.slides.len() == spec.pages.len(),
@@ -246,8 +265,7 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     );
     let mut result = json!({"schema_version":1,"engine_revision":crate::ENGINE_REV,"runtime":"rust","spec":ctx.binding(resolved)?,"editable":ctx.binding(&full)?,"blank":ctx.binding(&blank)?,"pages":spec.pages.iter().map(|p|&p.id).collect::<Vec<_>>(),"quality_approved":false});
     result["sources"] = json!(sources);
-    if r["action"] == "cycle" {
-        let width = width(r)?;
+    if let Some(width) = render_width {
         result["renders"] = json!({"editable":render_to(ctx,&full_doc,&full,&out.join("rendered"),width)?,"blank":render_to(ctx,&blank_doc,&blank,&out.join("blank-rendered"),width)?});
         let draft = ctx.write_json(out.join("render-cycle.json"), &result)?;
         result["inspection"] = crate::review::inspect(
@@ -283,11 +301,31 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     };
     if publication["candidate"].is_object() {
         handoff["candidate"] = publication["candidate"].clone();
+        handoff["candidate_id"] = publication["candidate_id"].clone();
         handoff["page_id"] = json!(spec.pages[0].id);
     }
     Ok(
         json!({"receipt":ctx.binding(receipt)?,"editable":result["editable"],"blank":result["blank"],"renders":result["renders"],"comparisons":result["comparisons"],"inspection":result["inspection"],"native_qa":result["native_qa"],"page_publication":publication,"peer_review_handoff":handoff,"quality_approved":false}),
     )
+}
+fn cycle_width(ctx: &Context, r: &Value, spec: &Spec, doc: &Presentation) -> Result<u32> {
+    if r.get("width").is_some() || !ctx.path(crate::page_gate::PLAN)?.exists() {
+        return width(r);
+    }
+    let [w, h] = [spec.canvas.width_px, spec.canvas.height_px].map(f64::round);
+    ensure!(
+        (1.0..=8192.0).contains(&w) && (1.0..=8192.0).contains(&h),
+        "page-first canvas {w}x{h} is outside the native render range (1..8192 pixels per side); specify a supported preview width"
+    );
+    let requested_scale = w / doc.slide_size.width;
+    let scale = file::image_scale(doc, requested_scale);
+    ensure!(
+        requested_scale * doc.slide_size.height <= 8192.
+            && (doc.slide_size.width * scale).round() == w
+            && (doc.slide_size.height * scale).round() == h,
+        "page-first canvas {w}x{h} cannot be rendered at the declared physical slide size; check the canvas or specify a supported preview width"
+    );
+    Ok(w as u32)
 }
 pub fn width(r: &Value) -> Result<u32> {
     let w = r

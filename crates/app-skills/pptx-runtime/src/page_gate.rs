@@ -41,7 +41,7 @@ fn bindings(ctx: &Context, v: &Value, key: &str, required: bool) -> Result<()> {
     }
     Ok(())
 }
-fn plan(ctx: &Context) -> Result<Value> {
+pub(crate) fn plan(ctx: &Context) -> Result<Value> {
     let p = ctx.json(PLAN)?;
     ensure!(
         p["schema_version"] == 1,
@@ -57,10 +57,12 @@ fn plan(ctx: &Context) -> Result<Value> {
         min.is_finite() && (0.0..=100.0).contains(&min),
         "min_score must be between 0 and 100"
     );
+    crate::page_verdict::check_rubric(&p)?;
     let pages = array(&p, "pages")?;
     ensure!(!pages.is_empty(), "page plan must cover at least one page");
     let mut ids = BTreeSet::new();
     let mut makers = BTreeSet::new();
+    let mut publications = BTreeSet::new();
     for page in pages {
         let id = nonempty(page, "id")?;
         let maker = nonempty(page, "maker_session")?;
@@ -73,8 +75,12 @@ fn plan(ctx: &Context) -> Result<Value> {
             identity(maker) != identity(coordinator),
             "coordinator cannot be a page maker"
         );
-        ctx.path(nonempty(page, "candidate")?)?;
-        ctx.path(nonempty(page, "review")?)?;
+        for field in ["candidate", "review"] {
+            ensure!(
+                publications.insert(ctx.path(nonempty(page, field)?)?),
+                "each page needs its own candidate and review paths"
+            );
+        }
     }
     Ok(p)
 }
@@ -117,7 +123,7 @@ fn source_matches(ctx: &Context, actual: &Value, expected: &Value) -> bool {
                     .is_some_and(|(a, b)| a == b)
             })
 }
-fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<Value> {
+fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<(Value, bool)> {
     let build = ctx
         .json(ctx.verify(&candidate["build_receipt"])?)
         .context("missing native build receipt")?;
@@ -151,6 +157,7 @@ fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<Value> {
         }
     }
     let mut current = build["editable"].clone();
+    let mut has_postbuild_edits = false;
     ctx.verify(&current)?;
     for binding in array(candidate, "receipts")? {
         let path = ctx.verify(binding)?;
@@ -161,7 +168,16 @@ fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<Value> {
             {
                 ctx.verify(&receipt["input"])?;
                 ctx.verify(&receipt["output"])?;
-                current = receipt["output"].clone();
+                let output = &receipt["output"];
+                if current["sha256"] != output["sha256"] {
+                    // A native empty batch still reserializes OOXML. It has no
+                    // authoring commands to lose when regenerating the source.
+                    let empty_batch = receipt["commands_sha256"] == crate::fs::digest(b"[]")
+                        && receipt["results"].as_array().is_some_and(Vec::is_empty);
+                    has_postbuild_edits = output["sha256"] != build["editable"]["sha256"]
+                        && (has_postbuild_edits || !empty_batch);
+                }
+                current = output.clone();
             }
         }
     }
@@ -169,9 +185,9 @@ fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<Value> {
         current["sha256"] == candidate["artifact"]["sha256"],
         "candidate is not the build artifact or a bound native post-build receipt chain"
     );
-    Ok(resolved)
+    Ok((resolved, has_postbuild_edits))
 }
-fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) -> Result<()> {
+pub(crate) fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) -> Result<()> {
     let id = nonempty(row, "id")?;
     let maker = nonempty(row, "maker_session")?;
     ensure!(
@@ -198,7 +214,15 @@ fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) -> Result<(
     image::image_dimensions(render).context("candidate render must be an image")?;
     bindings(ctx, &candidate, "dependencies", false)?;
     bindings(ctx, &candidate, "receipts", true)?;
-    resolved_build(ctx, &candidate, id)?;
+    let (resolved, _) = resolved_build(ctx, &candidate, id)?;
+    if let Some(approved) = row.get("approved_background") {
+        ctx.verify(approved)
+            .context("approved background evidence changed")?;
+        ensure!(
+            resolved["pages"][0]["background"]["sha256"] == approved["sha256"],
+            "built page background differs from its plan-bound approved artwork"
+        );
+    }
     let render_receipt = ctx
         .json(ctx.verify(&candidate["render_receipt"])?)
         .context("native render receipt is stale")?;
@@ -215,19 +239,26 @@ fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) -> Result<(
     Ok(())
 }
 
+pub(crate) fn maker_row<'a>(ctx: &Context, plan: &'a Value, id: &str) -> Result<&'a Value> {
+    let row = array(plan, "pages")?
+        .iter()
+        .find(|row| row["id"] == id)
+        .context("page is not in the active page plan")?;
+    ensure!(
+        ctx.continuation_owner.as_deref().map(identity)
+            == Some(identity(nonempty(row, "maker_session")?)),
+        "only the declared page owner may publish its candidate"
+    );
+    Ok(row)
+}
+
 /// Publish native build/render bindings, never a quality decision or a peer wake.
 pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
     let p = plan(ctx)?;
     let id = nonempty(request, "page")?;
-    let row = array(&p, "pages")?
-        .iter()
-        .find(|row| row["id"] == id)
-        .context("page is not in the active page plan")?;
+    let row = maker_row(ctx, &p, id)?;
+    let _lock = crate::page_verdict::lock_page(ctx, id)?;
     let maker = nonempty(row, "maker_session")?;
-    ensure!(
-        ctx.continuation_owner.as_deref().map(identity) == Some(identity(maker)),
-        "only the declared page owner may publish its candidate"
-    );
     let cycle_path = ctx.path(nonempty(request, "cycle")?)?;
     let build = ctx.json(&cycle_path)?;
     ensure!(
@@ -327,17 +358,23 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
         ctx.replace_json(&destination, &candidate)?;
     }
     let bound = ctx.binding(&destination)?;
+    let candidate_id = crate::page_verdict::token("candidate", &bound)?;
     Ok(
-        json!({"candidate":bound,"ready_for_independent_review":true,
+        json!({"candidate":bound,"candidate_id":candidate_id,"ready_for_independent_review":true,
         "notification_sent":false,"quality_approved":false,
-        "handoff":{"kind":"page_candidate_ready","page_id":id,"maker_session":maker,
+        "handoff":{"kind":"page_candidate_ready","page_id":id,"maker_session":maker,"candidate_id":candidate_id,
             "candidate":bound,"cycle":ctx.binding(&cycle_path)?,"artifact":candidate["artifact"],
-            "render":candidate["render"],"review_path":row["review"]},
+            "render":candidate["render"],"source":candidate["source"],"review_path":row["review"]},
         "next":"Keep these inputs fixed. The host routes this bound candidate to the existing independent reviewer; publication is not acceptance."}),
     )
 }
 
-fn current_review(ctx: &Context, p: &Value, row: &Value, candidate: &Value) -> Result<Value> {
+pub(crate) fn current_review(
+    ctx: &Context,
+    p: &Value,
+    row: &Value,
+    candidate: &Value,
+) -> Result<Value> {
     let id = nonempty(row, "id")?;
     let review = ctx
         .json(nonempty(row, "review")?)
@@ -347,14 +384,9 @@ fn current_review(ctx: &Context, p: &Value, row: &Value, candidate: &Value) -> R
         review["candidate_sha256"] == candidate["sha256"],
         "review is for a different candidate; review the exact current artifact, including postbuild repairs"
     );
+    crate::page_verdict::verify_scores(p, &review)?;
     let reviewer = nonempty(&review, "reviewer_session")?;
-    ensure!(
-        identity(reviewer) != identity(p["coordinator_session"].as_str().unwrap_or_default())
-            && !array(p, "pages")?.iter().any(|r| r["maker_session"]
-                .as_str()
-                .is_some_and(|maker| identity(maker) == identity(reviewer))),
-        "reviewer must be independent of coordinator and all page makers"
-    );
+    independent(p, row, reviewer)?;
     review["score"]
         .as_f64()
         .context("review score must be numeric")?;
@@ -368,7 +400,24 @@ fn current_review(ctx: &Context, p: &Value, row: &Value, candidate: &Value) -> R
     Ok(review)
 }
 
-fn review_ready(p: &Value, review: &Value) -> Result<f64> {
+pub(crate) fn independent(p: &Value, row: &Value, reviewer: &str) -> Result<()> {
+    if let Some(assigned) = row.get("reviewer_session") {
+        ensure!(
+            assigned.as_str().map(identity) == Some(identity(reviewer)),
+            "different reviewer assigned to this page"
+        );
+    }
+    ensure!(
+        identity(reviewer) != identity(p["coordinator_session"].as_str().unwrap_or_default())
+            && !array(p, "pages")?.iter().any(|r| r["maker_session"]
+                .as_str()
+                .is_some_and(|maker| identity(maker) == identity(reviewer))),
+        "reviewer must be independent of coordinator and all page makers"
+    );
+    Ok(())
+}
+
+pub(crate) fn review_ready(p: &Value, review: &Value) -> Result<f64> {
     let score = review["score"]
         .as_f64()
         .context("review score must be numeric")?;
@@ -392,7 +441,7 @@ fn review_ready(p: &Value, review: &Value) -> Result<f64> {
     Ok(score)
 }
 
-fn load_candidate(ctx: &Context, row: &Value) -> Result<(Value, Value)> {
+pub(crate) fn load_candidate(ctx: &Context, row: &Value) -> Result<(Value, Value)> {
     let path = ctx.path(nonempty(row, "candidate")?)?;
     let bytes = ctx.read(&path).context("candidate is not published")?;
     let candidate = serde_json::from_slice(&bytes).context("candidate JSON is invalid")?;
@@ -413,6 +462,11 @@ fn stable_state(ctx: &Context, binding: &Value, mut state: Value) -> Value {
         );
         state.as_object_mut().unwrap().remove("score");
         state.as_object_mut().unwrap().remove("reviewer_session");
+        state.as_object_mut().unwrap().remove("disposition");
+        state
+            .as_object_mut()
+            .unwrap()
+            .remove("review_disposition_needed");
     }
     state
 }
@@ -457,6 +511,7 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
             return state;
         }
     };
+    state["candidate_id"] = json!(crate::page_verdict::token("candidate", &binding).ok());
     state["candidate"] = binding.clone();
     if let Err(error) = validate_candidate(ctx, row, &candidate) {
         state["reason"] = json!(format!("{error:#}"));
@@ -495,6 +550,12 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
             state["work_stage"] = json!(if actionable { "repair" } else { "review" });
             state["review_disposition_needed"] = json!(!actionable);
             state["ready_for_review"] = json!(!actionable);
+            if let Some(disposition) = crate::page_verdict::disposition(&review) {
+                state["work_stage"] = json!("disposition");
+                state["review_disposition_needed"] = json!(true);
+                state["ready_for_review"] = json!(false);
+                state["disposition"] = disposition.clone();
+            }
             state["reason"] = json!(format!("{error:#}"));
         }
     }
@@ -566,7 +627,12 @@ pub fn require_ready(
             "page-first assembly page order/IDs differ from plan"
         );
         for (index, page) in pages.iter().enumerate() {
-            let candidate = ctx.json(nonempty(page, "candidate")?)?;
+            let (candidate, binding) = load_candidate(ctx, page)?;
+            ensure!(
+                binding == checked["pages"][index]["candidate"],
+                "accepted page {} changed during assembly preflight; check the current review",
+                page["id"]
+            );
             let approved_source = ctx.verify(&candidate["source"])?;
             ensure!(
                 actual_sources
@@ -578,7 +644,13 @@ pub fn require_ready(
                 "page-first assembly source differs from accepted page {}",
                 page["id"]
             );
-            let resolved = resolved_build(ctx, &candidate, nonempty(page, "id")?)?;
+            let (resolved, has_postbuild_edits) =
+                resolved_build(ctx, &candidate, nonempty(page, "id")?)?;
+            ensure!(
+                !has_postbuild_edits,
+                "source-only assembly would discard post-build edits on accepted page {}; use page_assemble to retain the accepted slide artifacts in plan order",
+                page["id"]
+            );
             ensure!(
                 serde_json::to_value(&spec.canvas)? == resolved["canvas"]
                     && serde_json::to_value(&spec.styles)? == resolved["styles"],

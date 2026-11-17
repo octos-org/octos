@@ -211,23 +211,31 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
             serialization.push(item);
         }
     }
+    let dispositions: Vec<_> = pages
+        .iter()
+        .filter(|p| p["work_stage"] == "disposition")
+        .map(|p| json!({"page":p["id"],"candidate":p["candidate"],"disposition":p["disposition"]}))
+        .collect();
     let unassigned: Vec<_> = pages
         .iter()
         .filter(|p| {
-            p["work_stage"] != "complete" && !covered.contains(p["id"].as_str().unwrap_or_default())
+            p["work_stage"] != "complete"
+                && p["work_stage"] != "disposition"
+                && !covered.contains(p["id"].as_str().unwrap_or_default())
         })
         .map(|p| {
             json!({"page":p["id"],"phase":p["work_stage"],"candidate":p["candidate"],
             "maker_session":p["maker_session"],"reason":p["reason"]})
         })
         .collect();
-    let complete = invalid.is_empty()
+    let complete = dispositions.is_empty()
+        && invalid.is_empty()
         && unassigned.is_empty()
         && serialization.is_empty()
         && capacity_limited.is_empty();
     Ok(
         json!({"plan":gate["plan"],"page_count":pages.len(),"accepted_pages":gate["accepted_pages"],
-        "pages":pages,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
+        "pages":pages,"needs_disposition":dispositions,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
         "capacity_limited_serialization":capacity_limited,"invalid_assignments":invalid,
         "eligible_idle_reviewers":idle,"completed_page_assignments":completed_work,
         "unverified_dependency_claims":dependency_claims,"declared_running_count":running_peers.len(),

@@ -20,7 +20,10 @@ cycle and native render receipts. A one-page `cycle` accepts
 `publish_candidate:true` to do this in the same call. Existing post-build edits
 require the actual `artifact`, `render_receipt` and ordered native `receipts`;
 do not silently publish the pre-repair PPTX. Publication emits review handoff
-data, never a score or an automatic peer notification. The host uses its existing
+data. Use `freeze_inputs:true` to keep the published page's root and
+source immutable. Reviewers submit their own judgment and actual evidence with
+`page_review_submit` using the exact candidate ID. See
+[page verdict](references/page-verdict.md). The host uses its existing
 peer queue to route the fresh candidate to its independent reviewer.
 
 Choose local text targets and same-role sizes from the artwork before fitting.

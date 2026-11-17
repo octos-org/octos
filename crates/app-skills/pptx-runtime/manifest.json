@@ -22,8 +22,10 @@
               "help",
               "doctor",
               "page_gate",
+              "page_assemble",
               "page_dispatch",
               "page_publish",
+              "page_review_submit",
               "build",
               "cycle",
               "render",
@@ -68,6 +70,31 @@
           },
           "page": {
             "type": "string"
+          },
+          "freeze_inputs": {
+            "type": "boolean",
+            "description": "cycle with publish_candidate: freeze the resolved page and root JSON as reusable immutable inputs before building."
+          },
+          "candidate_id": {
+            "type": "string",
+            "description": "page_review_submit: opaque identifier from the exact page publication the reviewer inspected."
+          },
+          "replaces_verdict_id": {
+            "type": "string",
+            "description": "page_review_submit: current verdict identifier when revising an existing native verdict."
+          },
+          "verdict": {
+            "type": "object",
+            "description": "Independent decision for page_review_submit. Include the actual visual evidence files and required findings.",
+            "required": ["accepted", "score", "critical_defects", "open_required_findings", "evidence"],
+            "properties": {
+              "accepted": {"type": "boolean"},
+              "score": {"type": "number", "minimum": 0, "maximum": 100},
+              "critical_defects": {"type": "array"},
+              "open_required_findings": {"type": "array"},
+              "evidence": {"type": "array", "minItems": 1},
+              "component_scores": {"type": "object"}
+            }
           },
           "output_page": {
             "type": "string",
@@ -416,6 +443,9 @@
             "type": "string",
             "enum": [
               "page_gate",
+              "page_assemble",
+              "page_review_submit",
+              "page_dispatch",
               "evidence_record",
               "review",
               "finding_register",
