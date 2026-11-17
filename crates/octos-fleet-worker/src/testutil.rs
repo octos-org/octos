@@ -30,6 +30,14 @@ pub fn controller() -> SessionKey {
     SessionKey::new("fleet", "keeper-1")
 }
 
+/// A fresh, empty escalation slot for a test `run_attempt` / registry build.
+/// The agent writes into it via the `escalate` valve; `run_attempt` reads it
+/// after the turn. The single canonical copy, shared by the worker /
+/// closed-registry / escalate test modules.
+pub fn slot() -> crate::EscalationSlot {
+    Arc::new(std::sync::Mutex::new(None))
+}
+
 pub fn budget(cap: u64) -> FleetBudget {
     FleetBudget {
         token_budget: cap,
