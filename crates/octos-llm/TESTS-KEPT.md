@@ -134,3 +134,9 @@ Concrete `EmbedQueueFull` shedding/backfill tests live in `octos-embed-llama` an
 - `cargo +1.97.1 test -p octos-llm --lib -- --list` — 807 lib tests listed; every exact name above is present in that output.
 - `python3 wake/test-lines.py` at `main@ed914b5f` — octos **458,756 lines / 12,113 counted tests**, octos-llm **24,398 / 875** (attribute-count baseline; the test binary reports 807 discoverable lib tests).
 - This PR adds only this Markdown inventory; it neither deletes nor modifies tests or production code.
+
+## OrcaRouter family (#2219)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `registry::orcarouter::tests::should_apply_gpt5_hints_to_a_prefixed_orcarouter_model_on_the_wire` | 3 | A provider-prefixed id (`openai/gpt-5`) keeps its full form on the wire while hints derive from the upstream name: `max_completion_tokens` (never `max_tokens`), no `temperature`, and the configured `reasoning_effort` is preserved. |

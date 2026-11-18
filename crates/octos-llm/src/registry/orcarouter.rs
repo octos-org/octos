@@ -53,11 +53,70 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("orcarouter")
         .with_base_url(&url);
-    if let Some(hints) = p.model_hints {
-        provider = provider.with_hints(hints);
-    }
+    // #2219 review — hints must be derived from the UPSTREAM model name
+    // (`gpt-5`), not the full provider-prefixed id (`openai/gpt-5`):
+    // ModelHints::detect matches prefixes at the string start, so the full
+    // id would silently lose GPT-5's request settings (max_tokens instead
+    // of max_completion_tokens, forwarded temperature, dropped reasoning
+    // effort). The full id stays on the wire; explicit hint overrides win.
+    let hints = p.model_hints.unwrap_or_else(|| {
+        let upstream = model
+            .split_once('/')
+            .map_or(model.as_str(), |(_, rest)| rest);
+        crate::openai::ModelHints::detect(upstream)
+    });
+    provider = provider.with_hints(hints);
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
     Ok(Arc::new(provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ChatConfig, ReasoningEffort};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// #2219 review — a provider-prefixed id keeps its full form on the wire
+    /// while hints come from the UPSTREAM name: `openai/gpt-5` must emit
+    /// `max_completion_tokens` (never `max_tokens`), omit `temperature`,
+    /// and keep the configured reasoning effort.
+    #[tokio::test]
+    async fn should_apply_gpt5_hints_to_a_prefixed_orcarouter_model_on_the_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let provider = create(CreateParams {
+            api_key: Some("sk-orca-test".into()),
+            model: Some("openai/gpt-5".into()),
+            base_url: Some(server.uri()),
+            model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .unwrap();
+        let config = ChatConfig {
+            max_tokens: Some(777),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        provider
+            .chat(&[octos_core::Message::user("hi")], &[], &config)
+            .await
+            .expect("mock chat");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "openai/gpt-5", "full id on the wire");
+        assert_eq!(body["max_completion_tokens"], 777);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
 }
