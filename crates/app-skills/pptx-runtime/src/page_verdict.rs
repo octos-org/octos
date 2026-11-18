@@ -129,6 +129,68 @@ pub(crate) fn resolution_phase(disposition: &Value, verdict: &Value) -> &'static
     }
 }
 
+// A reviewer can redirect a live referral while a specialist is still working.
+// Its result can close the earlier referral only for the same unresolved items.
+fn matches_investigated_referral(ctx: &Context, current: &Value, revised: &Value) -> Result<bool> {
+    use std::collections::BTreeSet;
+    fn ids(v: &Value, key: &str) -> Option<BTreeSet<String>> {
+        v[key]
+            .as_array()?
+            .iter()
+            .map(|f| f.as_str().or_else(|| f["id"].as_str()).map(str::to_owned))
+            .collect()
+    }
+    let phase = resolution_phase(&revised["disposition"], revised);
+    let mut head = current.clone();
+    let mut seen = BTreeSet::new();
+    loop {
+        let Some(owner) = disposition(&head) else {
+            return Ok(false);
+        };
+        if head["candidate_sha256"] != revised["candidate_sha256"]
+            || head["page_id"] != revised["page_id"]
+            || head["reviewer_session"].as_str().map(page_gate::identity)
+                != revised["reviewer_session"]
+                    .as_str()
+                    .map(page_gate::identity)
+        {
+            return Ok(false);
+        }
+        if resolution_phase(owner, &head) == phase {
+            return Ok(true);
+        }
+        let Some(previous_id) = head["replaces_verdict_id"].as_str() else {
+            return Ok(false);
+        };
+        let hash = previous_id
+            .strip_prefix("verdict-")
+            .unwrap_or("")
+            .replace('-', "");
+        ensure!(
+            previous_id == token("verdict", &json!({"sha256":hash}))? && seen.insert(hash.clone()),
+            "invalid immutable referral history"
+        );
+        let bytes = ctx.read(format!(".octos/page-verdicts/{hash}.json"))?;
+        ensure!(fs::digest(&bytes) == hash, "archived referral changed");
+        head = serde_json::from_slice(&bytes)?;
+        for key in ["critical_defects", "open_required_findings"] {
+            let Some(current_items) = ids(revised, key) else {
+                return Ok(false);
+            };
+            if ids(&head, key).as_ref() != Some(&current_items)
+                || ids(current, key).as_ref() != Some(&current_items)
+            {
+                return Ok(false);
+            }
+        }
+        if revised["critical_defects"] == json!([])
+            && revised["open_required_findings"] == json!([])
+        {
+            return Ok(false);
+        }
+    }
+}
+
 // The bound reviewer records the specialist's published report. The host owns
 // peer identity/dispatch attestation; this validates the report's file and scope.
 pub(crate) fn checked_blocker(ctx: &Context, plan: &Value, verdict: &Value) -> Result<()> {
@@ -309,7 +371,9 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         let mut v: Value = serde_json::from_slice(bytes)?;
         let prior =
             disposition(&v).context("bind a report only to a rejected native peer referral")?;
-        let phase = resolution_phase(prior, &v);
+        let bound = ctx.binding(path)?;
+        let report_value = ctx.json(ctx.verify(&bound)?)?;
+        let phase = crate::string(&report_value, "phase")?;
         ensure!(
             matches!(phase, "arbitrate" | "diagnose")
                 && v["page_id"] == id
@@ -319,7 +383,6 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
             "the original reviewer must bind the report to the exact referred candidate"
         );
         let head = token("verdict", &json!({"sha256":fs::digest(bytes)}))?;
-        let bound = ctx.binding(path)?;
         let same = prior["blocked_report"] == bound["path"]
             && v["evidence"].as_array().is_some_and(|a| a.contains(&bound));
         ensure!(
@@ -406,13 +469,9 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
             Some(previous) => {
                 let current: Value = serde_json::from_slice(previous)?;
                 if verdict["disposition"].get("blocked_report").is_some() {
-                    let prior = disposition(&current)
-                        .context("blocked report requires an existing peer referral")?;
                     ensure!(
-                        current["candidate_sha256"] == verdict["candidate_sha256"]
-                            && resolution_phase(prior, &current)
-                                == resolution_phase(&verdict["disposition"], &verdict),
-                        "blocked report must resolve the existing referral for the same candidate and phase"
+                        matches_investigated_referral(ctx, &current, &verdict)?,
+                        "blocked report must resolve an investigated referral for the same candidate and findings"
                     );
                 }
                 ensure!(

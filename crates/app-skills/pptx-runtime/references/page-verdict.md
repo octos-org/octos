@@ -38,5 +38,11 @@ This preserves the existing rejection, score, findings and evidence. Retrying
 the attachment returns the same verdict ID. Reports may identify the page by
 `page` or `page_id`; if both are present they must agree. An in-progress
 report belongs to the current investigator until it publishes a conclusion.
+Publish the finished report once and keep its bytes immutable while it is
+bound. Subsequent status updates belong in the task status, outside that file.
+If a reviewer redirected the same open finding while the specialist worked,
+the original reviewer can bind the finished result from the earlier referral.
+The runtime checks the immutable verdict chain, candidate, reviewer and finding
+IDs. A changed candidate or different finding requires its own evidence.
 The gate validates the report scope and bound bytes. Changed evidence reopens
 review. A changed capability can trigger a fresh referral or a new candidate.

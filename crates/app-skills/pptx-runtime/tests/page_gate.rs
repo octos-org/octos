@@ -299,6 +299,9 @@ fn bind_finished_report_once_on_the_original_candidate_and_review() {
     approve(&ctx, "beta");
     let mut req = verdict_request(&ctx);
     req["verdict"]["disposition"] = json!({"owner":"tool_maintainer","reason":"Font unresolved","resume_when":"Changed font capability"});
+    let original = ctx.execute(req.clone()).unwrap();
+    req["replaces_verdict_id"] = original["verdict_id"].clone();
+    req["verdict"]["disposition"]["owner"] = json!("arbiter");
     let referral = ctx.execute(req).unwrap();
     let before = ctx.json("alpha-review.json").unwrap();
     let mut bind = json!({"action":"page_review_submit","page":"alpha","blocked_report":"specialist.json",
@@ -323,6 +326,17 @@ fn bind_finished_report_once_on_the_original_candidate_and_review() {
     ctx.continuation_owner = Some("unrelated reviewer".into());
     assert!(ctx.execute(bind.clone()).is_err());
     ctx.continuation_owner = Some("reviewer".into());
+    let mut changed = verdict_request(&ctx);
+    changed["replaces_verdict_id"] = referral["verdict_id"].clone();
+    changed["verdict"]["open_required_findings"] = json!(["different-finding"]);
+    changed["verdict"]["disposition"] = json!({"owner":"tool_maintainer","reason":"Different investigation","resume_when":"New data"});
+    let mut invalid = changed.clone();
+    invalid["verdict"]["disposition"]["blocked_report"] = json!("specialist.json");
+    invalid["verdict"]["evidence"] = json!(["evidence.json", "specialist.json"]);
+    assert!(
+        ctx.execute(invalid).is_err(),
+        "old investigation cannot resolve different findings"
+    );
     let after = ctx.execute(bind.clone()).unwrap();
     assert_eq!(ctx.execute(bind.clone()).unwrap(), after);
     bind["replaces_verdict_id"] = gate(&ctx)["pages"][0]["verdict_id"].clone();
