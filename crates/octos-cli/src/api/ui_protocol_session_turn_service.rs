@@ -720,6 +720,7 @@ impl<'a> SessionTurnService<'a> {
             };
             let admission = admission.and_then(|()| {
                 let profile = background_profile.as_deref().unwrap_or(&profile_for_stamp);
+                let fail_closed_on_error = caller.ingress_generation().is_some();
                 let _observed = observe_background_grant_read(
                     &background_grants,
                     contracts,
@@ -727,6 +728,7 @@ impl<'a> SessionTurnService<'a> {
                     &session_id,
                     profile,
                     None,
+                    fail_closed_on_error,
                 )?;
                 let work = contracts
                     .background_work

@@ -261,10 +261,11 @@ fn observe_background_grant_read(
     session: &SessionKey,
     profile: &str,
     expected_hash: Option<&str>,
+    fail_closed_on_error: bool,
 ) -> Result<crate::contracts::background_work::Observation, RpcError> {
     let grants = match read {
         Ok(snapshot) => snapshot.records().to_vec(),
-        Err(error) if expected_hash.is_none() => {
+        Err(error) if !fail_closed_on_error => {
             // Ordinary browser / non-ingress turn (T-0309): a corrupt or
             // unreadable grants file must not strip existing browser
             // capabilities, and must NOT be read as a revocation (which would

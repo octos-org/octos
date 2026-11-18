@@ -151,7 +151,10 @@ Session-ingress transport rules:
   admission, and ActiveTurn insertion; CLI issue/revoke/reissue uses the
   corresponding exclusive lock across load→modify→rename. Thus a completed
   mutation either precedes the snapshot or follows admission, never lands between
-  them. Snapshot lock/read work stays off the global turn-registry lock. A stale
+  them. Snapshot lock/read work stays off the global turn-registry lock. If that
+  snapshot cannot be read, a bound work-secret caller fails closed; the existing
+  non-mutating fallback is limited to callers without an ingress generation.
+  A stale
   socket's later text frame or teardown cannot cancel work admitted under a newer
   grant or by a browser after that retirement.
   Queue ticks do not poll grants. Revoking and then disconnecting without another

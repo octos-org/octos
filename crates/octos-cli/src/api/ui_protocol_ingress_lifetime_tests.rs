@@ -681,6 +681,7 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
             &new_session,
             &profile,
             None,
+            true,
         )
         .unwrap();
         let fresh =
@@ -752,6 +753,7 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
         &browser_session,
         &profile,
         None,
+        true,
     )
     .unwrap();
     let browser_work =

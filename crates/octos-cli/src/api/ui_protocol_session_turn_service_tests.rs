@@ -102,6 +102,77 @@ async fn turn_start_matches_the_handler_on_admission_and_each_refusal() {
 }
 
 #[tokio::test]
+async fn grant_read_error_fails_closed_for_ingress_but_not_browser_turns() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (mut state, _profile) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
+    // Make the stable lock parent unusable, so every admission snapshot fails
+    // with the same storage error.
+    let bad_store_dir = temp.path().join("grant-store-is-a-file");
+    std::fs::write(&bad_store_dir, "not a directory").expect("bad store marker");
+    let store = octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&bad_store_dir);
+    Arc::get_mut(&mut state)
+        .expect("unique test state")
+        .work_secret_store = Arc::new(store);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns: SharedActiveTurns = Arc::default();
+    let connection_turns: SharedConnectionTurns = Arc::default();
+
+    for (ingress_generation, admitted) in [(None, true), (Some(0), false)] {
+        let session = twin_session("grant-read-error");
+        let caller = RecordingCaller::new(false, ingress_generation);
+        let turn = TurnId::new();
+        let start = SessionTurnService::new(&state, &ledger)
+            .start_turn(
+                &caller,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                Some(MAIN_PROFILE_ID),
+                None,
+                ConnectionUiFeatures::default(),
+                turn_start_params(&session, &turn, "read with an unavailable grant store"),
+                None,
+            )
+            .await;
+        match (ingress_generation, start.outcome) {
+            (None, Ok(turn)) => {
+                turn.start();
+                for _ in 0..200 {
+                    if !caller.runs.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    caller.runs.lock().unwrap().as_slice(),
+                    ["read with an unavailable grant store"],
+                    "a browser turn keeps the existing non-ingress read fallback"
+                );
+            }
+            (Some(_), Err(Refused::Error(error))) => {
+                assert_eq!(
+                    error.message, "Cannot verify the session's background-work generation",
+                    "an ingress caller must not take the browser fallback"
+                );
+                assert!(caller.runs.lock().unwrap().is_empty());
+            }
+            (ingress_generation, outcome) => panic!(
+                "unexpected outcome for ingress_generation={ingress_generation:?}: admitted={}",
+                outcome.is_ok()
+            ),
+        }
+        assert_eq!(
+            active_turns.lock().await.contains_key(&session),
+            admitted,
+            "caller admission state does not match ingress_generation={ingress_generation:?}"
+        );
+        active_turns.lock().await.remove(&session);
+    }
+}
+
+#[tokio::test]
 async fn session_open_matches_the_handler_for_ordinary_ingress_and_foreign_scope() {
     // (connection profile, work-secret ingress, opened)
     for case in [

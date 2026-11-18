@@ -126,6 +126,9 @@ worker, never under `active_turns`, and the guard never enters socket/turn state
 A per-session/profile observation gate serializes each read with its subsequent
 validate/observe/admit step, so a late old snapshot cannot overwrite a replacement
 grant or clear a newer revocation; different sessions do not share that gate.
+If the fenced snapshot itself cannot be read, only a caller without an ingress
+generation may use the non-mutating browser fallback; a bound work-secret caller
+fails closed instead of admitting work without the authoritative snapshot.
 No session holds the global admission lock across grant-file I/O. Synchronous child
 calls and already-running native tools retain their existing completion/timeout
 limitation. Connection cleanup releases the global turn-registry lock before waiting on
