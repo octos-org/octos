@@ -58,14 +58,15 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     // ModelHints::detect matches prefixes at the string start, so the full
     // id would silently lose GPT-5's request settings (max_tokens instead
     // of max_completion_tokens, forwarded temperature, dropped reasoning
-    // effort). The full id stays on the wire; explicit hint overrides win.
-    let hints = p.model_hints.unwrap_or_else(|| {
-        let upstream = model
-            .split_once('/')
-            .map_or(model.as_str(), |(_, rest)| rest);
-        crate::openai::ModelHints::detect(upstream)
-    });
+    // effort). The full id is passed to OpenAIProvider::new unchanged (the
+    // wire keeps `openai/gpt-5`); the detect input is only the last path
+    // segment. Explicit hint overrides are applied AFTER the detected
+    // defaults, so they still win.
+    let hints = crate::openai::ModelHints::detect(model.rsplit('/').next().unwrap_or(&model));
     provider = provider.with_hints(hints);
+    if let Some(overrides) = p.model_hints {
+        provider = provider.with_hints(overrides);
+    }
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
@@ -118,5 +119,50 @@ mod tests {
         assert!(body.get("max_tokens").is_none(), "{body}");
         assert!(body.get("temperature").is_none(), "{body}");
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    /// #2219 review — explicit `model_hints` still WIN over the detected
+    /// defaults: with a fully-default override the same prefixed model sends
+    /// plain `max_tokens`, forwards the configured temperature, and drops
+    /// the reasoning effort (ReasoningStyle::None).
+    #[tokio::test]
+    async fn should_let_explicit_hint_overrides_win_over_detected_gpt5_defaults() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            ))
+            .mount(&server)
+            .await;
+        let provider = create(CreateParams {
+            api_key: Some("sk-orca-test".into()),
+            model: Some("openai/gpt-5".into()),
+            base_url: Some(server.uri()),
+            model_hints: Some(crate::openai::ModelHints::default()),
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .unwrap();
+        let config = ChatConfig {
+            max_tokens: Some(777),
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        provider
+            .chat(&[octos_core::Message::user("hi")], &[], &config)
+            .await
+            .expect("mock chat");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "openai/gpt-5", "full id on the wire");
+        assert_eq!(
+            body["max_tokens"], 777,
+            "explicit override keeps max_tokens"
+        );
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+        assert_eq!(body["temperature"], 0.7);
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
     }
 }
