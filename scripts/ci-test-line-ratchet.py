@@ -8,8 +8,10 @@ plus inline `#[cfg(test)]` modules, JS/TS `*.test.*`/`*.spec.*` and
 
 pull_request and merge_group enforce: net growth > 0 fails unless the PR
 carries `test-growth-approved` added by a human maintainer (see
-MAINTAINERS; the shared agent account never counts). Push to main only
-reports the numbers.
+MAINTAINERS; the shared agent account never counts). The baseline is the
+merge-base of the event base and head refs, so a PR behind main is not
+credited with deleting main's newer tests. Push to main only reports the
+numbers.
 
 `--self-test` runs offline cases in temporary git repositories.
 """
@@ -70,6 +72,17 @@ def ensure_ref(repo: Path, ref: str) -> None:
     )
     if fetched.returncode:
         raise SystemExit(f"cannot resolve {ref}: {fetched.stderr.strip()}")
+
+
+def merge_base(repo: Path, base: str, head: str) -> str:
+    result = subprocess.run(
+        ["git", "merge-base", base, head], cwd=repo, capture_output=True, text=True
+    )
+    if result.returncode:
+        raise SystemExit(
+            f"cannot find merge-base for {base} and {head}: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
 
 
 def measure(repo: Path, ref: str) -> dict[str, int]:
@@ -154,14 +167,15 @@ def run(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     ensure_ref(repo, args.base)
     ensure_ref(repo, args.head)
-    base = measure(repo, args.base)
+    comparison = merge_base(repo, args.base, args.head)
+    base = measure(repo, comparison)
     head = measure(repo, args.head)
     base_total = sum(base.values())
     head_total = sum(head.values())
     delta = head_total - base_total
     print(
-        f"test-line ratchet: base {args.base} = {base_total} lines, "
-        f"head {args.head} = {head_total} lines, delta = {delta:+d}"
+        f"test-line ratchet: base {args.base} (merge-base {comparison}) = "
+        f"{base_total} lines, head {args.head} = {head_total} lines, delta = {delta:+d}"
     )
     if args.report_only:
         print("report-only event (push): no enforcement")
@@ -225,8 +239,44 @@ def fixture_repo(root: Path, growth: int) -> Path:
     return repo, base_sha, head_sha
 
 
-def case(root: Path, name: str, growth: int, *extra: str, expect: int) -> None:
-    repo, base, head = fixture_repo(root / name, growth)
+def stale_branch_repo(root: Path) -> tuple[Path, str, str]:
+    repo = root / "fixture"
+    (repo / "crates/demo/src").mkdir(parents=True)
+    (repo / "crates/demo").joinpath("Cargo.toml").write_text("[package]\nname = \"demo\"\n")
+    lib = repo / "crates/demo/src/lib.rs"
+
+    def source(cases: int) -> str:
+        body = "".join(f"#[test]\nfn case_{i}() {{}}\n" for i in range(cases))
+        return f"pub fn f() {{}}\n\n#[cfg(test)]\nmod tests {{\n{body}}}\n"
+
+    lib.write_text(source(3))
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "ratchet@example.invalid")
+    git(repo, "config", "user.name", "ratchet self-test")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "base")
+    main_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    git(repo, "checkout", "-qb", "stale-pr")
+    (repo / "branch-note.txt").write_text("non-test branch change\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "pr change")
+    pr_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    git(repo, "checkout", "-q", main_branch)
+    lib.write_text(source(4))
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "main adds a test")
+    main_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    git(repo, "remote", "add", "origin", str(repo))
+    return repo, main_sha, pr_sha
+
+
+def run_case(name: str, repo: Path, base: str, head: str, *extra: str, expect: int) -> str:
     result = subprocess.run(
         [
             sys.executable, str(Path(__file__).resolve()), "--repo", str(repo),
@@ -242,6 +292,11 @@ def case(root: Path, name: str, growth: int, *extra: str, expect: int) -> None:
     return result.stdout
 
 
+def case(root: Path, name: str, growth: int, *extra: str, expect: int) -> None:
+    repo, base, head = fixture_repo(root / name, growth)
+    return run_case(name, repo, base, head, *extra, expect=expect)
+
+
 def self_test(repo_root: Path) -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -252,6 +307,10 @@ def self_test(repo_root: Path) -> None:
         assert "net test-line growth" in out and "lib.rs" in out, out
         assert "offset this in the same PR" in out, out
         assert "If it truly cannot be offset" in out, out
+        stale_repo, stale_base, stale_head = stale_branch_repo(root / "stale-pr")
+        out = run_case("stale-pr", stale_repo, stale_base, stale_head, expect=0)
+        assert "delta = +0" in out, out
+        assert "merge-base" in out, out
         out = case(root, "report", 2, "--report-only", expect=0)
         assert "report-only" in out, out
         maintainer_events = root / "maintainer.json"
