@@ -47,6 +47,7 @@
               "geometry",
               "evidence_init",
               "evidence_record",
+              "evidence_blocked",
               "evidence_status",
               "ocr",
               "raster_overlap",

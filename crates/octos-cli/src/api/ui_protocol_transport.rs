@@ -39868,6 +39868,25 @@ async fn run_standalone_turn(
         // never hand off recursively. The staged event is sent DURABLE so a
         // briefly-disconnected client still opens the peer on replay.
         if peer_handoff_allowed_for_session(&session_id) {
+            let master = session_id.clone();
+            let profile = session_runtime.profile.profile_id.clone();
+            let workspace = session_runtime.workspace_root.clone();
+            tool_registry.register(octos_agent::PeerCheckpointInboxTool::new(
+                move |ids, after| {
+                    if session_workspace_root_for_profile(Some(&profile), &master).as_ref()
+                        != Some(&workspace)
+                    {
+                        return Err("Supervisor workspace binding changed".into());
+                    }
+                    default_agent_orchestrator().peer_checkpoint_inbox(
+                        &master,
+                        &profile,
+                        &workspace,
+                        &ids,
+                        after.as_deref(),
+                    )
+                },
+            ));
             let peer_ws = ws.clone();
             let peer_ledger = ledger.clone();
             // #1868 Phase 1 — enroll the peer as SUPERVISED work. Peers were

@@ -7,6 +7,9 @@ use tokio_tungstenite::tungstenite::Message as Frame;
 
 #[derive(Default)]
 struct HandoffModel {
+    inbox_calls: AtomicUsize,
+    owner_ready: tokio::sync::Notify,
+    allow_inbox: tokio::sync::Notify,
     maker_calls: AtomicUsize,
     supervisor_calls: AtomicUsize,
     reviewed: AtomicBool,
@@ -31,6 +34,50 @@ impl octos_llm::LlmProvider for HandoffModel {
         if user.contains("WAIT_SIBLING") {
             self.sibling_entered.notify_one();
             self.hold_sibling.notified().await;
+        } else if user.contains("RECONCILE_ACCOUNTED_CHECKPOINT") {
+            let (tool, arguments) = match self.inbox_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.owner_ready.notify_one();
+                    self.allow_inbox.notified().await;
+                    ("discover_tools", json!({"name":"peer_checkpoint_inbox"}))
+                }
+                1 => (
+                    "run_tool",
+                    json!({"name":"peer_checkpoint_inbox","arguments":{}}),
+                ),
+                2 => {
+                    let listing = &messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == MessageRole::Tool)
+                        .unwrap()
+                        .content;
+                    assert!(
+                        listing.contains("already-bound.json") && listing.contains("page-03.json"),
+                        "{listing}"
+                    );
+                    let id = listing
+                        .split("external/peer_checkpoint_handoff/")
+                        .skip(1)
+                        .filter_map(|part| part.split_once("/old-revision").map(|(stage, _)| stage))
+                        .find(|stage| uuid::Uuid::parse_str(stage).is_ok())
+                        .unwrap();
+                    let receipt = format!("external/peer_checkpoint_handoff/{id}/old-revision");
+                    (
+                        "run_tool",
+                        json!({"name":"peer_checkpoint_inbox","arguments":{"acknowledge":[receipt]}}),
+                    )
+                }
+                _ => ("", Value::Null),
+            };
+            if !tool.is_empty() {
+                calls.push(octos_core::ToolCall {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: tool.into(),
+                    arguments,
+                    metadata: None,
+                });
+            }
         } else if user.contains("MAKE_HANDOFF") {
             let call = self.maker_calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
@@ -44,16 +91,21 @@ impl octos_llm::LlmProvider for HandoffModel {
                     arguments: json!({"name":"peer_publish"}),
                     metadata: None,
                 });
-            } else if call < 3 {
+            } else if call < 4 {
                 assert!(
                     messages
                         .iter()
                         .any(|m| m.role == MessageRole::Tool && m.content.contains("handoff_id")),
                     "registered peer_publish does not advertise handoff_id"
                 );
+                let (path, revision) = if call == 1 {
+                    ("already-bound.json", "old-revision")
+                } else {
+                    ("review/page-03.json", "page-03-r01")
+                };
                 calls.push(octos_core::ToolCall {
                     id:format!("publish-{call}"), name:"run_tool".into(),
-                    arguments:json!({"name":"peer_publish","arguments":{"message":"review/page-03.json","handoff_id":"page-03-r01"}}),
+                    arguments:json!({"name":"peer_publish","arguments":{"message":path,"handoff_id":revision}}),
                     metadata:None,
                 });
             } else {
@@ -242,12 +294,43 @@ async fn exercise_handoff() {
     tokio::time::timeout(Duration::from_secs(20), model.sibling_entered.notified())
         .await
         .expect("sibling must be running");
+    std::fs::create_dir_all(workspace.join(".octos")).unwrap();
+    let report = b"checked blocker";
+    std::fs::write(workspace.join("already-bound.json"), report).unwrap();
+    use sha2::Digest as _;
+    std::fs::write(workspace.join(".octos/continuation.json"),json!({
+        "schema_version":1,"task_id":"blocked-fixture","owner_agent":format!("session:{}",master.0),
+        "evidence_file":".octos/evidence.json","stagnant_attempts":3,"required_checks":[{"id":"package"}],
+        "deliverables":["final.pptx"]
+    }).to_string()).unwrap();
+    std::fs::write(workspace.join(".octos/evidence.json"),json!({
+        "schema_version":1,"task_id":"blocked-fixture","attempt":1,"phase":"blocked",
+        "artifacts":[{"path":"already-bound.json","sha256":format!("{:x}",sha2::Sha256::digest(report))}],
+        "checks":[{"id":"package","status":"fail"}]
+    }).to_string()).unwrap();
+    rpc(
+        &mut socket,
+        "turn/start",
+        turn_params(&master, "RECONCILE_ACCOUNTED_CHECKPOINT"),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(20), model.owner_ready.notified())
+        .await
+        .unwrap();
     rpc(
         &mut socket,
         "turn/start",
         turn_params(&maker, "MAKE_HANDOFF"),
     )
     .await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while model.maker_calls.load(Ordering::SeqCst) < 5 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    model.allow_inbox.notify_one();
     let durable = SupervisorStore::new(&store);
     tokio::time::timeout(Duration::from_secs(40), async {
         loop {
@@ -260,11 +343,25 @@ async fn exercise_handoff() {
                 })
                 .collect();
             if model.maker_calls.load(Ordering::SeqCst) >= 4
+                && wakes.len() == 2
                 && wakes
                     .iter()
-                    .any(|w| w.status == ContinuationStatus::Completed)
+                    .all(|w| w.status == ContinuationStatus::Completed)
             {
-                assert_eq!(wakes.len(), 1);
+                let old = wakes
+                    .iter()
+                    .find(|w| w.continuation_id.ends_with("/old-revision"))
+                    .unwrap();
+                assert_eq!(
+                    old.result.as_deref(),
+                    Some("acknowledged_by_owning_supervisor")
+                );
+                let evidence: Value = serde_json::from_slice(
+                    &std::fs::read(workspace.join(".octos/continuation-state.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(evidence["completion_blocked"], true);
+                assert!(!workspace.join("final.pptx").exists());
                 assert_eq!(wakes[0].metadata["session_id"], master.0);
                 assert_eq!(
                     wakes[0].metadata["payload:envelope"]

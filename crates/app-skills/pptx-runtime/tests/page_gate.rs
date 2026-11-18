@@ -278,6 +278,27 @@ fn exhausted_peer_investigation_ends_blocked_and_stale_evidence_reopens_work() {
     ctx.replace_json("result.json", &report).unwrap();
     ctx.execute(req.clone()).unwrap();
     ctx.execute(req).unwrap();
+    let policy = json!({"schema_version":1,"owner_agent":"coordinator","task_id":"fixture","evidence_file":"whole-task.json",
+        "required_checks":[{"id":"package"},{"id":"copy"},{"id":"artwork"},{"id":"readability"}],"deliverables":["final.pptx"],"stagnant_attempts":3});
+    ctx.write_json(".octos/continuation.json", &policy).unwrap();
+    ctx.write_json("whole-task.json",&json!({"schema_version":1,"task_id":"fixture","phase":"pending","attempt":0,"checks":[],"artifacts":[]})).unwrap();
+    assert!(ctx.execute(json!({"action":"evidence_blocked"})).is_err());
+    ctx.continuation_owner = Some("coordinator".into());
+    let blocked = ctx.execute(json!({"action":"evidence_blocked"})).unwrap();
+    assert_eq!(blocked["attempt"], 1);
+    assert_eq!(blocked["quality_approved"], false);
+    assert_eq!(
+        ctx.execute(json!({"action":"evidence_blocked"})).unwrap(),
+        blocked
+    );
+    let frozen = ctx.json("whole-task.json").unwrap();
+    assert_eq!(frozen["phase"], "blocked");
+    assert!(
+        frozen["artifacts"]
+            .as_array()
+            .unwrap()
+            .contains(&ctx.binding("result.json").unwrap())
+    );
     let result = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
     assert_eq!(result["only_blocked_pages_remain"], true);
     assert_eq!(result["blocked_pages"][0]["page"], "alpha");
@@ -289,6 +310,8 @@ fn exhausted_peer_investigation_ends_blocked_and_stale_evidence_reopens_work() {
     let result = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
     assert_eq!(result["only_blocked_pages_remain"], false);
     assert_eq!(result["ready_unassigned"][0]["phase"], "review");
+    assert!(ctx.execute(json!({"action":"evidence_blocked"})).is_err());
+    assert_eq!(ctx.json("whole-task.json").unwrap(), frozen);
 }
 
 #[test]

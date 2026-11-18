@@ -21,6 +21,7 @@ kernel-enforced page scopes unless the actual host supports and consumes them.
 - `evidence_retarget`: revised delivery paths plus reason, preserving the same
   task and all failure/stagnation history. Use this for obsolete output paths;
   reinitialization is not a repair operation.
+- `evidence_blocked` records an incomplete coordinator attempt when page admission has exhausted all ready work and each unresolved page has a verified independent blocker. Identical evidence retains its attempt number.
 - `evidence_status`: actual owner_agent; confirms whether the persisted runtime
   observer consumed the exact policy and evidence hashes.
 

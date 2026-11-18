@@ -63,6 +63,7 @@ impl Context {
             .unwrap_or("help")
         {
             "help" if request["topic"].as_str().is_some() => match request["topic"].as_str().context("lib::execute: missing required value")? {
+                "evidence_blocked" => Ok(json!({"action":"evidence_blocked","required":[],"owner":"page and continuation coordinator","purpose":"Record a blocked attempt after the native page gate verifies that every unresolved page has a bound blocker. Retains independent review evidence and leaves final deck quality unapproved."})),
                 "evidence_record" => Ok(json!({"action":"evidence_record","required":["cycle"],"optional":["review","comparisons","scope_change_reason"],
                     "example":{"action":"evidence_record","cycle":"attempt/cycle.json","review":"review/bound.json"},
                     "requirements":["Maker owns the frozen policy; delivery files must match the reviewed candidate.","Use independent review_submit output; omit review only to record genuinely incomplete machine-only evidence.","Rust increments a checked attempt; never invent or edit the counter.","Before the first completed check attempt=0 pending is expected, not a defect.","On the next tool turn, evidence_status confirms host consumption."],"quality_approved":false})),
@@ -85,7 +86,7 @@ impl Context {
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","page_gate","page_dispatch","page_publish","page_review_submit","page_assemble","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["operations","review_view","finding_register","doctor","page_gate","page_dispatch","page_publish","page_review_submit","page_assemble","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_blocked","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
@@ -168,6 +169,7 @@ impl Context {
             })().map_err(|e: anyhow::Error| anyhow::anyhow!("{e:#}\nUsage: {}", geometry::usage())),
             "evidence_init" => evidence::init(self, &request),
             "evidence_retarget" => evidence::retarget(self, &request),
+            "evidence_blocked" => evidence::record_blocked(self),
             "evidence_record" => evidence::record(self, &request),
             "evidence_status" => evidence::status(self, &request),
             other => bail!("unknown action {other}"),

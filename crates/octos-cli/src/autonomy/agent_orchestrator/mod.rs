@@ -4752,6 +4752,91 @@ impl InProcessAgentOrchestrator {
         self.enqueue_peer_occurrence(request, true, publish)
     }
 
+    /// A supervisor can reconcile a backlog within its current turn. Select by
+    /// immutable stage/revision keys, never by age or by the latest blackboard.
+    pub(crate) fn peer_checkpoint_inbox(
+        &self,
+        master: &SessionKey,
+        profile: &str,
+        workspace: &Path,
+        acknowledge: &[String],
+        after: Option<&str>,
+    ) -> Result<Value, String> {
+        if !crate::peers::peer_handoff_allowed_for_session(master)
+            || master.profile_id() != Some(profile)
+        {
+            return Err("Only the owning supervisor can acknowledge checkpoints".into());
+        }
+        let target = self.scoped_goal_key(master);
+        let mut state = self.state();
+        let mut listed = Vec::new();
+        let mut handled = Vec::new();
+        for item in state.continuations.pending_items() {
+            if item.session_id.as_str() != target.0
+                || item.profile_id.as_str() != profile
+                || !matches!(&item.reason, MasterContinuationReason::External(kind) if kind == PEER_CHECKPOINT_HANDOFF_KIND)
+            {
+                continue;
+            }
+            let Some(envelope) = item
+                .metadata
+                .get("envelope")
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            else {
+                continue;
+            };
+            let publication = &envelope["publication"];
+            if publication["master"].as_str() != Some(&master.0)
+                || publication["workspace"].as_str().map(Path::new) != Some(workspace)
+            {
+                continue;
+            }
+            let id = item.dedupe_key.as_str();
+            if acknowledge.iter().any(|receipt| receipt == id) {
+                handled.push(item.dedupe_key.clone());
+            } else {
+                listed.push((id.to_owned(), json!({"receipt":id, "peer":publication["slug"],
+                    "handoff_id":envelope["checkpoint"]["handoff_id"], "message":envelope["checkpoint"]["message"]})));
+            }
+        }
+        if !handled.is_empty() {
+            let now = now_ms_u64();
+            let entries: Vec<_> = handled
+                .iter()
+                .map(|id| CoalescedTombstoneEntry {
+                    group_id: PEER_CHECKPOINT_HANDOFF_KIND.to_owned(),
+                    continuation_id: id.as_str().to_owned(),
+                    completed_at_ms: now,
+                    result: "acknowledged_by_owning_supervisor".to_owned(),
+                    attempt: 0,
+                })
+                .collect();
+            let store = state
+                .supervisor_store
+                .as_ref()
+                .ok_or("Checkpoint store unavailable")?;
+            store
+                .record_continuations_coalesced(&entries)
+                .map_err(|e| e.to_string())?;
+            for id in &handled {
+                cancel_pending_continuation(&mut state, id);
+            }
+        }
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        let pending = listed.len();
+        let mut remaining = listed
+            .into_iter()
+            .filter(|(id, _)| after.is_none_or(|cursor| id.as_str() > cursor));
+        let page: Vec<_> = remaining.by_ref().take(4).map(|(_, row)| row).collect();
+        let next_after = remaining
+            .next()
+            .and_then(|_| page.last())
+            .and_then(|row| row["receipt"].as_str());
+        Ok(
+            json!({"acknowledged":handled.len(),"pending":pending,"checkpoints":page,"next_after":next_after}),
+        )
+    }
+
     fn enqueue_peer_occurrence(
         &self,
         request: MasterContinuationRequest,

@@ -2181,6 +2181,37 @@ fn peer_checkpoint_handoff_survives_busy_parent_and_restart_and_deduplicates_aft
         fresh.drain_and_claim_ready_continuation_for_session(&owner, profile, idle, 1);
     assert_eq!(wakes.len(), 1);
     assert!(master_continuation_prompt(&wakes[0]).contains("review/s2-r1.json"));
+    publish(fresh, "old blocker already handled", "spent").unwrap();
+    let inbox = |scheduler: &InProcessAgentOrchestrator,
+                 target: &SessionKey,
+                 cwd: &Path,
+                 ids: &[String]| {
+        scheduler.peer_checkpoint_inbox(target, profile, cwd, ids, None)
+    };
+    let list = inbox(fresh, &owner, &workspace, &[]).unwrap();
+    let receipt = list["checkpoints"][0]["receipt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ids = vec![receipt];
+    assert!(inbox(fresh, &caller, &workspace, &ids).is_err());
+    assert_eq!(
+        inbox(fresh, &owner, tmp.path(), &ids).unwrap()["acknowledged"],
+        0
+    );
+    let other = SessionKey::with_profile(profile, "local", "different-master");
+    assert_eq!(
+        inbox(fresh, &other, &workspace, &ids).unwrap()["acknowledged"],
+        0
+    );
+    assert_eq!(
+        inbox(fresh, &owner, &workspace, &ids).unwrap()["acknowledged"],
+        1
+    );
+    assert_eq!(
+        inbox(fresh, &owner, &workspace, &ids).unwrap()["acknowledged"],
+        0
+    );
     publish(fresh, "review/s2-r2.json", "s2-r2").unwrap();
     assert!(
         fresh

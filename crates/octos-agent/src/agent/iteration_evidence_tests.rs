@@ -34,6 +34,53 @@ fn poll(root: &Path, final_answer: bool) -> Decision {
 }
 
 #[test]
+fn verified_blocker_ends_the_attempt_with_undelivered_outputs() {
+    let d = setup();
+    report(d.path(), 1, 1., "fail");
+    let file = d.path().join("evidence.json");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    snapshot["phase"] = json!("blocked");
+    fs::rename(d.path().join("artifact.bin"), d.path().join("blocker.json")).unwrap();
+    snapshot["artifacts"][0]["path"] = json!("blocker.json");
+    fs::write(&file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    assert!(
+        matches!(poll(d.path(), true), Decision::Yield(note) if note.contains("evidence_stalled"))
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(d.path().join(STATE)).unwrap()).unwrap();
+    assert_eq!(state["completion_blocked"], true);
+    assert_eq!(poll(d.path(), false), Decision::Continue);
+    fs::write(d.path().join("blocker.json"), "changed").unwrap();
+    assert!(
+        matches!(poll(d.path(), true), Decision::Notice(note) if note.contains("stale artifact"))
+    );
+    report(d.path(), 2, 0., "pass");
+    assert_eq!(poll(d.path(), true), Decision::Continue);
+}
+
+#[test]
+fn a_blocked_attempt_cannot_replace_the_final_pass_or_omit_a_required_check() {
+    for checks in [
+        json!([]),
+        json!([{"id":"other","status":"fail"}]),
+        json!([{"id":"layout","status":"pass"}]),
+    ] {
+        let d = setup();
+        report(d.path(), 1, 0., "pass");
+        let file = d.path().join("evidence.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        snapshot["phase"] = json!("blocked");
+        snapshot["checks"] = checks;
+        fs::write(file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(
+            matches!(poll(d.path(), true), Decision::Notice(note) if note.contains("every required check"))
+        );
+    }
+}
+
+#[test]
 fn unchanged_completion_claims_reach_a_durable_handoff_without_counting_polls() {
     let d = setup();
     report(d.path(), 1, 9., "unknown");

@@ -237,6 +237,18 @@ that job remain, the owning coordinator retires that peer with `peer_close`.
 `peer_send_input` queues another turn even when the message says “stand down”.
 Write the blocked outcome to the existing machine-readable task status used by
 the host, with the bound report paths.
+Before ending the owner turn, open `peer_checkpoint_inbox` on hosts that expose
+it. Reconcile each queued checkpoint against the dispatch inventory, page
+candidate and bound report. Acknowledge only the exact receipt IDs whose work
+is accounted for. Follow `next_after` for additional messages. Handle new
+actionable evidence normally. Acknowledgement consumes a notification and
+preserves the peer's result and review.
+
+When the workspace has an owner continuation policy and every unfinished
+page has a bound independent blocker, the coordinator calls `evidence_blocked`.
+This records the native packaging blocker and leaves final quality checks
+unknown. End the turn after reconciling the inbox. A changed input or a fresh
+handoff can start a new attempt.
 Earlier runtimes and pre-existing verdict files retain their original contracts.
 
 Keep the current dispatch record in the existing coordination files.

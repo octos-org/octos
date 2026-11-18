@@ -246,7 +246,12 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
         let state = ctx.json(&sp)?;
         v["runtime_consumed_current_evidence"] = json!(
             e["task_id"] == p["task_id"]
-                && e["phase"] == "checked"
+                && (e["phase"] == "checked"
+                    || (e["phase"] == "blocked"
+                        && e["artifacts"]
+                            .as_array()
+                            .is_some_and(|rows| !rows.is_empty()
+                                && rows.iter().all(|row| ctx.verify(row).is_ok()))))
                 && e["attempt"].as_u64().is_some_and(|n| n > 0)
                 && state["attempt"] == e["attempt"]
                 && state["policy_digest"] == crate::fs::sha_file(&ctx.path(POLICY)?)?
@@ -267,6 +272,91 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
     }
     Ok(v)
 }
+/// Publish the page admission failure as an incomplete owner attempt. This
+/// does not produce a deck, a visual score, or a passing whole-deck check.
+pub fn record_blocked(ctx: &Context) -> Result<Value> {
+    let _lock = lock(ctx)?;
+    let policy = ctx.json(POLICY)?;
+    let owner = ctx
+        .continuation_owner
+        .as_deref()
+        .context("host coordinator identity required")?;
+    ensure!(
+        policy["owner_agent"] == owner,
+        "only the continuation owner may record a blocker"
+    );
+    let gate = crate::page_gate::check(ctx)?;
+    ensure!(
+        crate::page_gate::identity(owner)
+            == crate::page_gate::identity(string(&gate, "coordinator_session")?),
+        "page plan belongs to another coordinator"
+    );
+    let pages = gate["pages"]
+        .as_array()
+        .context("active page plan required")?;
+    ensure!(
+        pages.iter().any(|p| p["work_stage"] == "blocked")
+            && pages
+                .iter()
+                .all(|p| p["work_stage"] == "blocked" || p["work_stage"] == "complete"),
+        "every unfinished page needs a bound independent blocker"
+    );
+    let mut artifacts = vec![gate["plan"].clone()];
+    for page in pages {
+        for key in ["candidate", "review_binding"] {
+            artifacts.push(page[key].clone());
+        }
+        let verdict = ctx.json(ctx.verify(&page["review_binding"])?)?;
+        if let Some(bindings) = verdict["evidence"].as_array() {
+            // Independent reviews may attach descriptive fields to a binding;
+            // the continuation observer accepts only the path and content hash.
+            artifacts.extend(
+                bindings
+                    .iter()
+                    .map(|b| json!({"path":b["path"],"sha256":b["sha256"]})),
+            );
+        }
+    }
+    artifacts.sort_by_key(Value::to_string);
+    artifacts.dedup();
+    for binding in &artifacts {
+        ctx.verify(binding)?;
+    }
+    let ep = string(&policy, "evidence_file")?;
+    let previous = ctx.json(ep)?;
+    ensure!(
+        previous["task_id"] == policy["task_id"],
+        "evidence belongs to another task"
+    );
+    let old = previous["attempt"].as_u64().context("invalid attempt")?;
+    let mut payload = json!({"schema_version":1,"task_id":policy["task_id"],"attempt":old,"phase":"blocked",
+        "scope":previous.get("scope").cloned().unwrap_or_else(||json!([])),
+        "artifacts":artifacts,"checks":[{"id":"package","status":"fail"},
+        {"id":"copy","status":"unknown"},{"id":"artwork","status":"unknown"},{"id":"readability","status":"unknown"}]});
+    if previous != payload {
+        payload["attempt"] = json!(old.checked_add(1).context("attempt overflow")?);
+        ensure!(
+            serde_json::to_vec_pretty(&payload)?.len() <= 256 * 1024,
+            "blocked evidence exceeds the continuation observer record limit"
+        );
+        if old > 0 {
+            let archive = format!(
+                ".octos/pptx-blocker-history/{old}-{}.json",
+                ctx.binding(ep)?["sha256"]
+                    .as_str()
+                    .context("missing digest")?
+            );
+            if !ctx.path(&archive)?.exists() {
+                ctx.write_json(&archive, &previous)?;
+            }
+        }
+        ctx.replace_json(ep, &payload)?;
+    }
+    Ok(
+        json!({"evidence":ctx.binding(ep)?,"attempt":payload["attempt"],"outcome":"blocked","quality_approved":false,"reason":"Native page admission prevents final packaging; final deck checks remain outstanding."}),
+    )
+}
+
 pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     let _lock = lock(ctx)?;
     let policy = ctx.json(POLICY)?;
@@ -664,7 +754,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         .as_u64()
         .unwrap_or(0)
         .max(previous["attempt"].as_u64().unwrap_or(0));
-    let attempt = if old["key"] == key {
+    let attempt = if old["key"] == key && previous["phase"] != "blocked" {
         n
     } else {
         n.checked_add(1)

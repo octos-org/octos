@@ -276,7 +276,7 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
             .iter()
             .all(|p| p["work_stage"] == "blocked" || p["work_stage"] == "complete");
     let handoff = blocked_only.then(|| json!({"outcome":"blocked","automatic_retry_allowed":false,
-        "next":"End the attempt as blocked with the existing page reports. Stop consumed task monitors and close any existing goal as blocked through its owner. Resume only on a changed candidate, capability or evidence."}));
+        "next":"Record the verified page blockers with evidence_blocked when the workspace has a continuation policy. Reconcile queued peer checkpoints with peer_checkpoint_inbox on supported hosts and acknowledge the exact handled receipts. Stop consumed task monitors and end this attempt as blocked. Resume on changed evidence or capability."}));
     Ok(
         json!({"plan":gate["plan"],"page_count":pages.len(),"accepted_pages":gate["accepted_pages"],
         "pages":pages,"needs_disposition":dispositions,"blocked_pages":blocked,"only_blocked_pages_remain":blocked_only,"handoff":handoff,"ready_unassigned":unassigned,"avoidable_serialization":serialization,

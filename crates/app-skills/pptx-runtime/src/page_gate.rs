@@ -466,6 +466,7 @@ fn stable_state(ctx: &Context, binding: &Value, mut state: Value) -> Value {
         state.as_object_mut().unwrap().remove("score");
         state.as_object_mut().unwrap().remove("reviewer_session");
         state.as_object_mut().unwrap().remove("verdict_id");
+        state.as_object_mut().unwrap().remove("review_binding");
         state.as_object_mut().unwrap().remove("disposition");
         state
             .as_object_mut()
@@ -532,6 +533,7 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
         }
     };
     state["review_current"] = json!(true);
+    state["review_binding"] = review_binding.clone();
     if review["kind"] == crate::page_verdict::KIND {
         state["verdict_id"] = json!(
             crate::page_verdict::token("verdict", &review_binding)

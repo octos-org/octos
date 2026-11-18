@@ -58,6 +58,7 @@ struct Snapshot {
 enum Phase {
     Pending,
     Checked,
+    Blocked,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -263,7 +264,7 @@ impl Observer {
                     binding.path
                 );
             }
-            if final_answer {
+            if final_answer && snapshot.phase != Phase::Blocked {
                 for delivery in &policy.deliverables {
                     let path = confined(&root, delivery)?;
                     ensure!(
@@ -287,6 +288,19 @@ impl Observer {
                     "invalid residual"
                 );
                 observed.insert(c.id.clone(), c.clone());
+            }
+            if snapshot.phase == Phase::Blocked {
+                ensure!(
+                    policy
+                        .required_checks
+                        .iter()
+                        .all(|check| observed.contains_key(&check.id))
+                        && policy
+                            .required_checks
+                            .iter()
+                            .any(|check| observed[&check.id].status == Status::Fail),
+                    "a blocked attempt must account for every required check and identify a failure"
+                );
             }
             Ok(policy
                 .required_checks
@@ -378,7 +392,10 @@ impl Observer {
             state.attempt = snapshot.attempt;
             state.snapshot_digest = fingerprint.clone();
             let was_warned = state.warned;
-            if !ready && state.flat_attempts >= policy.stagnant_attempts {
+            if snapshot.phase != Phase::Blocked
+                && !ready
+                && state.flat_attempts >= policy.stagnant_attempts
+            {
                 state.warned = true;
                 state.completion_blocked = true;
                 save(&state_path, &state)?;
@@ -393,7 +410,16 @@ impl Observer {
                     Decision::Notice(message)
                 });
             }
+            if snapshot.phase == Phase::Blocked {
+                state.completion_blocked = true;
+            }
             save(&state_path, &state)?;
+        }
+        if snapshot.phase == Phase::Blocked && final_answer {
+            return Ok(Decision::Yield(format!(
+                "[evidence_stalled] A checked blocker ended this attempt. Unresolved checks: {}. Keep the bound evidence and resume on a changed input or capability.",
+                unresolved(&current)
+            )));
         }
         if state.completion_blocked && !ready && final_answer {
             return Ok(Decision::Yield(stalled_message(&current)));
