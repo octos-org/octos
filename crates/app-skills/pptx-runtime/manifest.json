@@ -83,6 +83,10 @@
             "type": "string",
             "description": "page_review_submit: current verdict identifier when revising an existing native verdict."
           },
+          "blocked_report": {
+            "type": "string",
+            "description": "page_review_submit: bind a finished specialist report to the existing rejected verdict using candidate_id and replaces_verdict_id. Omit verdict."
+          },
           "verdict": {
             "type": "object",
             "description": "Independent decision for page_review_submit. Include the actual visual evidence files and required findings.",

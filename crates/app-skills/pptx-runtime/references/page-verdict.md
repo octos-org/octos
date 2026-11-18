@@ -29,7 +29,14 @@ When the assigned specialist exhausts permitted remedies, they publish a JSON
 report containing `outcome:"blocked"`, `phase` (`arbitrate` or `diagnose`),
 `page`, `candidate_sha256`, `peer` (their session), `attempted_remedy` and
 `remaining_blocker`. The coordinator verifies the native publication identity.
-The original reviewer revises the rejected referral, includes the report path
-in `evidence` and `disposition.blocked_report`, and preserves the open findings.
+The original reviewer can attach the published report in one call. Use the
+candidate and verdict IDs returned on the same `page_gate` row:
+
+    {"action":"page_review_submit","page":"intro","candidate_id":"<candidate id>","replaces_verdict_id":"<verdict id>","blocked_report":"reviews/intro-specialist.json"}
+
+This preserves the existing rejection, score, findings and evidence. Retrying
+the attachment returns the same verdict ID. Reports may identify the page by
+`page` or `page_id`; if both are present they must agree. An in-progress
+report belongs to the current investigator until it publishes a conclusion.
 The gate validates the report scope and bound bytes. Changed evidence reopens
 review. A changed capability can trigger a fresh referral or a new candidate.

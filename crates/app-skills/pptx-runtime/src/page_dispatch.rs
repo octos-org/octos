@@ -275,14 +275,16 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
         && pages
             .iter()
             .all(|p| p["work_stage"] == "blocked" || p["work_stage"] == "complete");
+    let handoff = blocked_only.then(|| json!({"outcome":"blocked","automatic_retry_allowed":false,
+        "next":"End the attempt as blocked with the existing page reports. Stop consumed task monitors and close any existing goal as blocked through its owner. Resume only on a changed candidate, capability or evidence."}));
     Ok(
         json!({"plan":gate["plan"],"page_count":pages.len(),"accepted_pages":gate["accepted_pages"],
-        "pages":pages,"needs_disposition":dispositions,"blocked_pages":blocked,"only_blocked_pages_remain":blocked_only,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
+        "pages":pages,"needs_disposition":dispositions,"blocked_pages":blocked,"only_blocked_pages_remain":blocked_only,"handoff":handoff,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
         "capacity_limited_serialization":capacity_limited,"invalid_assignments":invalid,
         "eligible_idle_reviewers":idle,"completed_page_assignments":completed_work,
         "unverified_dependency_claims":dependency_claims,"declared_running_count":running_peers.len(),
         "declared_coverage_complete":complete,
-        "all_work_waiting":if !unassigned.is_empty() || !serialization.is_empty() || !capacity_limited.is_empty() {json!(false)} else {Value::Null},
+        "all_work_waiting":if blocked_only || !unassigned.is_empty() || !serialization.is_empty() || !capacity_limited.is_empty() {json!(false)} else {Value::Null},
         "host_verified":false,"agent_execution_verified":false,"quality_approved":false,
         "limitations":"Page readiness is checked against bound files. Assignments, peer availability, authorization, attachment and dependencies are coordinator declarations, not host attestations. This check does not dispatch peers, grant permissions, judge quality or enforce EndTurn. A complete plan does not prove simultaneous execution; verify native current-turn events."}),
     )

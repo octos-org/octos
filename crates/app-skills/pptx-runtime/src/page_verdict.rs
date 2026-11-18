@@ -2,9 +2,8 @@
 use crate::{Context, fs, page_gate};
 use anyhow::{Context as _, Result, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
-const KIND: &str = "page-review-v1";
+pub(crate) const KIND: &str = "page-review-v1";
 
 pub(crate) fn token(kind: &str, binding: &Value) -> Result<String> {
     let hash = binding["sha256"]
@@ -148,11 +147,13 @@ pub(crate) fn checked_blocker(ctx: &Context, plan: &Value, verdict: &Value) -> R
         .find(|b| b["path"] == path)
         .context("blocked_report must be bound in verdict evidence")?;
     let report = ctx.json(ctx.verify(bound)?)?;
+    let page = report.get("page").or_else(|| report.get("page_id"));
     ensure!(
         report["outcome"] == "blocked"
             && report["phase"] == phase
             && report["candidate_sha256"] == verdict["candidate_sha256"]
-            && report["page"] == verdict["page_id"],
+            && page == Some(&verdict["page_id"])
+            && report.get("page_id").is_none_or(|id| Some(id) == page),
         "blocker must describe the investigated phase and exact page candidate"
     );
     let peer = page_gate::identity(crate::string(&report, "peer")?);
@@ -177,9 +178,22 @@ pub(crate) fn checked_blocker(ctx: &Context, plan: &Value, verdict: &Value) -> R
         }
     }
     for key in ["attempted_remedy", "remaining_blocker"] {
+        let note = crate::string(&report, key)?.trim();
         ensure!(
-            !crate::string(&report, key)?.trim().is_empty(),
-            "missing {key} in blocker report"
+            !note.is_empty()
+                && !note
+                    .split([':', '—', '–'])
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("pending"),
+            "unfinished {key} in blocker report; await the current specialist's final publication"
+        );
+    }
+    if let Some(evidence) = report.get("evidence") {
+        ensure!(
+            evidence.as_array().is_some_and(|rows| !rows.is_empty()),
+            "blocker report has an empty or malformed evidence inventory"
         );
     }
     Ok(())
@@ -266,9 +280,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     );
     page_gate::validate_candidate(ctx, row, &candidate)?;
 
-    let mut verdict = request["verdict"].clone();
-    let fields = verdict.as_object().context("verdict must be an object")?;
-    let reserved: BTreeSet<_> = [
+    let reserved = [
         "kind",
         "page_id",
         "reviewer_session",
@@ -279,13 +291,71 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         "render",
         "replaces_verdict_id",
         "rubric",
-    ]
-    .into_iter()
-    .collect();
-    ensure!(
-        !fields.keys().any(|k| reserved.contains(k.as_str())),
-        "omit tool-owned identity, candidate, artifact and rubric fields"
-    );
+    ];
+    let dest = ctx.path(crate::string(row, "review")?)?;
+    let old = dest.exists().then(|| ctx.read(&dest)).transpose()?;
+    let mut replaces = request.get("replaces_verdict_id").cloned();
+    let mut verdict = if let Some(report) = request.get("blocked_report") {
+        ensure!(
+            request.get("verdict").is_none(),
+            "blocked_report preserves the existing verdict; omit verdict"
+        );
+        let path = report
+            .as_str()
+            .context("blocked_report must be a report path")?;
+        let bytes = old
+            .as_deref()
+            .context("no rejected native verdict to bind")?;
+        let mut v: Value = serde_json::from_slice(bytes)?;
+        let prior =
+            disposition(&v).context("bind a report only to a rejected native peer referral")?;
+        let phase = resolution_phase(prior, &v);
+        ensure!(
+            matches!(phase, "arbitrate" | "diagnose")
+                && v["page_id"] == id
+                && v["candidate"] == binding
+                && v["reviewer_session"].as_str().map(page_gate::identity)
+                    == Some(page_gate::identity(reviewer)),
+            "the original reviewer must bind the report to the exact referred candidate"
+        );
+        let head = token("verdict", &json!({"sha256":fs::digest(bytes)}))?;
+        let bound = ctx.binding(path)?;
+        let same = prior["blocked_report"] == bound["path"]
+            && v["evidence"].as_array().is_some_and(|a| a.contains(&bound));
+        ensure!(
+            replaces
+                .as_ref()
+                .is_some_and(|r| r == &head || (same && r == &v["replaces_verdict_id"])),
+            "stale referral; use the current verdict_id"
+        );
+        if same {
+            replaces = v.get("replaces_verdict_id").cloned();
+        }
+        v["disposition"]["owner"] = json!(if phase == "arbitrate" {
+            "arbiter"
+        } else {
+            "tool_maintainer"
+        });
+        v["disposition"]["blocked_report"] = bound["path"].clone();
+        let evidence = v["evidence"]
+            .as_array_mut()
+            .context("missing review evidence")?;
+        if !same && !evidence.contains(&bound) {
+            evidence.push(bound);
+        }
+        for field in reserved {
+            v.as_object_mut().unwrap().remove(field);
+        }
+        v
+    } else {
+        let v = request["verdict"].clone();
+        let fields = v.as_object().context("verdict must be an object")?;
+        ensure!(
+            !fields.keys().any(|k| reserved.contains(&k.as_str())),
+            "omit tool-owned identity, candidate, artifact and rubric fields"
+        );
+        v
+    };
     verdict["kind"] = json!(KIND);
     verdict["page_id"] = row["id"].clone();
     verdict["reviewer_session"] = json!(reviewer);
@@ -297,8 +367,8 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     if let Some(rubric) = plan.get("rubric") {
         verdict["rubric"] = rubric.clone();
     }
-    if let Some(prior) = request.get("replaces_verdict_id") {
-        verdict["replaces_verdict_id"] = prior.clone();
+    if let Some(prior) = replaces {
+        verdict["replaces_verdict_id"] = prior;
     }
     validate(ctx, &plan, &mut verdict)?;
     if verdict["disposition"].get("blocked_report").is_some() {
@@ -309,7 +379,6 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         checked_blocker(ctx, &plan, &verdict)?;
     }
 
-    let dest = ctx.path(crate::string(row, "review")?)?;
     for evidence in verdict["evidence"]
         .as_array()
         .context("missing verdict evidence")?
@@ -323,7 +392,6 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     let digest = fs::digest(&bytes);
     let archive = format!(".octos/page-verdicts/{digest}.json");
     let verdict_id = token("verdict", &json!({"sha256":digest}))?;
-    let old = dest.exists().then(|| ctx.read(&dest)).transpose()?;
     let identical = old.as_deref() == Some(bytes.as_slice());
     if !identical {
         ensure!(

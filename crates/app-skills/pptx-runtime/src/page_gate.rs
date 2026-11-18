@@ -374,11 +374,11 @@ pub(crate) fn current_review(
     p: &Value,
     row: &Value,
     candidate: &Value,
-) -> Result<Value> {
+) -> Result<(Value, Value)> {
     let id = nonempty(row, "id")?;
-    let review = ctx
-        .json(nonempty(row, "review")?)
-        .context("independent review is pending")?;
+    let path = nonempty(row, "review")?;
+    let bytes = ctx.read(path).context("independent review is pending")?;
+    let review: Value = serde_json::from_slice(&bytes).context("invalid independent review")?;
     ensure!(review["page_id"] == id, "review names another page");
     ensure!(
         review["candidate_sha256"] == candidate["sha256"],
@@ -397,7 +397,10 @@ pub(crate) fn current_review(
     array(&review, "critical_defects")?;
     array(&review, "open_required_findings")?;
     bindings(ctx, &review, "evidence", true)?;
-    Ok(review)
+    Ok((
+        review,
+        json!({"path":path,"sha256":crate::fs::digest(&bytes)}),
+    ))
 }
 
 pub(crate) fn independent(p: &Value, row: &Value, reviewer: &str) -> Result<()> {
@@ -462,6 +465,7 @@ fn stable_state(ctx: &Context, binding: &Value, mut state: Value) -> Value {
         );
         state.as_object_mut().unwrap().remove("score");
         state.as_object_mut().unwrap().remove("reviewer_session");
+        state.as_object_mut().unwrap().remove("verdict_id");
         state.as_object_mut().unwrap().remove("disposition");
         state
             .as_object_mut()
@@ -518,7 +522,7 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
         return state;
     }
     state["candidate_current"] = json!(true);
-    let review = match current_review(ctx, p, row, &state["candidate"]) {
+    let (review, review_binding) = match current_review(ctx, p, row, &state["candidate"]) {
         Ok(review) => review,
         Err(error) => {
             state["work_stage"] = json!("review");
@@ -528,6 +532,12 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
         }
     };
     state["review_current"] = json!(true);
+    if review["kind"] == crate::page_verdict::KIND {
+        state["verdict_id"] = json!(
+            crate::page_verdict::token("verdict", &review_binding)
+                .expect("SHA-256 from review bytes")
+        );
+    }
     state["reviewer_session"] = review["reviewer_session"].clone();
     state["score"] = review["score"].clone();
     match review_ready(p, &review) {

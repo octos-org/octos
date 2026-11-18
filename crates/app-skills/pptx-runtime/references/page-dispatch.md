@@ -25,6 +25,9 @@
   referral and candidate. See [page verdicts](page-verdict.md). Dispatch other
   pages. When `only_blocked_pages_remain` is true, report the blockers and end
   the attempt. Assembly still requires every page to pass.
+  The terminal `handoff` sets `automatic_retry_allowed:false`. Retire consumed
+  monitors and close the existing task goal as blocked. An idle coordinator
+  has no peer work to reissue for this inventory.
 
 Use `page_dispatch` for a read-only coverage check. It reuses the real page gate,
 does not write files, start peers, author prompts, grade visuals or change limits.

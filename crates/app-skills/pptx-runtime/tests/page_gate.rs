@@ -292,6 +292,60 @@ fn exhausted_peer_investigation_ends_blocked_and_stale_evidence_reopens_work() {
 }
 
 #[test]
+fn bind_finished_report_once_on_the_original_candidate_and_review() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("reviewer".into());
+    approve(&ctx, "beta");
+    let mut req = verdict_request(&ctx);
+    req["verdict"]["disposition"] = json!({"owner":"tool_maintainer","reason":"Font unresolved","resume_when":"Changed font capability"});
+    let referral = ctx.execute(req).unwrap();
+    let before = ctx.json("alpha-review.json").unwrap();
+    let mut bind = json!({"action":"page_review_submit","page":"alpha","blocked_report":"specialist.json",
+        "candidate_id":referral["candidate_id"],"replaces_verdict_id":referral["verdict_id"]});
+    let mut report = json!({"page_id":"alpha","phase":"diagnose","outcome":"blocked","candidate_sha256":before["candidate_sha256"],
+        "peer":"specialist","attempted_remedy":"PENDING — measurement in progress.","remaining_blocker":"PENDING","evidence":[]});
+    ctx.write_json("specialist.json", &report).unwrap();
+    assert!(ctx.execute(bind.clone()).is_err());
+    report["attempted_remedy"] = json!("Measured available shapes");
+    report["remaining_blocker"] = json!("Required shape unavailable");
+    ctx.replace_json("specialist.json", &report).unwrap();
+    assert!(
+        ctx.execute(bind.clone()).is_err(),
+        "must not attach empty inventory"
+    );
+    report["evidence"] = json!(["evidence.json"]);
+    report["page"] = json!("beta");
+    ctx.replace_json("specialist.json", &report).unwrap();
+    assert!(ctx.execute(bind.clone()).is_err());
+    report.as_object_mut().unwrap().remove("page");
+    ctx.replace_json("specialist.json", &report).unwrap();
+    ctx.continuation_owner = Some("unrelated reviewer".into());
+    assert!(ctx.execute(bind.clone()).is_err());
+    ctx.continuation_owner = Some("reviewer".into());
+    let after = ctx.execute(bind.clone()).unwrap();
+    assert_eq!(ctx.execute(bind.clone()).unwrap(), after);
+    bind["replaces_verdict_id"] = gate(&ctx)["pages"][0]["verdict_id"].clone();
+    assert_eq!(ctx.execute(bind.clone()).unwrap(), after);
+    bind["replaces_verdict_id"] = json!("stale");
+    assert!(ctx.execute(bind).is_err());
+    let v = ctx.json("alpha-review.json").unwrap();
+    for key in [
+        "score",
+        "open_required_findings",
+        "accepted",
+        "candidate_sha256",
+    ] {
+        assert_eq!(v[key], before[key]);
+    }
+    let dispatch = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
+    assert_eq!(dispatch["ready_unassigned"], json!([]));
+    assert_eq!(dispatch["handoff"]["automatic_retry_allowed"], false);
+    assert_eq!(dispatch["all_work_waiting"], false);
+    assert_eq!(gate(&ctx)["ready_for_assembly"], false);
+}
+
+#[test]
 fn native_submission_preserves_legacy_verdict_and_rejects_changed_sources() {
     let t = tempfile::tempdir().unwrap();
     let mut ctx = fixture(t.path());

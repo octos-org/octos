@@ -222,6 +222,15 @@ through the native peer channel. Confirm the sender, page and candidate against
 the assignment. The original reviewer binds that report with
 `page_review_submit` as documented in its tool help. A dispatch inventory with
 `only_blocked_pages_remain:true` ends this attempt with a technical blocker.
+Consume the specialist's native publication once per candidate. Send it
+straight to the original reviewer for attachment using the top-level
+`blocked_report` option of `page_review_submit`. A spelling or binding error
+requires correcting the submission, not commissioning another investigation.
+While an investigator is active, await its publication. Do not send another
+peer to audit the wait. When dispatch returns a blocked handoff, record the task
+as blocked, retire this task's consumed native monitors, and transition its
+existing goal to blocked through the owner if present. Do not dispatch a final
+review or ask another peer to verify a terminal dispatch inventory.
 Earlier runtimes and pre-existing verdict files retain their original contracts.
 
 Keep the current dispatch record in the existing coordination files.

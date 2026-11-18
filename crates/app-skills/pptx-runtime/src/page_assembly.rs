@@ -20,10 +20,7 @@ fn approved_inputs(ctx: &Context) -> Result<Value> {
             .with_context(|| format!("page {id} has no candidate"))?;
         page_gate::validate_candidate(ctx, row, &candidate)
             .with_context(|| format!("page {id} candidate is stale"))?;
-        let review_binding = ctx
-            .binding(string(row, "review")?)
-            .with_context(|| format!("page {id} independent review is pending"))?;
-        let review = page_gate::current_review(ctx, &plan, row, &binding)
+        let (review, review_binding) = page_gate::current_review(ctx, &plan, row, &binding)
             .with_context(|| format!("page {id} review is stale"))?;
         page_gate::review_ready(&plan, &review)
             .with_context(|| format!("page {id} has not passed review"))?;
