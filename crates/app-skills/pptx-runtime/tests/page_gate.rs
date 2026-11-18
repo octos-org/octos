@@ -183,10 +183,112 @@ fn below_threshold_without_a_maker_fix_routes_to_a_specific_owner() {
     ctx.execute(req).unwrap();
     let inventory = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
     assert_eq!(inventory["needs_disposition"][0]["page"], "alpha");
-    assert_eq!(inventory["ready_unassigned"].as_array().unwrap().len(), 1);
-    assert_eq!(inventory["ready_unassigned"][0]["page"], "beta");
+    assert_eq!(inventory["ready_unassigned"].as_array().unwrap().len(), 2);
+    assert_eq!(inventory["ready_unassigned"][0]["phase"], "diagnose");
+    assert_eq!(inventory["ready_unassigned"][1]["page"], "beta");
     assert_eq!(inventory["declared_coverage_complete"], false);
     assert_eq!(gate(&ctx)["ready_for_assembly"], false);
+}
+
+#[test]
+fn human_handoffs_resume_as_peer_work_without_changing_existing_verdicts() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("reviewer".into());
+    approve(&ctx, "beta");
+    let mut req = verdict_request(&ctx);
+    req["verdict"]["open_required_findings"] = json!([]);
+    req["verdict"]["disposition"] =
+        json!({"owner":"task_owner","reason":"Scoring dispute","resume_when":"Owner decides"});
+    assert!(
+        ctx.execute(req.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("arbiter")
+    );
+    assert!(!t.path().join("alpha-review.json").exists());
+    req["verdict"]["disposition"]["owner"] = json!("arbiter");
+    ctx.execute(req).unwrap();
+    let candidate = ctx.binding("alpha-candidate.json").unwrap();
+    ctx.write_json(
+        ".octos/pptx-verification-plan.json",
+        &json!({"mode":"independent_visual","arbiter_agent":"session:arbiter-1"}),
+    )
+    .unwrap();
+    let audit = |phase: &str, peer: &str| {
+        ctx.execute(json!({"action":"page_dispatch","peers":[{"peer":peer,"state":"running","attached":true,"authorized":true}],
+            "assignments":[{"phase":phase,"page":"alpha","peer":peer,"state":"running","candidate_sha256":candidate["sha256"]}]})).unwrap()
+    };
+    for peer in ["reviewer", "maker-beta", "coordinator", "other-arbiter"] {
+        assert_eq!(
+            audit("arbitrate", peer)["declared_coverage_complete"],
+            false
+        );
+    }
+    assert_eq!(
+        audit("arbitrate", "arbiter-1")["declared_coverage_complete"],
+        true
+    );
+    edit(&ctx, "alpha-review.json", |r| {
+        r["disposition"]["owner"] = json!("task_owner")
+    });
+    let legacy = ctx.binding("alpha-review.json").unwrap();
+    let result = audit("arbitrate", "arbiter-1");
+    assert_eq!(result["needs_disposition"][0]["phase"], "arbitrate");
+    assert_eq!(result["accepted_pages"], 1);
+    assert_eq!(ctx.binding("alpha-review.json").unwrap(), legacy);
+    edit(&ctx, "alpha-review.json", |r| {
+        r["open_required_findings"] = json!(["F1"])
+    });
+    assert_eq!(
+        audit("diagnose", "technical-peer")["declared_coverage_complete"],
+        true
+    );
+    assert_eq!(
+        audit("diagnose", "maker-alpha")["declared_coverage_complete"],
+        false
+    );
+    assert_eq!(gate(&ctx)["ready_for_assembly"], false);
+}
+
+#[test]
+fn exhausted_peer_investigation_ends_blocked_and_stale_evidence_reopens_work() {
+    let t = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(t.path());
+    ctx.continuation_owner = Some("reviewer".into());
+    approve(&ctx, "beta");
+    let mut req = verdict_request(&ctx);
+    req["verdict"]["disposition"] = json!({"owner":"tool_maintainer","reason":"Font unavailable","resume_when":"Compatible font is available"});
+    let referral = ctx.execute(req.clone()).unwrap();
+    req["replaces_verdict_id"] = referral["verdict_id"].clone();
+    req["verdict"]["disposition"]["blocked_report"] = json!("result.json");
+    assert!(ctx.execute(req.clone()).is_err());
+    req["verdict"]["evidence"] = json!(["evidence.json", "result.json"]);
+    let mut report = json!({"outcome":"blocked","phase":"diagnose","page":"alpha","candidate_sha256":"obsolete",
+        "peer":"technical-peer","attempted_remedy":"Tested authorized fonts","remaining_blocker":"No compatible font available"});
+    ctx.write_json("result.json", &report).unwrap();
+    assert!(ctx.execute(req.clone()).is_err());
+    report["candidate_sha256"] = ctx.binding("alpha-candidate.json").unwrap()["sha256"].clone();
+    for peer in ["session:reviewer", "session:coordinator", "maker-beta"] {
+        report["peer"] = json!(peer);
+        ctx.replace_json("result.json", &report).unwrap();
+        assert!(ctx.execute(req.clone()).is_err());
+    }
+    report["peer"] = json!("technical-peer");
+    ctx.replace_json("result.json", &report).unwrap();
+    ctx.execute(req.clone()).unwrap();
+    ctx.execute(req).unwrap();
+    let result = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
+    assert_eq!(result["only_blocked_pages_remain"], true);
+    assert_eq!(result["blocked_pages"][0]["page"], "alpha");
+    assert_eq!(result["ready_unassigned"], json!([]));
+    assert_eq!(gate(&ctx)["ready_for_assembly"], false);
+    edit(&ctx, "result.json", |r| {
+        r["remaining_blocker"] = json!("changed")
+    });
+    let result = ctx.execute(json!({"action":"page_dispatch"})).unwrap();
+    assert_eq!(result["only_blocked_pages_remain"], false);
+    assert_eq!(result["ready_unassigned"][0]["phase"], "review");
 }
 
 #[test]

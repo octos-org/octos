@@ -91,7 +91,7 @@ impl Context {
             ),
             "doctor" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,"runtime":"rust","ocr":ocr::capabilities(),"bundled_fonts":env!("OCTOS_PPTX_BUNDLED_FONTS")=="true","python_required":false,"libreoffice_required":false,"node_required":false,
-                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists(),"dispatch_coverage_check":true,"review_submission":true,"freeze_inputs":true,"artifact_assembly":true},
+                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists(),"dispatch_coverage_check":true,"peer_resolution":true,"review_submission":true,"freeze_inputs":true,"artifact_assembly":true},
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),

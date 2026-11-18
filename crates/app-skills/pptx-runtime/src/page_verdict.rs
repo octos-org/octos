@@ -93,7 +93,7 @@ pub(crate) fn verify_scores(plan: &Value, verdict: &Value) -> Result<()> {
 fn disposition_valid(disposition: &Value) -> bool {
     matches!(
         disposition["owner"].as_str(),
-        Some("reviewer" | "tool_maintainer" | "task_owner")
+        Some("reviewer" | "tool_maintainer" | "arbiter" | "task_owner")
     ) && ["reason", "resume_when"].iter().all(|k| {
         disposition[k]
             .as_str()
@@ -106,6 +106,83 @@ pub(crate) fn disposition(review: &Value) -> Option<&Value> {
         && review["accepted"] == false
         && disposition_valid(&review["disposition"]))
     .then_some(&review["disposition"])
+}
+
+/// Legacy task_owner verdicts remain immutable. Derive peer work from the bound
+/// findings without changing the grade or treating an old waiver request as authority.
+pub(crate) fn resolution_phase(disposition: &Value, verdict: &Value) -> &'static str {
+    match disposition["owner"].as_str() {
+        Some("reviewer") => "review",
+        Some("tool_maintainer") => "diagnose",
+        Some("task_owner")
+            if disposition["secondary_owner"] == "tool_maintainer"
+                || ["critical_defects", "open_required_findings"]
+                    .iter()
+                    .any(|key| {
+                        verdict[key]
+                            .as_array()
+                            .is_some_and(|items| !items.is_empty())
+                    }) =>
+        {
+            "diagnose"
+        }
+        _ => "arbitrate",
+    }
+}
+
+// The bound reviewer records the specialist's published report. The host owns
+// peer identity/dispatch attestation; this validates the report's file and scope.
+pub(crate) fn checked_blocker(ctx: &Context, plan: &Value, verdict: &Value) -> Result<()> {
+    let disp = disposition(verdict).context("a blocker requires a rejected native verdict")?;
+    let phase = resolution_phase(disp, verdict);
+    ensure!(
+        matches!(phase, "diagnose" | "arbitrate"),
+        "a blocker requires independent peer investigation"
+    );
+    let path = crate::string(disp, "blocked_report")?;
+    let evidence = verdict["evidence"]
+        .as_array()
+        .context("missing bound evidence")?;
+    let bound = evidence
+        .iter()
+        .find(|b| b["path"] == path)
+        .context("blocked_report must be bound in verdict evidence")?;
+    let report = ctx.json(ctx.verify(bound)?)?;
+    ensure!(
+        report["outcome"] == "blocked"
+            && report["phase"] == phase
+            && report["candidate_sha256"] == verdict["candidate_sha256"]
+            && report["page"] == verdict["page_id"],
+        "blocker must describe the investigated phase and exact page candidate"
+    );
+    let peer = page_gate::identity(crate::string(&report, "peer")?);
+    ensure!(
+        !peer.trim().is_empty()
+            && peer != page_gate::identity(crate::string(verdict, "reviewer_session")?)
+            && peer != page_gate::identity(crate::string(plan, "coordinator_session")?)
+            && !plan["pages"]
+                .as_array()
+                .context("missing pages")?
+                .iter()
+                .any(|p| p["maker_session"].as_str().map(page_gate::identity) == Some(peer)),
+        "blocker investigation must come from a separate peer"
+    );
+    if phase == "arbitrate" {
+        let verification = crate::review_routes::load_plan(ctx)?;
+        if let Some(arbiter) = verification["arbiter_agent"].as_str() {
+            ensure!(
+                peer == page_gate::identity(arbiter),
+                "blocker report names a different arbiter"
+            );
+        }
+    }
+    for key in ["attempted_remedy", "remaining_blocker"] {
+        ensure!(
+            !crate::string(&report, key)?.trim().is_empty(),
+            "missing {key} in blocker report"
+        );
+    }
+    Ok(())
 }
 
 fn validate(ctx: &Context, plan: &Value, verdict: &mut Value) -> Result<()> {
@@ -138,7 +215,7 @@ fn validate(ctx: &Context, plan: &Value, verdict: &mut Value) -> Result<()> {
             .all(|k| verdict[k].as_array().is_some_and(|v| v.is_empty()));
     if rejected_without_finding || verdict.get("disposition").is_some() {
         if disposition(verdict).is_none() {
-            errors.push("a disposition requires a rejected verdict, owner (reviewer, tool_maintainer or task_owner), reason and resume_when; otherwise list actionable findings".to_owned());
+            errors.push("a disposition requires a rejected verdict, peer role (reviewer, arbiter or tool_maintainer), reason and resume_when; otherwise list actionable findings".to_owned());
         }
     }
     if let Err(err) = verify_scores(plan, verdict) {
@@ -224,6 +301,13 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         verdict["replaces_verdict_id"] = prior.clone();
     }
     validate(ctx, &plan, &mut verdict)?;
+    if verdict["disposition"].get("blocked_report").is_some() {
+        ensure!(
+            request["replaces_verdict_id"].is_string(),
+            "investigate the rejected verdict before recording a blocker"
+        );
+        checked_blocker(ctx, &plan, &verdict)?;
+    }
 
     let dest = ctx.path(crate::string(row, "review")?)?;
     for evidence in verdict["evidence"]
@@ -242,6 +326,10 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     let old = dest.exists().then(|| ctx.read(&dest)).transpose()?;
     let identical = old.as_deref() == Some(bytes.as_slice());
     if !identical {
+        ensure!(
+            verdict["disposition"]["owner"] != "task_owner",
+            "route rubric disputes to arbiter or capability limitations to tool_maintainer; human approval cannot resolve a page verdict"
+        );
         match old.as_ref() {
             None => ensure!(
                 request.get("replaces_verdict_id").is_none(),
@@ -249,6 +337,16 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
             ),
             Some(previous) => {
                 let current: Value = serde_json::from_slice(previous)?;
+                if verdict["disposition"].get("blocked_report").is_some() {
+                    let prior = disposition(&current)
+                        .context("blocked report requires an existing peer referral")?;
+                    ensure!(
+                        current["candidate_sha256"] == verdict["candidate_sha256"]
+                            && resolution_phase(prior, &current)
+                                == resolution_phase(&verdict["disposition"], &verdict),
+                        "blocked report must resolve the existing referral for the same candidate and phase"
+                    );
+                }
                 ensure!(
                     current["kind"] == KIND && current["page_id"] == id,
                     "preserve existing review file; configure a fresh plan review path for native submissions"

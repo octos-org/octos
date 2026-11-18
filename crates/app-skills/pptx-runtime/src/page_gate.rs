@@ -551,9 +551,16 @@ fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
             state["review_disposition_needed"] = json!(!actionable);
             state["ready_for_review"] = json!(!actionable);
             if let Some(disposition) = crate::page_verdict::disposition(&review) {
-                state["work_stage"] = json!("disposition");
+                let phase = if disposition.get("blocked_report").is_some()
+                    && crate::page_verdict::checked_blocker(ctx, p, &review).is_ok()
+                {
+                    "blocked"
+                } else {
+                    crate::page_verdict::resolution_phase(disposition, &review)
+                };
+                state["work_stage"] = json!(phase);
                 state["review_disposition_needed"] = json!(true);
-                state["ready_for_review"] = json!(false);
+                state["ready_for_review"] = json!(phase == "review");
                 state["disposition"] = disposition.clone();
             }
             state["reason"] = json!(format!("{error:#}"));

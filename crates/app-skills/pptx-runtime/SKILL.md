@@ -10,6 +10,9 @@ and peer sessions selected for the task. Read the returned PNG files with the ho
 image-capable `read_file` tool; paths alone are not visual review.
 
 For the full-deck one-maker-per-page workflow, read [page-first admission](references/page-first.md).
+The coordinator dispatches unresolved scoring and capability questions to Octos
+peers through [page dispatch](references/page-dispatch.md). The original
+reviewer retains the verdict and the quality gate remains in force.
 The coordinator declares the complete task-local plan before production. `page_gate`
 reports bound per-page review readiness; `build`/`cycle` and `batch` then refuse
 multi-page output until the active plan passes. This checks evidence and ownership

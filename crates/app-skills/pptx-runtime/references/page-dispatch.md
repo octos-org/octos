@@ -16,6 +16,15 @@
   to clarify its decision rather than inventing edits or demanding a higher score.
 - `complete`: the current candidate already meets the unchanged page gate.
   Keep it frozen; do not start cosmetic work to occupy an idle agent.
+- `arbitrate`: assign an independent third peer to interpret the existing rubric
+  on the bound evidence. Use the frozen arbiter when configured. The original
+  reviewer owns any revision to its verdict.
+- `diagnose`: assign an authorized technical peer to reproduce the capability
+  failure and identify a repair within the task's permissions.
+- `blocked`: the original reviewer bound a specialist's report for the exact
+  referral and candidate. See [page verdicts](page-verdict.md). Dispatch other
+  pages. When `only_blocked_pages_remain` is true, report the blockers and end
+  the attempt. Assembly still requires every page to pass.
 
 Use `page_dispatch` for a read-only coverage check. It reuses the real page gate,
 does not write files, start peers, author prompts, grade visuals or change limits.
@@ -41,8 +50,8 @@ Omitting `assignments`/`peers` returns a work inventory with uncovered pages.
 ```
 
 Use exact identities from the page plan/native peer tools; `session:` is normalized.
-Assignment `phase` is `make`, `review` or `repair`; `state` is `running`, `queued`
-or `waiting`. Review/repair assignments name the exact current candidate digest.
+Assignment `phase` matches the page's work stage; `state` is `running`, `queued`
+or `waiting`. Active assignments after make name the exact current candidate digest.
 Waiting assignments require a specific `dependency`; they are unverified claims,
 not coverage of a ready phase. A waiting reviewer may remain staged while its own
 maker prepares a candidate. Production must stay with the declared page maker;
@@ -78,6 +87,13 @@ Before reassigning queued work, confirm the old assignment is stood down; preser
 all review/finding history and avoid duplicate writers or reviewer shopping.
 
 
-A current native review can route a page to `needs_disposition` with a named
-owner and a specific condition for resuming. The page remains incomplete and
-requires coordinator action. It is excluded from automatic maker/reviewer retry.
+A current native review can name a peer role and a specific condition for
+resuming. These pages appear in `needs_disposition` and, until assigned, in
+`ready_unassigned` with their executable phase. Dispatch the peer through the
+native host. Group pages sharing the same cause in one job and declare each
+candidate separately. A technical result goes to the original makers; an
+arbitration result goes to the original reviewers. Both require independent
+evidence before any acceptance can change. If peer investigation establishes
+that no authorized path meets the contract, finish the attempt as blocked with
+the affected pages, tested alternatives and missing capability. Resume on a
+material change. Repeated audits and human waivers are not resolution steps.

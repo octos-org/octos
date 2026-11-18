@@ -39,11 +39,17 @@ fn name(s: &str) -> bool {
 }
 
 pub fn check(ctx: &Context, request: &Value) -> Result<Value> {
-    let gate = page_gate::check(ctx)?;
+    let mut gate = page_gate::check(ctx)?;
     ensure!(
         gate["active"] == true,
         "page_dispatch requires an active page plan"
     );
+    if gate["pages"]
+        .as_array()
+        .is_some_and(|pages| pages.iter().any(|p| p["work_stage"] == "arbitrate"))
+    {
+        gate["arbiter_agent"] = crate::review_routes::load_plan(ctx)?["arbiter_agent"].clone();
+    }
     audit(&gate, request)
 }
 
@@ -98,8 +104,9 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
             "assignment page/peer must be nonempty trimmed strings"
         );
         ensure!(
-            ["make", "review", "repair"].contains(&assignment.phase.as_str()),
-            "assignment phase must be make, review or repair"
+            ["make", "review", "repair", "arbitrate", "diagnose"]
+                .contains(&assignment.phase.as_str()),
+            "assignment phase must be make, review, repair, arbitrate or diagnose"
         );
         ensure!(
             ["running", "queued", "waiting"].contains(&assignment.state.as_str()),
@@ -114,6 +121,10 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
                 completed_work.push(json!({"page":assignment.page,"peer":assignment.peer}));
                 return Ok(());
             }
+            ensure!(
+                row["work_stage"] != "blocked",
+                "blocked candidate already has an evidenced peer outcome"
+            );
             ensure!(
                 seen.insert((&assignment.page, &assignment.phase)),
                 "duplicate page/phase assignment"
@@ -130,11 +141,34 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
                 !["unknown", "unavailable"].contains(&peer.state.as_str()),
                 "peer execution state is unknown/unavailable"
             );
-            if assignment.phase == "review" {
+            if matches!(
+                assignment.phase.as_str(),
+                "review" | "arbitrate" | "diagnose"
+            ) {
                 ensure!(
                     peer_id != coordinator && !makers.contains(peer_id),
-                    "reviewer must be independent of coordinator and all makers"
+                    "resolution and review peers must be independent of coordinator and all makers"
                 );
+                let reviewer = row["reviewer_session"].as_str().map(identity);
+                if matches!(assignment.phase.as_str(), "arbitrate" | "diagnose") {
+                    ensure!(
+                        Some(peer_id) != reviewer,
+                        "use a separate peer to resolve the reviewer's referral"
+                    );
+                }
+                if assignment.phase == "arbitrate" {
+                    if let Some(arbiter) = gate["arbiter_agent"].as_str() {
+                        ensure!(
+                            peer_id == identity(arbiter),
+                            "use the frozen arbiter session"
+                        );
+                    }
+                } else if assignment.phase == "review" && row["review_current"] == true {
+                    ensure!(
+                        Some(peer_id) == reviewer,
+                        "clarification belongs to the bound reviewer"
+                    );
+                }
             } else {
                 ensure!(
                     Some(peer_id) == row["maker_session"].as_str().map(identity),
@@ -213,14 +247,14 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
     }
     let dispositions: Vec<_> = pages
         .iter()
-        .filter(|p| p["work_stage"] == "disposition")
-        .map(|p| json!({"page":p["id"],"candidate":p["candidate"],"disposition":p["disposition"]}))
+        .filter(|p| p["disposition"].is_object() && p["work_stage"] != "blocked")
+        .map(|p| json!({"page":p["id"],"phase":p["work_stage"],"candidate":p["candidate"],"disposition":p["disposition"]}))
         .collect();
     let unassigned: Vec<_> = pages
         .iter()
         .filter(|p| {
             p["work_stage"] != "complete"
-                && p["work_stage"] != "disposition"
+                && p["work_stage"] != "blocked"
                 && !covered.contains(p["id"].as_str().unwrap_or_default())
         })
         .map(|p| {
@@ -228,14 +262,22 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
             "maker_session":p["maker_session"],"reason":p["reason"]})
         })
         .collect();
-    let complete = dispositions.is_empty()
-        && invalid.is_empty()
+    let complete = invalid.is_empty()
         && unassigned.is_empty()
         && serialization.is_empty()
         && capacity_limited.is_empty();
+    let blocked: Vec<_> = pages
+        .iter()
+        .filter(|p| p["work_stage"] == "blocked")
+        .map(|p| json!({"page":p["id"],"candidate":p["candidate"],"disposition":p["disposition"]}))
+        .collect();
+    let blocked_only = !blocked.is_empty()
+        && pages
+            .iter()
+            .all(|p| p["work_stage"] == "blocked" || p["work_stage"] == "complete");
     Ok(
         json!({"plan":gate["plan"],"page_count":pages.len(),"accepted_pages":gate["accepted_pages"],
-        "pages":pages,"needs_disposition":dispositions,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
+        "pages":pages,"needs_disposition":dispositions,"blocked_pages":blocked,"only_blocked_pages_remain":blocked_only,"ready_unassigned":unassigned,"avoidable_serialization":serialization,
         "capacity_limited_serialization":capacity_limited,"invalid_assignments":invalid,
         "eligible_idle_reviewers":idle,"completed_page_assignments":completed_work,
         "unverified_dependency_claims":dependency_claims,"declared_running_count":running_peers.len(),

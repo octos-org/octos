@@ -572,7 +572,9 @@
                   "enum": [
                     "make",
                     "review",
-                    "repair"
+                    "repair",
+                    "arbitrate",
+                    "diagnose"
                   ]
                 },
                 "peer": {
@@ -595,7 +597,7 @@
               },
               "additionalProperties": false
             },
-            "description": "page_dispatch: coordinator-declared page jobs; does not dispatch or attest to execution. Review/repair require the exact current candidate SHA-256; waiting requires a dependency."
+            "description": "page_dispatch: coordinator-declared peer jobs. All phases after make require the current candidate SHA-256 for active coverage. Arbitration and technical diagnosis are dispatchable peer work."
           },
           "peers": {
             "type": "array",

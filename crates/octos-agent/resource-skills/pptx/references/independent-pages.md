@@ -206,12 +206,22 @@ The native verdict writer supplies hashes and identity. For a changed judgment,
 the same reviewer supplies the current `replaces_verdict_id`; immutable versions
 are preserved. A schema repair reuses the existing visual work and PPTX. If a
 rejection needs a rubric clarification or an unavailable tool, submit a
-`disposition` with `owner`, `reason` and `resume_when`. Triage
-`page_dispatch.needs_disposition` separately from ready page work. Route one
-reproducible shared tool failure to its maintainer, resume affected original
-makers when a verified capability changes, and keep unaffected accepted pages
-frozen. Preserve the quality threshold and the existing reviewer. A task-owner
-decision is for genuine changes to scope, not a substitute for a tool repair.
+`disposition` with `owner`, `reason` and `resume_when`. The coordinator owns
+routine production and assembly choices. Dispatch scoring disagreements to an
+independent arbiter and shared capability failures to a technical peer in
+parallel. Group pages with the same underlying question and bind each candidate.
+Use `page_dispatch.ready_unassigned` when `doctor.page_first_gate.peer_resolution`
+is true. On older hosts translate old `task_owner` rows into the same peer jobs.
+Return rulings to the original reviewers and verified technical changes to the
+original makers. An arbiter interprets the existing rubric and cannot waive a
+required finding. If all authorized options are exhausted, publish a blocked
+outcome with the exact remaining defect, attempted remedies and evidence. End
+the attempt without waiting for human approval or repeating unchanged audits.
+On hosts exposing peer resolution the specialist publishes its scoped report
+through the native peer channel. Confirm the sender, page and candidate against
+the assignment. The original reviewer binds that report with
+`page_review_submit` as documented in its tool help. A dispatch inventory with
+`only_blocked_pages_remain:true` ends this attempt with a technical blocker.
 Earlier runtimes and pre-existing verdict files retain their original contracts.
 
 Keep the current dispatch record in the existing coordination files.

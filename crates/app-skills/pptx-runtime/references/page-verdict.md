@@ -15,8 +15,21 @@ For new plans freeze a `rubric` mapping task-specific category names to maximum 
 
 A rejection with no critical or required fix needs a `disposition`, for example
 `{"owner":"tool_maintainer","reason":"A font face cannot be addressed","resume_when":"A rendered fixture resolves that face"}`.
-Other supported owners are `reviewer` and `task_owner`. A disposition can also
-keep a required finding open when a specific dependency prevents repair.
-`page_dispatch.needs_disposition` exposes that owner and condition; the page
-continues to block assembly. With native peer handoff support, publish the
+Use `reviewer` for clarification by the current reviewer, `arbiter` for an
+independent interpretation of the existing rubric, and `tool_maintainer` for a
+technical peer to investigate a capability. Open findings still block assembly.
+For a previously recorded `task_owner` verdict the gate derives a peer phase on
+read. A critical or required finding or a recorded technical secondary owner
+routes to diagnosis; a score-only dispute routes to arbitration. The original
+verdict remains intact. The coordinator follows the current dispatch phase.
+With native peer handoff support, publish the
 result's `verdict_id` as the `peer_publish.handoff_id`.
+
+When the assigned specialist exhausts permitted remedies, they publish a JSON
+report containing `outcome:"blocked"`, `phase` (`arbitrate` or `diagnose`),
+`page`, `candidate_sha256`, `peer` (their session), `attempted_remedy` and
+`remaining_blocker`. The coordinator verifies the native publication identity.
+The original reviewer revises the rejected referral, includes the report path
+in `evidence` and `disposition.blocked_report`, and preserves the open findings.
+The gate validates the report scope and bound bytes. Changed evidence reopens
+review. A changed capability can trigger a fresh referral or a new candidate.
