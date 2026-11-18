@@ -231,6 +231,12 @@ peer to audit the wait. When dispatch returns a blocked handoff, record the task
 as blocked, retire this task's consumed native monitors, and transition its
 existing goal to blocked through the owner if present. Do not dispatch a final
 review or ask another peer to verify a terminal dispatch inventory.
+Check the native queue for the reviewer that recorded the last blocker. If its
+verdict and report are bound, no page is ready, and only stale instructions for
+that job remain, the owning coordinator retires that peer with `peer_close`.
+`peer_send_input` queues another turn even when the message says “stand down”.
+Write the blocked outcome to the existing machine-readable task status used by
+the host, with the bound report paths.
 Earlier runtimes and pre-existing verdict files retain their original contracts.
 
 Keep the current dispatch record in the existing coordination files.
