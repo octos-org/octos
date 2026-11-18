@@ -569,7 +569,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.scope.outputs.docs_only != 'true'
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME
+        # (GitHub cache would only download ~1 GB for nothing).
+        if: runner.environment == 'github-hosted' && (needs.scope.outputs.docs_only != 'true')
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -728,7 +730,9 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true'
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME
+        # (GitHub cache would only download ~1 GB for nothing).
+        if: runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || needs.scope.outputs.agent_selected == 'true')
         with:
           shared-key: octos-agent-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -821,7 +825,9 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        if: needs.scope.outputs.full_ci == 'true' || (needs.scope.outputs.cli_selected == 'true' && (matrix.part == 'unit' || matrix.part == 'integration'))
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME
+        # (GitHub cache would only download ~1 GB for nothing).
+        if: runner.environment == 'github-hosted' && (needs.scope.outputs.full_ci == 'true' || (needs.scope.outputs.cli_selected == 'true' && (matrix.part == 'unit' || matrix.part == 'integration')))
         with:
           shared-key: octos-cli-tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1002,6 +1008,9 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: matrix-feature
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1061,6 +1070,9 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: arm64
 
@@ -1153,6 +1165,9 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: riscv64
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1602,6 +1617,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -1644,6 +1662,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: arm64-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1687,6 +1708,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: windows-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1963,6 +1987,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        # Self-hosted slots keep a persistent CARGO_TARGET_DIR/CARGO_HOME;
+        # rust-cache would only download ~1 GB for nothing there.
+        if: runner.environment == 'github-hosted'
         with:
           shared-key: octos-agent-tests
       - run: bash scripts/setup-host-managed-linux-ci.sh
