@@ -34545,6 +34545,7 @@ async fn run_m9_fixture_turn(
     contracts: Arc<UiProtocolContractStores>,
     params: TurnStartParams,
     fixture: M9ProtocolFixture,
+    resolved_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
 ) {
@@ -34858,6 +34859,7 @@ async fn run_m9_fixture_turn(
             match seed_m9_task_output_fixture(
                 state.as_ref(),
                 &session_id,
+                resolved_profile_id.as_deref(),
                 ws.clone(),
                 Arc::clone(&ledger),
             )
@@ -37324,6 +37326,7 @@ print(f"{agent_id}: {finding}")
 async fn seed_m9_task_output_fixture(
     state: &AppState,
     session_id: &SessionKey,
+    resolved_profile_id: Option<&str>,
     ws: WsConnection,
     ledger: Arc<UiProtocolLedger>,
 ) -> Result<TaskId, String> {
@@ -37346,6 +37349,22 @@ async fn seed_m9_task_output_fixture(
         .map_err(|error| format!("failed to materialize session file: {error}"))?;
 
     let supervisor = octos_agent::TaskSupervisor::new();
+    // #2091 — even the deterministic fixture must install the goal-row
+    // observers BEFORE replay; otherwise its restore evidence proves nothing
+    // about the production reconciliation path. The sessions root above owns
+    // task JSONL; goal ledgers live under the canonical PROFILE data dir.
+    let profile_id = session_id
+        .profile_id()
+        .or(resolved_profile_id)
+        .unwrap_or(MAIN_PROFILE_ID);
+    let (_, profile_data_dir) = resolve_profile_data_dir(state, Some(profile_id))
+        .map_err(|error| format!("failed to resolve fixture goal ledger: {}", error.message))?;
+    crate::autonomy::agent_orchestrator::install_goal_task_row_observers_resolving_at_callback(
+        &supervisor,
+        session_id,
+        profile_id,
+        &profile_data_dir,
+    );
     supervisor
         .enable_persistence(ui_protocol_task_output::task_state_path(
             &data_dir, session_id,

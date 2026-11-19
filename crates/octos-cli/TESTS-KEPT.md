@@ -180,6 +180,8 @@ These five rows close independent real-path gaps identified during lead re-revie
 | 4 | `tests/serve_broken_pipe.rs::serve_broken_pipe::serve_shutdown_broken_pipe_cleanup_marker_observed` | Real EPIPE during shutdown still runs cleanup and exits cleanly; the same test also pins graceful-shutdown-before-gateway-stop ordering. |
 | 1 | `tests/smart_home_ws_e2e.rs::smart_home_device_command_posts_to_real_bridge` | A real UI-protocol WebSocket drives profile smart-home configuration through the real bridge and returns the device response. |
 | 4 | `api::handlers::session_mutation_tests::session_mutation_unreachable_gateway_preserves_only_actual_local_success` | Port 0 guarantees gateway refusal without a bind/drop race; actual local success survives, while any 404/non-502 mapping still fails. |
+| 4 | `autonomy::agent_orchestrator::goal_task_row_reconcile_tests::should_leave_the_binding_alone_when_a_live_incarnation_still_owns_the_task` | A real post-fence settle attempt is positively acknowledged and parked while restore reconcile runs; its generation survives and the released chain completes the owed row. |
+| 4 | `api::ui_protocol_transport::tests::should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture` | The real M9 fixture restores an unobserved terminal JSONL task into its owed SQLite row and also creates/settles its own goal task row; deleting the fixture observer fails both effects. |
 
 ## Reviewed skill install (T-0556, UPCR-2026-R48CB467B)
 
