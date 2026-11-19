@@ -289,7 +289,7 @@ Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SE
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 17 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
+Octos supports 18 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
 
 ### 3.1 Supported Providers
 
@@ -299,6 +299,7 @@ Octos supports 17 LLM provider families out of the box. Cloud providers require 
 | `openai` | `OPENAI_API_KEY` | gpt-4o | Native OpenAI | — |
 | `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | Native Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | Native OpenRouter | — |
+| `orcarouter` | `ORCAROUTER_API_KEY` | openai/gpt-4o-mini | OpenAI-compatible (`https://api.orcarouter.ai/v1`) | — |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI auto-detected | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | — |
@@ -2342,6 +2343,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | `OPENAI_API_KEY` | OpenAI API key |
 | `GEMINI_API_KEY` | Google Gemini API key |
 | `OPENROUTER_API_KEY` | OpenRouter API key |
+| `ORCAROUTER_API_KEY` | OrcaRouter API key (`sk-orca-…`) |
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
 | `GROQ_API_KEY` | Groq API key |
 | `MOONSHOT_API_KEY` | Moonshot/Kimi API key |

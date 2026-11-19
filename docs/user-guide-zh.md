@@ -209,7 +209,7 @@ octos auth revoke-work-secret '<secret>'
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 17 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
+Octos 开箱即用支持 18 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
 
 ### 3.1 支持的提供商
 
@@ -219,6 +219,7 @@ Octos 开箱即用支持 17 个 LLM 提供商家族。云端提供商需要设�
 | `openai` | `OPENAI_API_KEY` | gpt-4o | 原生 OpenAI | — |
 | `gemini` | `GEMINI_API_KEY` | gemini-2.5-flash | 原生 Gemini | — |
 | `openrouter` | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4-20250514 | 原生 OpenRouter | — |
+| `orcarouter` | `ORCAROUTER_API_KEY` | openai/gpt-4o-mini | OpenAI 兼容（`https://api.orcarouter.ai/v1`） | — |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI 自动判定 | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI 兼容 | — |
@@ -2171,6 +2172,7 @@ chmod +x .octos/skills/translator/main
 | `OPENAI_API_KEY` | OpenAI API 密钥 |
 | `GEMINI_API_KEY` | Google Gemini API 密钥 |
 | `OPENROUTER_API_KEY` | OpenRouter API 密钥 |
+| `ORCAROUTER_API_KEY` | OrcaRouter API 密钥（`sk-orca-…`） |
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥 |
 | `GROQ_API_KEY` | Groq API 密钥 |
 | `MOONSHOT_API_KEY` | Moonshot/Kimi API 密钥 |

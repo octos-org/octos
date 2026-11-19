@@ -121,6 +121,17 @@
       { "id": "deepseek/deepseek-v4.1-flash", "input": 0.14, "output": 0.42, "max_output": 393216 }
     ]
   },
+  "orcarouter": {
+    "env": "ORCAROUTER_API_KEY",
+    "models": [
+      { "id": "openai/gpt-4o-mini", "input": 0.15, "output": 0.6, "max_output": 16384 },
+      { "id": "openai/gpt-5", "input": 1.25, "output": 10.0, "max_output": 128000 },
+      { "id": "anthropic/claude-sonnet-4.6", "input": 3.0, "output": 15.0, "max_output": 64000 },
+      { "id": "google/gemini-2.5-flash", "input": 0.3, "output": 2.5, "max_output": 65536 },
+      { "id": "qwen/qwen3-max", "input": 0.359, "output": 1.434, "max_output": 65536 },
+      { "id": "kimi/kimi-k2.6", "input": 0.95, "output": 4.0, "max_output": 32768 }
+    ]
+  },
   "deepseek": {
     "env": "DEEPSEEK_API_KEY",
     "models": [
