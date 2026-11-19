@@ -9,6 +9,133 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRespondParams, PreviewId, QuestionId, UserQuestionAnswer,
 };
 
+struct GenericInterruptFixture {
+    _dir: tempfile::TempDir,
+    owner: Arc<octos_agent::TaskSupervisor>,
+    replica: Arc<octos_agent::TaskSupervisor>,
+    store: crate::session_actor::SessionTaskQueryStore,
+    session_id: SessionKey,
+    task_id: String,
+    _owner_liveness: octos_agent::TaskTerminalGuard,
+}
+
+fn generic_interrupt_fixture() -> GenericInterruptFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("tasks.jsonl");
+    let session_id = SessionKey::new("api", "interrupt-owner");
+    let owner = Arc::new(octos_agent::TaskSupervisor::new());
+    owner.enable_persistence(&ledger).unwrap();
+    let task_id = owner.register("run_pipeline", "call-owner", Some("api:interrupt-owner"));
+    owner.mark_running(&task_id);
+    let owner_liveness = octos_agent::TaskTerminalGuard::new(Arc::clone(&owner), task_id.clone());
+
+    // A later turn restores a read-only projection of the still-live task.
+    let replica = Arc::new(octos_agent::TaskSupervisor::new());
+    replica.enable_persistence(&ledger).unwrap();
+    assert_eq!(
+        replica.get_task(&task_id).unwrap().status,
+        octos_agent::TaskStatus::Running
+    );
+    let store = crate::session_actor::SessionTaskQueryStore::default();
+    store.register(&session_id, &owner, dir.path());
+    store.register(&session_id, &replica, dir.path());
+    GenericInterruptFixture {
+        _dir: dir,
+        owner,
+        replica,
+        store,
+        session_id,
+        task_id,
+        _owner_liveness: owner_liveness,
+    }
+}
+
+#[tokio::test]
+async fn generic_interrupt_routes_to_owner_and_terminates_real_producer() {
+    let fixture = generic_interrupt_fixture();
+    let owner_token = fixture.owner.cancel_token(&fixture.task_id);
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let producer_owner = Arc::clone(&fixture.owner);
+    let producer_task_id = fixture.task_id.clone();
+    let producer = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = owner_token.cancelled() => "interrupted",
+            _ = finish_rx => {
+                producer_owner.mark_completed(&producer_task_id, Vec::new());
+                "completed"
+            }
+        }
+    });
+    tokio::task::yield_now().await;
+
+    // The generic turn path must use the same execution-owner bridge as
+    // explicit task/cancel, not cancel only this turn's restored projection.
+    cancel_session_spawn_only_tasks(
+        Some(&fixture.store),
+        fixture.replica.as_ref(),
+        &fixture.session_id,
+    );
+    cancel_session_spawn_only_tasks(
+        Some(&fixture.store),
+        fixture.replica.as_ref(),
+        &fixture.session_id,
+    );
+    finish_tx.send(()).unwrap();
+    assert_eq!(producer.await.unwrap(), "interrupted");
+    assert_eq!(
+        fixture.owner.get_task(&fixture.task_id).unwrap().status,
+        octos_agent::TaskStatus::Cancelled
+    );
+    assert_eq!(
+        fixture.replica.get_task(&fixture.task_id).unwrap().status,
+        octos_agent::TaskStatus::Running,
+        "the restored replica must stay a read-only projection"
+    );
+    fixture.replica.refresh_from_persistence().unwrap();
+    assert_eq!(
+        fixture.replica.get_task(&fixture.task_id).unwrap().status,
+        octos_agent::TaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn generic_interrupt_after_real_completion_leaves_owner_completed() {
+    let fixture = generic_interrupt_fixture();
+    let owner_token = fixture.owner.cancel_token(&fixture.task_id);
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let producer_owner = Arc::clone(&fixture.owner);
+    let producer_task_id = fixture.task_id.clone();
+    let producer = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = owner_token.cancelled() => "interrupted",
+            _ = finish_rx => {
+                producer_owner.mark_completed(&producer_task_id, Vec::new());
+                "completed"
+            }
+        }
+    });
+    tokio::task::yield_now().await;
+    finish_tx.send(()).unwrap();
+    assert_eq!(producer.await.unwrap(), "completed");
+
+    cancel_session_spawn_only_tasks(
+        Some(&fixture.store),
+        fixture.replica.as_ref(),
+        &fixture.session_id,
+    );
+    assert_eq!(
+        fixture.owner.get_task(&fixture.task_id).unwrap().status,
+        octos_agent::TaskStatus::Completed
+    );
+    fixture.replica.refresh_from_persistence().unwrap();
+    assert_eq!(
+        fixture.replica.get_task(&fixture.task_id).unwrap().status,
+        octos_agent::TaskStatus::Completed
+    );
+}
+
 #[test]
 fn spec_section6_catalog_lists_every_advertised_method() {
     fn is_method_char(c: char) -> bool {
