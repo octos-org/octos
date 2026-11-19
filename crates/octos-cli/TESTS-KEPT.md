@@ -447,3 +447,10 @@ Creation admission also retains these persistence regressions (T-0323):
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `peers::handoff_tests::should_stage_every_peer_a_turn_hands_off_however_many` | One turn that hands off six peers through the tool the serve path wires gets all six staged, each with its `peer/staged` event; a fifth handoff used to be refused. |
+
+## Windows deploy PATH self-check (#1483B)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `commands::doctor::tests::should_cover_fresh_windows_path_and_deploy_root_in_install_candidates` | A fresh Windows PATH still yields install.ps1's default `~/.octos/bin`; HOME and USERPROFILE are scanned independently when they differ and deduped when equal, empty values are ignored, a custom OCTOS_PREFIX wins first, and deploy.ps1's default `C:\octos\bin` is scanned on Windows only. |
+| 3 | `commands::doctor::tests::should_locate_an_off_path_install_and_point_at_its_directory` | A binary present only in the install dir is enumerated as `off PATH` (not "none found") and is not a warning, so doctor points at the exact directory to add to PATH. |
