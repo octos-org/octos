@@ -384,6 +384,8 @@ def self_test(repo_root: Path) -> None:
         assert "merge-base" in out, out
         out = case(root, "report", 2, "--report-only", expect=0)
         assert "report-only" in out, out
+        no_reviews = root / "no-reviews.json"
+        no_reviews.write_text(json.dumps({"head_sha": "0" * 40, "reviews": []}))
         maintainer_events = root / "maintainer.json"
         maintainer_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "anantheparty"}, "label": {"name": LABEL}},
@@ -391,7 +393,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(maintainer_events), expect=0,
+            "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+            expect=0,
         )
         assert "alan0x" in out, out
         bot_events = root / "bot.json"
@@ -400,7 +403,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "bot-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(bot_events), expect=1,
+            "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "applied by anantheparty, not a maintainer" in out, out
         # A maintainer's approval that was later removed must not exempt.
@@ -411,7 +415,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "removed-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(removed_events), expect=1,
+            "--events-json", str(removed_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "no maintainer-applied label event" in out, out
         # A bot re-label after maintainer approval supersedes the generation.
@@ -423,9 +428,14 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "bot-relabel", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(relabel_events), expect=1,
+            "--events-json", str(relabel_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "applied by anantheparty, not a maintainer" in out, out
+
+        # The label-only cases above are pinned offline on the review path
+        # via `no_reviews` (CI has GH_TOKEN; without the fixture the script
+        # would consult the live API and a real approval could mask them).
 
         # shu 2026-11-19 ruling: a maintainer's APPROVED review on the PR's
         # current head is itself the test-growth approval.
@@ -472,10 +482,10 @@ def self_test(repo_root: Path) -> None:
             {"event": "labeled", "actor": {"login": "ymote"}, "label": {"name": LABEL}},
         ]))
         repo, base, head = fixture_repo(root / "label-only", 2)
-        fixture = reviews_fixture(root / "no-reviews.json", head)
         out = run_case("label-only", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos",
-                       "--events-json", str(label_only), "--reviews-json", fixture, expect=0)
+                       "--events-json", str(label_only), "--reviews-json", str(no_reviews),
+                       expect=0)
         assert "ymote" in out, out
 
     workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text()
