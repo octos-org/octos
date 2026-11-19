@@ -1635,7 +1635,7 @@
       "cost_in": 3.0,
       "cost_out": 15.0,
       "context_window": 1000000,
-      "max_output": 128000
+      "max_output": 64000
     },
     {
       "provider": "orcarouter/google/gemini-2.5-flash",
@@ -1658,23 +1658,23 @@
       "p95_ms": 0,
       "score": 0.0,
       "ds_output": 0,
-      "cost_in": 1.2,
-      "cost_out": 6.0,
+      "cost_in": 0.359,
+      "cost_out": 1.434,
       "context_window": 262144,
       "max_output": 65536
     },
     {
-      "provider": "orcarouter/kimi/kimi-k2.5",
+      "provider": "orcarouter/kimi/kimi-k2.6",
       "type": "strong",
       "stability": 1.0,
       "tool_avg_ms": 0,
       "p95_ms": 0,
       "score": 0.0,
       "ds_output": 0,
-      "cost_in": 0.45,
-      "cost_out": 2.2,
+      "cost_in": 0.95,
+      "cost_out": 4.0,
       "context_window": 262144,
-      "max_output": 98304
+      "max_output": 32768
     },
     {
       "provider": "r9s/claude-haiku-4-5",
