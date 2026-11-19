@@ -86,9 +86,12 @@ A connection that does not request it sees byte-identical replies.
     command whose working folder (or a configured read path) holds one
     refuses to run. Without a sandbox (`sandbox.enabled = false`,
     `mode = "none"`, or `auto` finding no backend) a command can read any
-    path the server can, so every command refuses while any of those
-    folders holds a chat. A profile's `chats` folder is made when the
-    profile is reserved, so it is hidden before its first chat exists;
+    path the server can for as long as it runs, and a chat may be made
+    while it runs, so every command refuses while any profile's `chats`
+    folder is reserved, empty or not: while this server can make chats. A
+    profile's `chats` folder is made when the profile is reserved, so a
+    sandbox hides it before its first chat exists and for the whole run of
+    a command started before that chat;
   - workspace snapshots: those folders are left out by git pathspec
     exclusions, which no ignore file in the workspace can override, and
     whatever an earlier snapshot staged from them leaves the snapshot index.

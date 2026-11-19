@@ -213,8 +213,8 @@ pub struct SandboxConfig {
     /// - Landlock, Docker and AppContainer cannot hide a folder inside one
     ///   they grant: a command whose cwd or a configured read path holds one
     ///   refuses to run.
-    /// - No sandbox grants every path: every command refuses while a hidden
-    ///   folder holds anything.
+    /// - No sandbox grants every path for the command's whole run: every
+    ///   command refuses while any folder is hidden, empty or not.
     #[serde(skip)]
     pub hidden_folders: Option<octos_core::HiddenFolders>,
 }
@@ -1187,8 +1187,9 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
 /// A backend that cannot hide a folder inside one it grants
 /// ([`SandboxConfig::hidden_folders`]): a command whose cwd or a configured
 /// read path holds a hidden folder, or lies in one, refuses to run. No
-/// sandbox grants every path the server can read, so under it every command
-/// refuses while a hidden folder holds anything. Any other runs as the
+/// sandbox grants every path the server can read for as long as a command
+/// runs, so under it every command refuses while any folder is hidden (a
+/// chat could be made in it before the command ends). Any other runs as the
 /// backend runs it.
 struct HiddenFolderGuard {
     inner: Box<dyn Sandbox>,
@@ -1198,10 +1199,10 @@ struct HiddenFolderGuard {
 
 impl HiddenFolderGuard {
     fn exposes_hidden(&self, cwd: &Path) -> bool {
+        // A command outlives this check: one that starts while no chat
+        // exists yet could still be running when the first one is made.
         if self.inner.is_noop() {
-            let holds =
-                |folder: &PathBuf| std::fs::read_dir(folder).is_ok_and(|mut e| e.next().is_some());
-            return self.hidden.folders().iter().any(holds);
+            return !self.hidden.folders().is_empty();
         }
         let canonical = |path: &Path| std::fs::canonicalize(path).ok();
         let cwd = canonical(cwd);
@@ -1225,8 +1226,8 @@ impl HiddenFolderGuard {
         let backend = self.inner.backend_name();
         let line = if self.inner.is_noop() {
             "sandbox none: commands run without a sandbox here, which cannot hide chat folders \
-             from the shell. Refusing to run the command. Install a sandbox backend; octos \
-             doctor shows which."
+             from the shell while this server can make chats. Refusing to run the command. \
+             Install a sandbox backend; octos doctor shows which."
                 .to_string()
         } else {
             format!(

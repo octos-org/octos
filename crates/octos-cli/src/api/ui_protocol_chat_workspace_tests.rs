@@ -327,6 +327,36 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     let sandboxed = writable_runtime(&profile, &chat_key("code"), &beside).await;
     let said = shell_says(&sandboxed.expect("code runtime"), &reach).await;
     assert!(!said.contains("theirs"), "{said}");
+    // A command that starts before a host's first chat never reads it while
+    // it runs: a sandbox hides the still-empty chats folder for the command's
+    // lifetime, and with no sandbox the command never starts.
+    let chats = top.join("fresh/chats");
+    std::fs::create_dir_all(&chats).unwrap();
+    let reserved = octos_core::HiddenFolders::default();
+    reserved.add(chats.clone()).unwrap();
+    let reach = format!("sleep 1; cat {}/*/secret.txt", chats.display());
+    let running = [false, true].map(|enabled| {
+        let hidden_folders = Some(reserved.clone());
+        let config = octos_agent::SandboxConfig {
+            enabled,
+            hidden_folders,
+            ..Default::default()
+        };
+        let mut command = octos_agent::create_sandbox(&config).wrap_command(&reach, &top);
+        let piped = std::process::Stdio::piped;
+        command.stdout(piped()).stderr(piped()).spawn().unwrap()
+    });
+    std::fs::create_dir(chats.join("first")).unwrap();
+    std::fs::write(chats.join("first/secret.txt"), "theirs").unwrap();
+    for (enabled, child) in [false, true].into_iter().zip(running) {
+        let ran = child.wait_with_output().await.unwrap();
+        let said = String::from_utf8_lossy(&[ran.stdout, ran.stderr].concat()).into_owned();
+        assert!(
+            (enabled || said.contains("cannot hide")) && !said.contains("theirs"),
+            "{said}"
+        );
+    }
+    std::fs::remove_dir_all(top.join("fresh")).unwrap();
     // Workspace snapshots leave them out whatever the workspace's ignore rules
     // say, and a restore never writes them back, even from a snapshot taken
     // before they were hidden.
