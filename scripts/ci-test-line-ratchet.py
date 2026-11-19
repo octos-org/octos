@@ -204,10 +204,14 @@ def review_approved(
         if login not in MAINTAINERS:
             continue
         latest[login] = review  # the list is chronological; last wins
+    # Any ONE maintainer approving the current head exempts — check all of
+    # them before diagnosing, or a stale approval from one maintainer would
+    # mask a current-head approval from another.
+    for login, review in latest.items():
+        if review.get("state") == "APPROVED" and review.get("commit_id") == head_sha:
+            return True, f"{login} approved the current head {head_sha[:9]}"
     for login, review in latest.items():
         if review.get("state") == "APPROVED":
-            if review.get("commit_id") == head_sha:
-                return True, f"{login} approved the current head {head_sha[:9]}"
             return False, (
                 f"{login}'s approval is on {str(review.get('commit_id'))[:9]}, "
                 f"not the current head {head_sha[:9]}"
@@ -475,6 +479,17 @@ def self_test(repo_root: Path) -> None:
         out = run_case("review-superseded", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=1)
         assert "not APPROVED" in out and "alan0x: CHANGES_REQUESTED" in out, out
+
+        # alan0x review: one maintainer's STALE approval must not mask
+        # another maintainer's current-head approval.
+        repo, base, head = fixture_repo(root / "review-two", 2)
+        fixture = reviews_fixture(root / "two.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": "0" * 40},
+            {"user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": head},
+        )
+        out = run_case("review-two", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
+        assert "BH3GEI approved the current head" in out, out
 
         # Label still exempts without any approval (original behavior).
         label_only = root / "label-only.json"
