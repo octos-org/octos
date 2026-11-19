@@ -152,6 +152,16 @@ To remove an installation:
 
 On a tenant, the uninstall flag stops and removes both `octos-serve` and `frpc` services, deletes `/etc/frp` and `/usr/local/bin/frpc`, stops Caddy if present, and (on Linux) removes the firewall rules it added. The data directory (`~/.octos`) is always preserved unless you delete it manually.
 
+### 2.1.4 Windows install PATH
+
+A Windows install is **not fully zero-config**: the binary lands in a directory that is usually not on your `PATH`, so a fresh terminal cannot run `octos` by bare name until you add it. `install.ps1` installs to `$HOME\.octos\bin` (override with `-Prefix` or `$env:OCTOS_PREFIX`); the remote `scripts/deploy.ps1` installs to `C:\octos\bin` by default. Add the directory to your user PATH once:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', "$HOME\.octos\bin;" + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')
+```
+
+`octos doctor` locates the binary even when it is off-PATH — it scans `$HOME\.octos\bin` (via `USERPROFILE` when `HOME` is unset), any `OCTOS_PREFIX`, and the deploy default `C:\octos\bin` — and prints it as `off PATH` with the exact directory to add, rather than reporting "none found" on a correctly installed host. Until PATH is updated, run it by full path, e.g. `& "$HOME\.octos\bin\octos.exe" doctor`.
+
 On the cloud VPS, `cloud-host-deploy.sh --uninstall` calls `install.sh --uninstall` internally and additionally stops and removes `frps.service` and the Caddy host configuration. Using plain `install.sh --uninstall` on the VPS is not recommended because it removes `/etc/frp` and `/usr/local/bin/frpc` without stopping `frps.service`.
 
 ### 2.2 OTP Email Authentication

@@ -304,3 +304,10 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
+
+## Windows deploy PATH self-check (#1483B)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `commands::doctor::tests::should_cover_fresh_windows_path_and_deploy_root_in_install_candidates` | A fresh Windows PATH (no HOME, USERPROFILE only) still yields install.ps1's default `~/.octos/bin`; deploy.ps1's default `C:\octos\bin` is scanned on Windows only; a custom OCTOS_PREFIX wins first; empty env values are ignored. |
+| 3 | `commands::doctor::tests::should_locate_an_off_path_install_and_point_at_its_directory` | A binary present only in the install dir is enumerated as `off PATH` (not "none found") and is not a warning, so doctor points at the exact directory to add to PATH. |
