@@ -1,4 +1,6 @@
 use super::*;
+use crate::progress::ProgressReporter;
+use std::time::Duration;
 
 /// Runaway guard for the "poll until the background task reaches state X"
 /// loops below. It is NOT a latency assertion: on a passing run the loop
@@ -735,4 +737,58 @@ async fn background_deliverable_uses_configured_root_under_real_sandbox() {
     assert!(!workspace.join(".octos").exists());
     assert!(!workspace.join("escape").exists());
     assert!(!sibling.join("escape").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_child_reporter_heartbeats_without_events_and_stops_on_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let router = Arc::new(crate::subagent_output::SubAgentOutputRouter::new(
+        dir.path(),
+    ));
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.set_stuck_timeout(Duration::from_millis(60));
+    let id = supervisor.register("spawn", "call-heartbeat", Some("api:heartbeat"));
+    supervisor.mark_running(&id);
+    let _guard = TaskTerminalGuard::new(Arc::clone(&supervisor), id.clone());
+    let reporter = SpawnChildTranscriptReporter::new(
+        router,
+        "agent:spawn-heartbeat".to_string(),
+        id.clone(),
+        None,
+        Some(Arc::clone(&supervisor)),
+    );
+    let weak = Arc::downgrade(&reporter);
+    let start = tokio::time::Instant::now();
+    reporter.report(crate::progress::ProgressEvent::ToolStarted {
+        name: "long_tool".into(),
+        tool_id: "long-call".into(),
+        arguments: None,
+    });
+
+    // No transcript or stream events follow. The reporter's own monotonic
+    // heartbeat must keep the live long tool from looking abandoned.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(40)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        supervisor
+            .reap_stuck_tasks(start + Duration::from_millis(95), Duration::from_millis(60))
+            .is_empty(),
+        "eventless long-tool execution must still heartbeat"
+    );
+
+    // Once the worker releases its reporter, the Weak heartbeat loop cannot
+    // keep anything alive. With no further beats the same worker is reapable.
+    drop(reporter);
+    assert!(weak.upgrade().is_none());
+    tokio::time::advance(Duration::from_millis(61)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        supervisor.reap_stuck_tasks(tokio::time::Instant::now(), Duration::from_millis(60)),
+        vec![id]
+    );
 }

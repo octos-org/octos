@@ -877,6 +877,10 @@ struct SpawnChildTranscriptReporter {
     router: Arc<SubAgentOutputRouter>,
     router_session_id: String,
     task_id: String,
+    /// Parent supervisor whose task this child represents. Kept strong only
+    /// while the worker owns the reporter; the heartbeat loop itself holds a
+    /// Weak reporter reference and therefore cannot pin either object.
+    supervisor: Option<Arc<TaskSupervisor>>,
     /// Cumulative byte count of streamed text so far. Incremented per
     /// `StreamChunk`; the callback receives the value from BEFORE the
     /// increment, i.e. the START offset of the delta's window — the same
@@ -902,9 +906,56 @@ struct SpawnChildTranscriptReporter {
     on_stream_chunk: Option<ChildStreamCallback>,
 }
 
+impl SpawnChildTranscriptReporter {
+    fn new(
+        router: Arc<SubAgentOutputRouter>,
+        router_session_id: String,
+        task_id: String,
+        on_stream_chunk: Option<ChildStreamCallback>,
+        supervisor: Option<Arc<TaskSupervisor>>,
+    ) -> Arc<Self> {
+        let reporter = Arc::new(Self {
+            router,
+            router_session_id,
+            task_id,
+            supervisor,
+            stream_offset: AtomicU64::new(0),
+            on_stream_chunk,
+        });
+        if let Some(supervisor) = reporter.supervisor.as_ref() {
+            supervisor.heartbeat(&reporter.task_id);
+            let interval = supervisor.spawn_heartbeat_interval();
+            let weak = Arc::downgrade(&reporter);
+            // A long tool call may produce no transcript events. Beat on a
+            // monotonic cadence while the worker owns its reporter, but hold
+            // only a Weak reference across sleep so exit stops the heartbeat.
+            // This is liveness, not proof of model/tool progress: a wedged
+            // child whose reporter remains owned is intentionally kept alive,
+            // while dropping the worker/reporter always ends the beats. The
+            // cadence is sampled at construction; later stuck-timeout changes
+            // affect the reaper threshold, not this existing reporter's timer.
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(reporter) = weak.upgrade() else {
+                        break;
+                    };
+                    if let Some(supervisor) = reporter.supervisor.as_ref() {
+                        supervisor.heartbeat(&reporter.task_id);
+                    }
+                }
+            });
+        }
+        reporter
+    }
+}
+
 impl crate::progress::ProgressReporter for SpawnChildTranscriptReporter {
     fn report(&self, event: crate::progress::ProgressEvent) {
         use crate::progress::ProgressEvent;
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor.heartbeat(&self.task_id);
+        }
         let line = match event {
             ProgressEvent::Response { content, .. } => {
                 if content.trim().is_empty() {
@@ -5055,15 +5106,13 @@ impl Tool for SpawnTool {
                 // the agent view could only ever show status.
                 let child_transcript_reporter: Option<Arc<dyn crate::progress::ProgressReporter>> =
                     match (parent_output_router.as_ref(), tracked_task_id.as_ref()) {
-                        (Some(router), Some(task_id)) => {
-                            Some(Arc::new(SpawnChildTranscriptReporter {
-                                router: router.clone(),
-                                router_session_id: child_router_session_id.clone(),
-                                task_id: task_id.clone(),
-                                stream_offset: AtomicU64::new(0),
-                                on_stream_chunk: child_stream_callback.clone(),
-                            }))
-                        }
+                        (Some(router), Some(task_id)) => Some(SpawnChildTranscriptReporter::new(
+                            router.clone(),
+                            child_router_session_id.clone(),
+                            task_id.clone(),
+                            child_stream_callback.clone(),
+                            task_supervisor.clone(),
+                        )),
                         _ => None,
                     };
                 let mut worker = Agent::new(wid.clone(), llm, tools, memory)
