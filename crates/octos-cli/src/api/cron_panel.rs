@@ -52,21 +52,27 @@ use super::AppState;
 use super::router::AuthIdentity;
 use crate::api::auth_handlers::resolve_cron_profile_id;
 
+/// Shared by scoped and admin cron lists, including inactive persisted stores.
+pub(super) fn format_next_in(t: i64, now_ms: i64) -> String {
+    if chrono::DateTime::from_timestamp_millis(t).is_none() {
+        return "invalid timestamp".to_string();
+    }
+    let secs = t.saturating_sub(now_ms) / 1000;
+    if secs < 0 {
+        "overdue".to_string()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Render one job in the same shape the admin list uses, so the SPA
 /// can share a row component between the two surfaces.
 fn job_json(j: &octos_bus::CronJob, now_ms: i64) -> serde_json::Value {
-    let next_in = j.state.next_run_at_ms.map(|t| {
-        let secs = (t - now_ms) / 1000;
-        if secs < 0 {
-            "overdue".to_string()
-        } else if secs < 60 {
-            format!("{secs}s")
-        } else if secs < 3600 {
-            format!("{}m", secs / 60)
-        } else {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-        }
-    });
+    let next_in = j.state.next_run_at_ms.map(|t| format_next_in(t, now_ms));
     let last_run = j.state.last_run_at_ms.map(|t| {
         chrono::DateTime::from_timestamp_millis(t)
             .map(|dt| dt.to_rfc3339())
@@ -193,7 +199,9 @@ impl CronApplicationError {
             Self::AuthScopeViolation => "auth_scope_violation",
             Self::MessageRequired => "message_required",
             Self::EveryMsMustBePositive => "every_ms_must_be_positive",
-            Self::InvalidAtMs => "invalid_at_ms: expected a run time on or before 2099-12-31",
+            Self::InvalidAtMs => {
+                "invalid_at_ms: expected a representable UTC timestamp on or before 2099-12-31"
+            }
             Self::InvalidEveryMs => {
                 "invalid_every_ms: expected a positive interval with an upcoming run on or before 2099-12-31 and no timestamp overflow"
             }
@@ -564,6 +572,32 @@ impl CronApplicationService {
             }
             Err(ToggleError::NotFound) => Err(CronApplicationError::JobNotFound),
             Err(ToggleError::Io) => Err(CronApplicationError::CronStoreIo),
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    #[test]
+    fn should_render_invalid_deadlines_without_overflowing() {
+        let mut job: octos_bus::CronJob = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "name": "legacy", "enabled": true,
+            "schedule": {"kind": "Every", "every_ms": 500},
+            "payload": {"message": "legacy", "channel": null, "chat_id": null},
+            "state": {"next_run_at_ms": null, "last_run_at_ms": null, "last_status": null},
+            "created_at_ms": 0, "delete_after_run": false
+        }))
+        .unwrap();
+        for (at_ms, expected) in [
+            (i64::MIN, "invalid timestamp"),
+            (i64::MAX, "invalid timestamp"),
+            (-1000, "overdue"),
+            (2000, "1s"),
+        ] {
+            job.state.next_run_at_ms = Some(at_ms);
+            let row = super::job_json(&job, 1000);
+            assert_eq!(row["next_in"], expected);
+            assert_eq!(row["next_run"], at_ms);
         }
     }
 }

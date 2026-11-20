@@ -298,3 +298,9 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool (including internally spaced fields) and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |
+
+## Invalid cron timestamps (T-0302)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
