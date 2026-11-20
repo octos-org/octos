@@ -253,9 +253,15 @@ fn pending_sink_drops() -> &'static StdMutex<HashMap<octos_core::SessionKey, Pen
 /// closed), and a session whose client is gone still gets its marker once
 /// the drain next flushes.
 pub(crate) fn note_human_sink_drop(dropped: BackgroundActivityEvent) {
-    let mut pending = pending_sink_drops()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    note_sink_drop_into(pending_sink_drops(), dropped);
+}
+
+/// [`note_human_sink_drop`] against an explicit map (tests isolate their own).
+fn note_sink_drop_into(
+    map: &StdMutex<HashMap<octos_core::SessionKey, PendingSinkDrops>>,
+    dropped: BackgroundActivityEvent,
+) {
+    let mut pending = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = pending
         .entry(dropped.session_id.clone())
         .or_insert_with(|| PendingSinkDrops {
@@ -285,31 +291,47 @@ pub(crate) fn flush_human_sink_drops(
     ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger,
     now: Instant,
 ) {
+    flush_human_sink_drops_with(pending_sink_drops(), now, |marker| {
+        ledger
+            .try_append_notification(octos_core::ui_protocol::UiNotification::BackgroundActivity(
+                marker,
+            ))
+            .is_ok()
+    });
+}
+
+/// The flush loop, with the durable append injectable for tests. Attempts
+/// EVERY eligible session at most once per pass (alan0x review): a session
+/// whose append keeps failing is restored for the next pass and must not
+/// starve the healthy sessions behind it.
+fn flush_human_sink_drops_with(
+    map: &StdMutex<HashMap<octos_core::SessionKey, PendingSinkDrops>>,
+    now: Instant,
+    mut append: impl FnMut(BackgroundActivityEvent) -> bool,
+) {
+    let mut attempted = std::collections::HashSet::new();
     loop {
-        // Take ONE session's pending count out of the lock, append WITHOUT
-        // holding the map lock, and only then clear what was appended. The
+        // Pick ONE eligible session not yet tried this pass, append WITHOUT
+        // holding the map lock, and only then settle its count. The
         // last-flushed stamp stays behind so the window is honored even if
         // the append fails.
         let candidate = {
-            let pending = pending_sink_drops()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pending = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             pending.iter().find_map(|(session, entry)| {
                 let window_open = entry
                     .last_flushed
                     .is_none_or(|last| now.duration_since(last) >= HUMAN_SINK_GAP_WINDOW);
-                (entry.count > 0 && window_open)
+                (entry.count > 0 && window_open && !attempted.contains(session))
                     .then(|| (session.clone(), entry.count, entry.template.clone()))
             })
         };
         let Some((session, count, template)) = candidate else {
             return;
         };
+        attempted.insert(session.clone());
         // Mark the count as in-flight by zeroing it under the lock, so a
         // concurrent note starts a NEW count instead of double-counting.
-        let mut pending = pending_sink_drops()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pending = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(entry) = pending.get_mut(&session) {
             entry.count = entry.count.saturating_sub(count);
         }
@@ -320,31 +342,24 @@ pub(crate) fn flush_human_sink_drops(
         marker.text = "background activity was dropped because the human event \
                        queue was full; the replay above has a gap here"
             .to_string();
-        let appended = ledger
-            .try_append_notification(octos_core::ui_protocol::UiNotification::BackgroundActivity(
-                marker,
-            ))
-            .is_ok();
-        let mut pending = pending_sink_drops()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let appended = append(marker);
+        let mut pending = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if appended {
             if let Some(entry) = pending.get_mut(&session) {
                 entry.last_flushed = Some(now);
             }
-            // Continue with any OTHER session whose window is open.
+            // Continue with any OTHER eligible session.
             continue;
         }
         // Restore the un-appended count (merged with drops noted while we
-        // were appending) so a later flush retries with the full total, and
-        // stop: the ledger is unavailable, retry on a later drain tick.
+        // were appending) so a later pass retries with the full total, and
+        // KEEP GOING: other sessions must still record their gaps this pass.
         let entry = pending.entry(session).or_insert_with(|| PendingSinkDrops {
             count: 0,
             template: template.clone(),
             last_flushed: None,
         });
         entry.count = entry.count.saturating_add(count);
-        return;
     }
 }
 
@@ -441,15 +456,22 @@ mod tests {
     #[test]
     fn should_buffer_drops_while_writer_is_down_and_flush_once_per_window_on_recovery() {
         let key = octos_core::SessionKey("web:tester#sink-gap-buffered".to_owned());
+        let map = StdMutex::new(HashMap::new());
         let now = Instant::now();
         // Writer "down": the producer only touches the in-memory counter and
         // returns immediately — no ledger exists at this point at all.
         for _ in 0..3 {
-            note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
+            note_sink_drop_into(&map, activity("web:tester#sink-gap-buffered", "m1", "lost"));
         }
         // Writer "resumes": the drain flushes; one durable gap row appears.
         let ledger = UiProtocolLedger::new(64);
-        flush_human_sink_drops(&ledger, now);
+        flush_human_sink_drops_with(&map, now, |marker| {
+            ledger
+                .try_append_notification(
+                    octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                )
+                .is_ok()
+        });
         let events = replayed_activity(&ledger, &key);
         assert_eq!(events.len(), 1, "one marker for the burst: {events:?}");
         assert!(events[0].suppressed);
@@ -461,22 +483,41 @@ mod tests {
         assert_eq!(events[0].origin_id, "m1");
         assert!(events[0].text.contains("queue was full"));
         // Counts were cleared by the successful append: no duplicate marker.
-        flush_human_sink_drops(&ledger, now);
+        flush_human_sink_drops_with(&map, now, |marker| {
+            ledger
+                .try_append_notification(
+                    octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                )
+                .is_ok()
+        });
         assert_eq!(replayed_activity(&ledger, &key).len(), 1);
 
         // A second burst INSIDE the window: no new marker (bounded writes).
-        note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
-        note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
-        flush_human_sink_drops(&ledger, now + Duration::from_secs(5));
+        note_sink_drop_into(&map, activity("web:tester#sink-gap-buffered", "m1", "lost"));
+        note_sink_drop_into(&map, activity("web:tester#sink-gap-buffered", "m1", "lost"));
+        flush_human_sink_drops_with(&map, now + Duration::from_secs(5), |marker| {
+            ledger
+                .try_append_notification(
+                    octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                )
+                .is_ok()
+        });
         assert_eq!(
             replayed_activity(&ledger, &key).len(),
             1,
             "window-bounded: the second burst appends nothing yet"
         );
         // After the window the buffered drops merge into the NEXT marker.
-        flush_human_sink_drops(
-            &ledger,
+        flush_human_sink_drops_with(
+            &map,
             now + HUMAN_SINK_GAP_WINDOW + Duration::from_secs(1),
+            |marker| {
+                ledger
+                    .try_append_notification(
+                        octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                    )
+                    .is_ok()
+            },
         );
         let events = replayed_activity(&ledger, &key);
         assert_eq!(events.len(), 2);
@@ -486,8 +527,70 @@ mod tests {
             "window-inner drops merge forward"
         );
         // And nothing further without new drops.
-        flush_human_sink_drops(&ledger, now + 2 * HUMAN_SINK_GAP_WINDOW);
+        flush_human_sink_drops_with(&map, now + 2 * HUMAN_SINK_GAP_WINDOW, |marker| {
+            ledger
+                .try_append_notification(
+                    octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                )
+                .is_ok()
+        });
         assert_eq!(replayed_activity(&ledger, &key).len(), 2);
+    }
+
+    /// alan0x review — one session with a persistently failing append must
+    /// not starve the others: each eligible session is attempted once per
+    /// flush, failed counts are retained for the next pass, and the healthy
+    /// session's gap is recorded on the SAME pass.
+    #[test]
+    fn should_not_starve_healthy_sessions_when_one_session_append_fails() {
+        let good = octos_core::SessionKey("web:tester#gap-good".to_owned());
+        let bad = octos_core::SessionKey("web:tester#gap-bad".to_owned());
+        let map = StdMutex::new(HashMap::new());
+        let now = Instant::now();
+        note_sink_drop_into(&map, activity("web:tester#gap-good", "m-good", "lost"));
+        note_sink_drop_into(&map, activity("web:tester#gap-bad", "m-bad", "lost"));
+
+        let attempts = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let attempts_in = attempts.clone();
+        let bad_key = bad.clone();
+        let good_key = good.clone();
+        flush_human_sink_drops_with(&map, now, move |marker| {
+            attempts_in
+                .lock()
+                .unwrap()
+                .push(marker.session_id.0.clone());
+            marker.session_id != bad_key
+        });
+        {
+            let attempts = attempts.lock().unwrap();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "each session attempted once: {attempts:?}"
+            );
+            assert!(
+                attempts.contains(&good_key.0),
+                "the healthy session records its gap on the same pass"
+            );
+            assert!(attempts.contains(&bad.0));
+        }
+        // The failed session's count is retained and retried on the next
+        // pass; the healthy one does not append again inside its window.
+        let attempts = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let attempts_in = attempts.clone();
+        let bad_key = bad.clone();
+        flush_human_sink_drops_with(
+            &map,
+            now + HUMAN_SINK_GAP_WINDOW + Duration::from_secs(1),
+            move |marker| {
+                attempts_in
+                    .lock()
+                    .unwrap()
+                    .push(marker.session_id.0.clone());
+                marker.session_id != bad_key
+            },
+        );
+        assert_eq!(*attempts.lock().unwrap(), vec![bad.0.clone()]);
     }
 
     /// #2021 — agent wake and UI stream are two READ-ONLY projections of one
@@ -497,14 +600,21 @@ mod tests {
     #[test]
     fn should_project_one_ordered_stream_to_both_consumers_without_duplicates() {
         let ledger = UiProtocolLedger::new(64);
+        let map = StdMutex::new(HashMap::new());
         let key = octos_core::SessionKey("web:tester#dual-projection".to_owned());
         ledger.append_notification(UiNotification::BackgroundActivity(activity(
             "web:tester#dual-projection",
             "m1",
             "first",
         )));
-        note_human_sink_drop(activity("web:tester#dual-projection", "m1", "lost"));
-        flush_human_sink_drops(&ledger, Instant::now());
+        note_sink_drop_into(&map, activity("web:tester#dual-projection", "m1", "lost"));
+        flush_human_sink_drops_with(&map, Instant::now(), |marker| {
+            ledger
+                .try_append_notification(
+                    octos_core::ui_protocol::UiNotification::BackgroundActivity(marker),
+                )
+                .is_ok()
+        });
         ledger.append_notification(UiNotification::BackgroundActivity(activity(
             "web:tester#dual-projection",
             "m1",
