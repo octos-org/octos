@@ -19,72 +19,46 @@ fn file_read_params(session_id: &str, path: &str) -> SessionFilesReadParams {
 async fn session_file_read_rejects_traversal_directories_and_symlinks() {
     let data = tempfile::tempdir().unwrap();
     let state = AppState::empty_for_tests();
-    let workspace = workspace_for_session(data.path(), "api:demo");
-    std::fs::create_dir_all(&workspace).unwrap();
-    for path in ["../secret.md", "/etc/passwd"] {
-        let error = read_session_workspace_file(
-            &state,
-            data.path(),
-            Some(MAIN_PROFILE_ID),
-            file_read_params("api:demo", path),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.data.as_ref().unwrap()["kind"],
-            "workspace_file_invalid_path"
-        );
+    let (outside, outside_dir) = (
+        data.path().join("outside.md"),
+        data.path().join("outside-dir"),
+    );
+    std::fs::write(&outside, b"secret").unwrap();
+    std::fs::create_dir(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
+    // A web session's workspace, and a chat's own folder (UPCR-2026-R1EFC56A3).
+    let chat = SessionKey("t:api:chat".into());
+    let chat_root = crate::runtime::chat_workspace::create(data.path(), "t", &chat).unwrap();
+    for (session_id, workspace) in [
+        ("api:demo", workspace_for_session(data.path(), "api:demo")),
+        (chat.0.as_str(), chat_root.root),
+    ] {
+        std::fs::create_dir_all(workspace.join("directory")).unwrap();
+        std::fs::write(workspace.join("own.md"), b"own").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut refused = vec![
+            ("../secret.md", "workspace_file_invalid_path"),
+            ("/etc/passwd", "workspace_file_invalid_path"),
+            ("directory", "workspace_file_not_regular"),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, workspace.join("escape.md")).unwrap();
+            std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
+            refused.push(("escape.md", "workspace_file_escape"));
+            refused.push(("dir-link/secret.md", "workspace_file_escape"));
+        }
+        let read = |path: &str| {
+            let params = file_read_params(session_id, path);
+            read_session_workspace_file(&state, data.path(), Some(MAIN_PROFILE_ID), params)
+        };
+        let own = read("own.md").await.unwrap();
+        assert_eq!(own.content_base64, BASE64_STANDARD.encode(b"own"));
+        for (path, kind) in refused {
+            let error = read(path).await.unwrap_err();
+            assert_eq!(error.data.unwrap()["kind"], kind, "{session_id} {path}");
+        }
     }
     assert!(!data.path().join("secret.md").exists());
-
-    std::fs::create_dir(workspace.join("directory")).unwrap();
-    let error = read_session_workspace_file(
-        &state,
-        data.path(),
-        Some(MAIN_PROFILE_ID),
-        file_read_params("api:demo", "directory"),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        error.data.as_ref().unwrap()["kind"],
-        "workspace_file_not_regular"
-    );
-
-    #[cfg(unix)]
-    {
-        let outside = data.path().join("outside.md");
-        std::fs::write(&outside, b"secret").unwrap();
-        std::os::unix::fs::symlink(&outside, workspace.join("escape.md")).unwrap();
-        let error = read_session_workspace_file(
-            &state,
-            data.path(),
-            Some(MAIN_PROFILE_ID),
-            file_read_params("api:demo", "escape.md"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.data.as_ref().unwrap()["kind"],
-            "workspace_file_escape"
-        );
-
-        let outside_dir = data.path().join("outside-dir");
-        std::fs::create_dir(&outside_dir).unwrap();
-        std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
-        std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
-        let error = read_session_workspace_file(
-            &state,
-            data.path(),
-            Some(MAIN_PROFILE_ID),
-            file_read_params("api:demo", "dir-link/secret.md"),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.data.as_ref().unwrap()["kind"],
-            "workspace_file_escape"
-        );
-        assert!(!outside_dir.join("created").exists());
-    }
+    assert!(!outside_dir.join("created").exists());
 }

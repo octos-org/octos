@@ -30,6 +30,46 @@ pub struct BwrapSandbox {
     pub(crate) repo_git_write: Option<PathBuf>,
     /// UPCR-2026-034 `read_parent` (see `SandboxConfig::read_only_view`).
     pub(crate) read_only_view: Option<Box<super::SandboxReadOnlyView>>,
+    /// UPCR-2026-R1EFC56A3 (see `SandboxConfig::hidden_folders`).
+    pub(crate) hidden_folders: Option<octos_core::HiddenFolders>,
+}
+
+/// How the sandbox hides `hidden`: each existing folder inside a `bound`
+/// folder (bound as given; compared resolved) is covered by an empty tmpfs,
+/// and a bound folder inside a hidden one is covered whole. Returns the
+/// folders to cover and, for a writable `cwd`, the folders between it and a
+/// hidden folder (source, destination), to bind over themselves first: a
+/// mount point cannot be renamed or removed, so the shell cannot move a
+/// hidden folder out from under the next command's mounts.
+fn hidden_mounts(
+    hidden: &[PathBuf],
+    cwd: &Path,
+    view_root: Option<&Path>,
+    cwd_writable: bool,
+) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+    let mut covers = std::collections::BTreeSet::new();
+    let mut pins = std::collections::BTreeSet::new();
+    let bound = std::iter::once(cwd).chain(view_root);
+    let bound: Vec<(&Path, PathBuf)> = bound
+        .filter_map(|path| Some((path, std::fs::canonicalize(path).ok()?)))
+        .collect();
+    for folder in hidden.iter().filter_map(|f| std::fs::canonicalize(f).ok()) {
+        for (path, real) in &bound {
+            if let Ok(below) = folder.strip_prefix(real) {
+                covers.insert(path.join(below));
+                if cwd_writable && *path == cwd {
+                    let mut between = PathBuf::new();
+                    for part in below.parent().into_iter().flat_map(Path::components) {
+                        between.push(part);
+                        pins.insert((real.join(&between), path.join(&between)));
+                    }
+                }
+            } else if real.starts_with(&folder) {
+                covers.insert(path.to_path_buf());
+            }
+        }
+    }
+    (covers.into_iter().collect(), pins.into_iter().collect())
 }
 
 impl Sandbox for BwrapSandbox {
@@ -135,6 +175,22 @@ impl Sandbox for BwrapSandbox {
             cmd.arg("--bind").arg(&*git_str).arg(&*git_str);
         }
 
+        // Folders the shell never sees (every profile's chats folder, for a
+        // session that is not a chat): an empty tmpfs over each one inside a
+        // bound folder, after the binds so it lands on top, with the folders
+        // leading to it pinned in place.
+        if let Some(hidden) = &self.hidden_folders {
+            let view_root = self.read_only_view.as_ref().map(|view| view.root.as_path());
+            let (covers, pins) =
+                hidden_mounts(&hidden.folders(), cwd, view_root, self.workspace_write);
+            for (source, destination) in pins {
+                cmd.arg("--bind").arg(source).arg(destination);
+            }
+            for cover in covers {
+                cmd.arg("--tmpfs").arg(cover);
+            }
+        }
+
         // /dev minimal
         cmd.arg("--dev").arg("/dev");
         cmd.arg("--proc").arg("/proc");
@@ -160,6 +216,7 @@ mod tests {
     fn test_bwrap_sandbox_env_sanitization() {
         let sb = BwrapSandbox {
             read_only_view: None,
+            hidden_folders: None,
             allow_network: false,
             workspace_write: true,
             deliverable_root: None,

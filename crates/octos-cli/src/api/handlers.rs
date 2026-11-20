@@ -70,6 +70,33 @@ fn resolve_scoped_download_path(
     base_dir: &std::path::Path,
     request_path: &str,
     auth_profile: Option<&str>,
+    session: &FileRequestSession,
+) -> Option<std::path::PathBuf> {
+    let path = resolve_download_candidate(
+        base_dir,
+        request_path,
+        auth_profile,
+        session.workspace.as_deref(),
+    )?;
+    // A file in any profile's chats folder is served only to a request
+    // naming the chat that owns it, as that chat is bound now
+    // (UPCR-2026-R1EFC56A3), whichever resolver found it.
+    let dirs = std::iter::once(base_dir).chain(session.data_dir.as_deref());
+    let in_chats = crate::runtime::chat_workspace::is_reserved(dirs, &path);
+    let owned = || {
+        let path = std::fs::canonicalize(&path);
+        session
+            .chat
+            .as_ref()
+            .is_some_and(|chat| path.is_ok_and(|path| path.starts_with(chat)))
+    };
+    (!in_chats || owned()).then_some(path)
+}
+
+fn resolve_download_candidate(
+    base_dir: &std::path::Path,
+    request_path: &str,
+    auth_profile: Option<&str>,
     session_workspace: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     if let Some(resolved) = resolve_scoped_file_handle(base_dir, request_path)
@@ -158,6 +185,13 @@ fn resolve_session_workspace_root(
         return None;
     }
     let key = octos_core::SessionKey(session_id.to_string());
+    // A chat's folder is its workspace, opened or not (UPCR-2026-R1EFC56A3).
+    // A chat whose folder is unusable serves no files at all.
+    match crate::runtime::chat_workspace::lookup(data_dir, &key) {
+        Ok(Some(chat)) => return Some(chat.root),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
     if let Some(ws) =
         crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
@@ -173,6 +207,49 @@ fn resolve_session_workspace_root(
     Some(data_dir.join("users").join(encoded).join("workspace"))
 }
 
+/// The session a file request names, under the profile that owns it.
+#[derive(Default)]
+struct FileRequestSession {
+    profile: Option<String>,
+    data_dir: Option<std::path::PathBuf>,
+    workspace: Option<std::path::PathBuf>,
+    /// Its folder, when the session is a chat bound to a usable one.
+    chat: Option<std::path::PathBuf>,
+}
+
+fn file_request_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    request_data_dir: &std::path::Path,
+    session: Option<&str>,
+) -> FileRequestSession {
+    let Some(session) = session else {
+        return FileRequestSession::default();
+    };
+    let profile = request_session_owner_profile(state, headers, identity, session);
+    let data_dir = profile
+        .as_deref()
+        .and_then(|profile| session_profile_data_dir(state, request_data_dir, profile));
+    let Some(dir) = data_dir.as_deref() else {
+        return FileRequestSession {
+            profile,
+            ..Default::default()
+        };
+    };
+    let workspace = resolve_session_workspace_root(state, dir, profile.as_deref(), session);
+    let key = octos_core::SessionKey(session.to_owned());
+    let chat = crate::runtime::chat_workspace::lookup(dir, &key)
+        .ok()
+        .flatten();
+    FileRequestSession {
+        workspace,
+        chat: chat.map(|chat| chat.root),
+        data_dir,
+        profile,
+    }
+}
+
 /// Workspace binding for UPCR-2026-057. An approved external cwd recorded by
 /// `session/open` is authoritative even when it is outside the profile data
 /// dir; the legacy `/api/files` resolver deliberately rejects that broader
@@ -185,8 +262,14 @@ fn resolve_session_workspace_root_for_read(
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
     let key = octos_core::SessionKey(session_id.to_owned());
-    if let Some(root) =
-        crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
+    // A chat, usable or not, never falls back to the root recorded at open.
+    let not_chat = matches!(
+        crate::runtime::chat_workspace::lookup(data_dir, &key),
+        Ok(None)
+    );
+    if not_chat
+        && let Some(root) =
+            crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
     {
         return Some(root);
     }
@@ -2018,9 +2101,21 @@ async fn session_files_response(
         if !tree_params_supplied && !workspace.exists() {
             return Json(Vec::<Value>::new()).into_response();
         }
-        let listing =
-            tokio::task::spawn_blocking(move || workspace_tree_listing(&workspace, &effective))
-                .await;
+        // The chats folder of the session's own profile, resolved as
+        // `files/read` resolves it, else of the folder the workspace was
+        // resolved in.
+        let owner_data_dir = match session_profile.as_str() {
+            MAIN_PROFILE_ID => data_dir.clone(),
+            profile => {
+                resolve_profile_data_dir_by_id(&state, profile).unwrap_or_else(|_| data_dir.clone())
+            }
+        };
+        let session = octos_core::SessionKey(params.session_id.clone());
+        let hidden = crate::runtime::chat_workspace::hidden_from(&owner_data_dir, &session);
+        let listing = tokio::task::spawn_blocking(move || {
+            workspace_tree_listing(&workspace, &effective, &hidden)
+        })
+        .await;
         return match listing {
             Ok(Ok(body)) if tree_params_supplied => Json(body).into_response(),
             Ok(Ok(body)) => {
@@ -2153,12 +2248,18 @@ fn workspace_relative_path(root: &std::path::Path, path: &std::path::Path) -> Op
 /// Entries are sorted by workspace-relative path and paginated keyset
 /// (`cursor` = the last path of the previous page). Directory symlinks are
 /// never traversed (no loops); file symlinks whose canonical target leaves
-/// the workspace are skipped.
+/// the workspace are skipped. Nothing in `hidden` (chats folders the
+/// workspace holds, UPCR-2026-R1EFC56A3) is listed or traversed.
 fn workspace_tree_listing(
     workspace: &std::path::Path,
     params: &SessionFilesListParams,
+    hidden: &[std::path::PathBuf],
 ) -> Result<Value, RpcError> {
     let (root, list_root) = resolve_tree_prefix(workspace, params.prefix.as_deref())?;
+    let is_hidden = |path: &std::path::Path| hidden.iter().any(|hidden| path.starts_with(hidden));
+    if is_hidden(&list_root) {
+        return Err(chat_files_reserved());
+    }
     let max_depth = params.depth.unwrap_or(1).min(FILES_TREE_MAX_DEPTH);
     let limit = (params.limit.unwrap_or(FILES_TREE_DEFAULT_LIMIT as u32) as usize)
         .min(FILES_TREE_MAX_LIMIT);
@@ -2199,7 +2300,7 @@ fn workspace_tree_listing(
         level.sort_by(|a, b| b.0.cmp(&a.0));
         for (name, path, file_type, metadata) in level {
             let name_str = name.to_string_lossy();
-            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) {
+            if FILES_TREE_EXCLUDED_NAMES.contains(&name_str.as_ref()) || is_hidden(&path) {
                 continue;
             }
             if file_type.is_symlink() {
@@ -2209,7 +2310,7 @@ fn workspace_tree_listing(
                 let Ok(canonical) = std::fs::canonicalize(&path) else {
                     continue;
                 };
-                if !canonical.starts_with(&root) || !canonical.is_file() {
+                if !canonical.starts_with(&root) || !canonical.is_file() || is_hidden(&canonical) {
                     continue;
                 }
             } else if !file_type.is_dir() && !file_type.is_file() {
@@ -2282,6 +2383,16 @@ pub const SESSION_FILE_READ_CHUNK_BYTES: u64 = 512 * 1024;
 
 fn workspace_file_error(code: i64, kind: &str, message: impl Into<String>) -> RpcError {
     RpcError::new(code, message).with_data(serde_json::json!({ "kind": kind }))
+}
+
+/// A workspace read or listing that reaches into a chats folder the session
+/// does not own (UPCR-2026-R1EFC56A3).
+fn chat_files_reserved() -> RpcError {
+    workspace_file_error(
+        rpc_error_codes::PERMISSION_DENIED,
+        "chat_workspace_reserved",
+        "this folder belongs to chats",
+    )
 }
 
 /// Read one bounded chunk from an explicitly named file in a session workspace.
@@ -2389,6 +2500,19 @@ async fn read_session_workspace_file(
         ));
     }
     let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
+    // A workspace that holds chats folders (a project or home above the data
+    // directories) does not open the chats' files. Checked by name and after
+    // resolving the path.
+    let session = octos_core::SessionKey(params.session_id.clone());
+    let hidden = crate::runtime::chat_workspace::hidden_from(data_dir, &session);
+    let candidate = root.join(relative);
+    let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    if hidden
+        .iter()
+        .any(|hidden| candidate.starts_with(hidden) || real.starts_with(hidden))
+    {
+        return Err(chat_files_reserved());
+    }
     let (bytes, size_bytes, eof) =
         read_file_chunk_no_follow(root, relative, offset, length).await?;
     Ok(SessionFilesReadResult {
@@ -2849,6 +2973,16 @@ async fn update_session_title_response(
     }
 }
 
+/// `session/delete` could not remove a chat's folder or record. The chat is
+/// still there (UPCR-2026-R1EFC56A3), so deleting it again retries.
+fn chat_workspace_not_deleted() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "could not delete the chat workspace",
+    )
+        .into_response()
+}
+
 // Helper for `ui_protocol_transport::handle_session_delete` (M12 Phase D-5).
 // The REST route `DELETE /api/sessions/{id}` was retired; this
 // function survives as the implementation backing the WS
@@ -2907,6 +3041,7 @@ pub async fn delete_session(
             tracing::warn!(session_key = %key, error = ?error,
                 "failed to remove deleted session's session_ref registry rows");
         }
+        super::ui_protocol_transport::restore_session_chat_folder(&state, &key);
         let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
@@ -2962,6 +3097,13 @@ pub async fn delete_session(
             }
             Ok(None) => {}
         }
+        // A chat's folder goes before its transcript and its record after it,
+        // so a folder that cannot be removed leaves the whole chat, and
+        // deleting it again retries (UPCR-2026-R1EFC56A3).
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_folder(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat workspace");
+            return chat_workspace_not_deleted();
+        }
         let existed = match sess.clear_existing(&key).await {
             Ok(existed) => existed,
             Err(e) => {
@@ -2985,6 +3127,10 @@ pub async fn delete_session(
         // `reasoning_effort_path` so the encoding matches, and is
         // idempotent (missing file = `Ok(())`).
         let data_dir = sess.data_dir();
+        if let Err(error) = super::ui_protocol_transport::remove_session_chat_record(&state, &key) {
+            tracing::warn!(session_key = %key, %error, "failed to remove the chat record");
+            return chat_workspace_not_deleted();
+        }
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {
             tracing::warn!(
@@ -3457,27 +3603,16 @@ pub async fn mutate_file(
         Err(response) => return response,
     };
     let profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = request
-        .session
-        .as_deref()
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let workspace = request.session.as_deref().and_then(|session| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            session,
-        )
-    });
-    let Some(path) = resolve_scoped_download_path(
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
         &data_dir,
-        &request.path,
-        profile.as_deref(),
-        workspace.as_deref(),
-    ) else {
+        request.session.as_deref(),
+    );
+    let Some(path) =
+        resolve_scoped_download_path(&data_dir, &request.path, profile.as_deref(), &session)
+    else {
         return (StatusCode::NOT_FOUND, "File not found in this profile.").into_response();
     };
     let root = if let Some(owner) = upload_tmpdir_tenant(&path) {
@@ -3530,22 +3665,15 @@ pub async fn serve_file_by_query(
     // #1377: the authenticated requester's profile gates upload-tmpdir downloads
     // (no cross-tenant) and authorizes a session-relative `uploads/<name>` path.
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = params
-        .get("session")
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            s,
-        )
-    });
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
+        &data_dir,
+        params.get("session").map(String::as_str),
+    );
     let delivery_profile = if params.contains_key("session") {
-        session_profile.as_deref()
+        session.profile.as_deref()
     } else {
         auth_profile.as_deref()
     };
@@ -3554,7 +3682,7 @@ pub async fn serve_file_by_query(
         &data_dir,
         filename,
         auth_profile.as_deref(),
-        session_ws.as_deref(),
+        &session,
         delivered,
     )
     .await
@@ -3620,22 +3748,15 @@ pub async fn serve_file(
         Err(response) => return response,
     };
     let auth_profile = request_owner_profile(&state, &headers, identity);
-    let session_profile = params
-        .get("session")
-        .and_then(|session| request_session_owner_profile(&state, &headers, identity, session));
-    let session_data_dir = session_profile
-        .as_deref()
-        .and_then(|session_profile| session_profile_data_dir(&state, &data_dir, session_profile));
-    let session_ws = params.get("session").and_then(|s| {
-        resolve_session_workspace_root(
-            &state,
-            session_data_dir.as_ref()?,
-            session_profile.as_deref(),
-            s,
-        )
-    });
+    let session = file_request_session(
+        &state,
+        &headers,
+        identity,
+        &data_dir,
+        params.get("session").map(String::as_str),
+    );
     let delivery_profile = if params.contains_key("session") {
-        session_profile.as_deref()
+        session.profile.as_deref()
     } else {
         auth_profile.as_deref()
     };
@@ -3644,7 +3765,7 @@ pub async fn serve_file(
         &data_dir,
         &filename,
         auth_profile.as_deref(),
-        session_ws.as_deref(),
+        &session,
         delivered,
     )
     .await
@@ -3844,11 +3965,10 @@ async fn serve_file_impl(
     data_dir: &std::path::Path,
     filename: &str,
     auth_profile: Option<&str>,
-    session_workspace: Option<&std::path::Path>,
+    session: &FileRequestSession,
     delivered_copy: Option<DeliveredDownloadRequest>,
 ) -> Response {
-    let resolved =
-        resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace);
+    let resolved = resolve_scoped_download_path(data_dir, filename, auth_profile, session);
     let (path, data) = if let Some(path) = resolved {
         // Keep the existing nofollow read for ordinary profile/workspace files.
         let data = match read_file_no_follow(path.clone()).await {
@@ -5422,7 +5542,10 @@ pub async fn list_content_files(
             let name = entry.file_name().to_string_lossy().to_string();
 
             if path.is_dir() {
-                if !allow_nested_dirs || should_skip_listing_dir(&name, include_build) {
+                if !allow_nested_dirs
+                    || should_skip_listing_dir(&name, include_build)
+                    || crate::runtime::chat_workspace::is_reserved([data_dir], &path)
+                {
                     continue;
                 }
                 let mut next_relative = relative_dir.to_path_buf();
@@ -5478,7 +5601,10 @@ pub async fn list_content_files(
         } else {
             data_dir.join(dir_name.as_str())
         };
-        if !dir_path.exists() {
+        // The chats' files are listed only to each chat, as its workspace.
+        if !dir_path.exists()
+            || crate::runtime::chat_workspace::is_reserved([data_dir.as_path()], &dir_path)
+        {
             continue;
         }
         let display_dir = display_dir_for_scan(dir_name);

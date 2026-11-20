@@ -648,6 +648,7 @@ mod execution_gate_tests {
                     deliverable_root: None,
                     repo_git_write: None,
                     read_only_view: None,
+                    hidden_folders: None,
                 })
             } else {
                 Box::new(RecordingSandbox::default())
@@ -747,6 +748,7 @@ mod execution_gate_tests {
             write_allow_globs: None,
             toolchain_write_grants: crate::sandbox::ToolchainWriteGrants::default(),
             read_only_view: None,
+            hidden_folders: None,
         };
         let executor = LifecycleExecutor::new(
             Box::new(LifecycleSandboxAdapter(Box::new(sandbox))),

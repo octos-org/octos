@@ -23,6 +23,15 @@ pub struct SendFileTool {
     /// Additional allowed directories beyond base_dir (e.g. data_dir for
     /// pipeline-generated files). Absolute paths under these dirs are accepted.
     extra_allowed_dirs: Vec<PathBuf>,
+    /// Deliver only from `base_dir`, pinned to where it resolved when set:
+    /// neither the managed upload root (shared by a profile's sessions) nor
+    /// `extra_allowed_dirs`, and nothing at all once `base_dir` resolves
+    /// elsewhere, e.g. a chat's folder replaced by a symlink
+    /// (UPCR-2026-R1EFC56A3).
+    base_dir_only: Option<PathBuf>,
+    /// Folders nothing is delivered from, wherever else they lie (e.g. the
+    /// chat folders, for any session that is not a chat).
+    hidden: octos_core::HiddenFolders,
     /// Only the gateway API consumer rejects messages without a turn thread.
     /// Serve's API consumers retain their existing thread-optional behavior.
     require_turn_scope: bool,
@@ -55,6 +64,8 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
+            base_dir_only: None,
+            hidden: Default::default(),
             require_turn_scope: false,
         }
     }
@@ -72,6 +83,8 @@ impl SendFileTool {
             default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
+            base_dir_only: None,
+            hidden: Default::default(),
             require_turn_scope: false,
         }
     }
@@ -91,6 +104,22 @@ impl SendFileTool {
     /// Set the base directory for file path resolution and validation.
     pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.base_dir = Some(dir.into());
+        self
+    }
+
+    /// Deliver files from `base_dir` only (a chat's own workspace), and only
+    /// while it resolves to `root`, where it resolved when its session was
+    /// admitted. Call after [`Self::with_base_dir`].
+    pub fn with_base_dir_only(mut self, root: PathBuf) -> Self {
+        self.base_dir_only = Some(root);
+        self
+    }
+
+    /// Deliver nothing from the folders of `hidden`, as they are when a file
+    /// is sent, even where `base_dir` or an extra allowed directory holds
+    /// them.
+    pub fn with_hidden_folders(mut self, hidden: octos_core::HiddenFolders) -> Self {
+        self.hidden = hidden;
         self
     }
 
@@ -278,6 +307,17 @@ impl Tool for SendFileTool {
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
+            if self
+                .base_dir_only
+                .as_ref()
+                .is_some_and(|pinned| *pinned != canonical_base)
+            {
+                return Ok(ToolResult {
+                    output: "Error: the workspace folder is no longer available".into(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
             let upload_root = std::fs::canonicalize(octos_core::file_handle::temp_upload_root())
                 .unwrap_or_else(|_| octos_core::file_handle::temp_upload_root());
             let extra_canonical: Vec<PathBuf> = self
@@ -287,11 +327,17 @@ impl Tool for SendFileTool {
                 .collect();
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
-                    let allowed = canonical_path.starts_with(&canonical_base)
-                        || canonical_path.starts_with(&upload_root)
-                        || extra_canonical
-                            .iter()
-                            .any(|d| canonical_path.starts_with(d));
+                    let hidden = self.hidden.folders().iter().any(|d| {
+                        canonical_path
+                            .starts_with(std::fs::canonicalize(d).unwrap_or_else(|_| d.clone()))
+                    });
+                    let allowed = !hidden
+                        && (canonical_path.starts_with(&canonical_base)
+                            || (self.base_dir_only.is_none()
+                                && (canonical_path.starts_with(&upload_root)
+                                    || extra_canonical
+                                        .iter()
+                                        .any(|d| canonical_path.starts_with(d)))));
                     if !allowed {
                         let mut output = format!(
                             "Error: File path is outside the allowed directory: {}",

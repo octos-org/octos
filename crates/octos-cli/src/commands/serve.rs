@@ -1971,6 +1971,17 @@ impl ServeCommand {
         // method and the signal watcher (installed further down) share it.
         let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let shared_token = self.shared.then(|| auth_token.clone()).flatten();
+        // Every stored profile's chat folders are kept from other profiles'
+        // sessions, whether or not it starts in this run (UPCR-2026-R1EFC56A3).
+        match profile_store.list() {
+            Ok(stored) => {
+                for profile in &stored {
+                    let data_dir = profile_store.resolve_data_dir(profile);
+                    crate::runtime::chat_workspace::register_profile(&data_dir);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "could not list profiles to reserve their chats"),
+        }
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,

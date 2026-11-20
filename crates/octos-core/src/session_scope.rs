@@ -205,6 +205,9 @@ pub enum SessionScopeError {
     /// A read-only view root or excluded folder is not absolute, contains
     /// `..`, or (for an excluded folder) is not strictly inside the root.
     ReadOnlyViewInvalid(PathBuf),
+
+    /// A hidden folder is not absolute or contains `..`.
+    HiddenFolderInvalid(PathBuf),
 }
 
 impl std::fmt::Display for SessionScopeError {
@@ -262,6 +265,11 @@ impl std::fmt::Display for SessionScopeError {
                 f,
                 "read-only view path must be absolute, without `..`, and an excluded \
                  folder strictly inside the view root; got: {}",
+                p.display()
+            ),
+            Self::HiddenFolderInvalid(p) => write!(
+                f,
+                "hidden folder must be absolute and without `..`; got: {}",
                 p.display()
             ),
         }
@@ -422,6 +430,70 @@ pub struct SessionScope {
     /// Optional read-only view of a folder above the workspace, minus the
     /// folders it excludes. See [`SessionScope::with_read_only_view`].
     read_only_view: Option<ReadOnlyView>,
+    /// Where the workspace resolved when it was pinned. See
+    /// [`SessionScope::with_pinned_workspace`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_workspace: Option<PathBuf>,
+    /// Folders outside every zone, even inside the workspace. See
+    /// [`SessionScope::with_hidden_folders`].
+    #[serde(skip_serializing_if = "HiddenFolders::is_empty")]
+    hidden: HiddenFolders,
+}
+
+/// Folders a scope keeps out of every zone. Clones share one list, so a
+/// folder added later reaches every scope already built with it
+/// (UPCR-2026-R1EFC56A3: a profile started after a session's scope was built
+/// still keeps its chats from that session).
+#[derive(Debug, Clone, Default)]
+pub struct HiddenFolders(std::sync::Arc<std::sync::RwLock<Vec<PathBuf>>>);
+
+impl HiddenFolders {
+    /// Hide `folder` (absolute and free of `..`) from every scope sharing
+    /// this list.
+    pub fn add(&self, folder: PathBuf) -> Result<(), SessionScopeError> {
+        let has_parent = folder
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+        if !folder.is_absolute() || has_parent {
+            return Err(SessionScopeError::HiddenFolderInvalid(folder));
+        }
+        let mut folders = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+        Ok(())
+    }
+
+    /// The folders hidden now.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn any(&self, hides: impl FnMut(&PathBuf) -> bool) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(hides)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+}
+
+impl PartialEq for HiddenFolders {
+    fn eq(&self, other: &Self) -> bool {
+        self.folders() == other.folders()
+    }
+}
+
+impl Eq for HiddenFolders {}
+
+impl Serialize for HiddenFolders {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.folders().serialize(serializer)
+    }
 }
 
 /// A read-only view of `root` that hides every folder in `excluded`
@@ -537,6 +609,8 @@ impl SessionScope {
             },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
+            hidden: HiddenFolders::default(),
         })
     }
 
@@ -667,6 +741,8 @@ impl SessionScope {
             },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
+            hidden: HiddenFolders::default(),
         })
     }
 
@@ -692,6 +768,8 @@ impl SessionScope {
             mode: ScopeMode::Solo { granted_dirs },
             skill_read_zones: Vec::new(),
             read_only_view: None,
+            pinned_workspace: None,
+            hidden: HiddenFolders::default(),
         })
     }
 
@@ -817,6 +895,17 @@ impl SessionScope {
         self.read_only_view.as_ref()
     }
 
+    /// Pin the workspace to `root`, where it resolved when it was checked
+    /// (a chat's folder as its session was admitted, UPCR-2026-R1EFC56A3).
+    /// Once the workspace resolves anywhere else (the folder, or a folder
+    /// above it, was replaced by a symlink), nothing is classified as in the
+    /// workspace any more, so file tools refuse instead of following the
+    /// replacement.
+    pub fn with_pinned_workspace(mut self, root: PathBuf) -> Self {
+        self.pinned_workspace = Some(root);
+        self
+    }
+
     /// Return a new `SessionScope` whose read-side tools may also read under
     /// `root`, except under any folder in `excluded` (each must be absolute,
     /// free of `..` and strictly inside `root`). Writes there are refused.
@@ -842,6 +931,26 @@ impl SessionScope {
         }
         self.read_only_view = Some(ReadOnlyView { root, excluded });
         Ok(self)
+    }
+
+    /// Return a new `SessionScope` that classifies every path in one of
+    /// `folders` (each absolute and free of `..`) as out of scope, whatever
+    /// zone holds it, the workspace included. An ordinary session rooted at
+    /// a project or home that holds the profile's chat folders keeps the
+    /// rest of it (UPCR-2026-R1EFC56A3).
+    pub fn with_hidden_folders(self, folders: Vec<PathBuf>) -> Result<Self, SessionScopeError> {
+        let hidden = HiddenFolders::default();
+        for folder in folders {
+            hidden.add(folder)?;
+        }
+        Ok(self.with_shared_hidden_folders(hidden))
+    }
+
+    /// Return a new `SessionScope` that hides the folders of `hidden`, now
+    /// and as they are added later.
+    pub fn with_shared_hidden_folders(mut self, hidden: HiddenFolders) -> Self {
+        self.hidden = hidden;
+        self
     }
 
     /// Return a new `SessionScope` with `dir` added to `granted_dirs`.
@@ -889,6 +998,9 @@ impl SessionScope {
             Some(p) => p,
             None => return PathClassification::OutOfScope,
         };
+        if self.hidden.any(|folder| normalised.starts_with(folder)) {
+            return PathClassification::OutOfScope;
+        }
         // Workspace is most specific — check first.
         if normalised.starts_with(&self.workspace) {
             return PathClassification::InWorkspace;
@@ -940,6 +1052,15 @@ impl SessionScope {
         PathClassification::OutOfScope
     }
 
+    /// Whether `path`, resolved, lies in a folder this scope hides
+    /// ([`Self::with_hidden_folders`]): for a tool that resolves its paths
+    /// itself rather than through the scope.
+    pub fn hides(&self, path: &Path) -> bool {
+        let canon = canonicalize_lossy(path);
+        self.hidden
+            .any(|folder| canon.starts_with(canonical_root_lossy(folder)))
+    }
+
     /// Classify `path` against this scope after canonicalising both
     /// sides. Closes the ancestor-symlink hole in
     /// [`Self::classify_lexical_path`]: a symlink anywhere on the
@@ -967,8 +1088,16 @@ impl SessionScope {
     /// fully-virtual paths.
     pub fn classify_canonical_path(&self, path: &Path) -> PathClassification {
         let canon = canonicalize_lossy(path);
+        let hidden = |folder: &PathBuf| canon.starts_with(canonical_root_lossy(folder));
+        if self.hidden.any(hidden) {
+            return PathClassification::OutOfScope;
+        }
         let canon_ws = canonical_root_lossy(&self.workspace);
-        if canon.starts_with(&canon_ws) {
+        let pin_holds = self
+            .pinned_workspace
+            .as_ref()
+            .is_none_or(|pinned| *pinned == canon_ws);
+        if pin_holds && canon.starts_with(&canon_ws) {
             return PathClassification::InWorkspace;
         }
         if let ScopeMode::Solo { granted_dirs } = &self.mode {

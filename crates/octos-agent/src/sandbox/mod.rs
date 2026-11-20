@@ -197,6 +197,26 @@ pub struct SandboxConfig {
     ///   see the peer's folder; the file tools still do).
     #[serde(skip)]
     pub read_only_view: Option<Box<SandboxReadOnlyView>>,
+
+    /// UPCR-2026-R1EFC56A3: folders the shell never sees, even inside its
+    /// cwd (every profile's chats folder, for a session that is not a chat).
+    /// The list is live: a profile that starts later is hidden from
+    /// sandboxes already built. Set by the kernel, never from configuration.
+    ///
+    /// - bwrap: an empty `--tmpfs` over each one inside a bound folder, after
+    ///   the binds so it lands on top. The folders between a writable cwd and
+    ///   a hidden one are bound over themselves first, so the shell cannot
+    ///   rename one (a mount point) to move the hidden folder away.
+    /// - macOS: `(deny file-read* file-write* (subpath <folder>))` for each,
+    ///   last, so it wins over every grant, and `(deny file-write* (literal
+    ///   <parent>))` for each folder between the cwd and it.
+    /// - Landlock, Docker and AppContainer cannot hide a folder inside one
+    ///   they grant: a command whose cwd or a configured read path holds one
+    ///   refuses to run.
+    /// - No sandbox grants every path for the command's whole run: every
+    ///   command refuses while any folder is hidden, empty or not.
+    #[serde(skip)]
+    pub hidden_folders: Option<octos_core::HiddenFolders>,
 }
 
 /// See [`SandboxConfig::read_only_view`]. `root` and `excluded` are
@@ -411,6 +431,7 @@ impl Default for SandboxConfig {
             profile_name: None,
             allow_toolchains: true,
             read_only_view: None,
+            hidden_folders: None,
         }
     }
 }
@@ -829,24 +850,13 @@ impl std::fmt::Display for SandboxUnavailable {
 impl std::error::Error for SandboxUnavailable {}
 
 impl SandboxUnavailable {
-    /// One-line rendering safe to embed in a `sh -c` / `cmd /C` echo: only
-    /// shell-inert characters survive, so no quoting bug can ever turn the
-    /// refusal back into command execution.
+    /// One-line rendering for [`refusing_command`].
     fn stderr_line(&self) -> String {
-        let line = format!(
+        format!(
             "sandbox unavailable, mode {}: {} Refusing to run the command unconfined. \
              Fix the sandbox config or run octos doctor.",
             self.requested, self.reason
-        );
-        line.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || " ./:_=,-".contains(c) {
-                    c
-                } else {
-                    ' '
-                }
-            })
-            .collect()
+        )
     }
 }
 
@@ -1032,32 +1042,48 @@ impl Sandbox for RefusingSandbox {
     }
 
     fn wrap_command(&self, _shell_command: &str, cwd: &Path) -> Command {
-        let line = self.error.stderr_line();
-        #[cfg(windows)]
-        {
-            // Space-free tokens are passed UNQUOTED by std's command-line
-            // builder, so cmd.exe sees the redirect/&/exit metacharacters
-            // unquoted and honors them. The original command is never passed
-            // at all, so no quoting subtlety can resurrect it.
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg("echo");
-            for token in line.split_whitespace() {
-                cmd.arg(token);
+        refusing_command(&self.error.stderr_line(), cwd)
+    }
+}
+
+/// A command that runs nothing but prints `line` to stderr and exits 1. Only
+/// shell-inert characters of `line` survive, so no quoting bug can ever turn
+/// the refusal back into command execution.
+fn refusing_command(line: &str, cwd: &Path) -> Command {
+    let line: String = line
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || " ./:_=,-".contains(c) {
+                c
+            } else {
+                ' '
             }
-            cmd.arg("1>&2").arg("&").arg("exit").arg("/b").arg("1");
-            cmd.current_dir(cwd);
-            cmd
+        })
+        .collect();
+    #[cfg(windows)]
+    {
+        // Space-free tokens are passed UNQUOTED by std's command-line
+        // builder, so cmd.exe sees the redirect/&/exit metacharacters
+        // unquoted and honors them. The original command is never passed
+        // at all, so no quoting subtlety can resurrect it.
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg("echo");
+        for token in line.split_whitespace() {
+            cmd.arg(token);
         }
-        #[cfg(not(windows))]
-        {
-            // `stderr_line` strips quotes and metacharacters, so the
-            // single-quoted embed below cannot be escaped from.
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg(format!("echo '{line}' >&2; exit 1"))
-                .current_dir(cwd);
-            cmd
-        }
+        cmd.arg("1>&2").arg("&").arg("exit").arg("/b").arg("1");
+        cmd.current_dir(cwd);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        // `line` has no quotes or metacharacters left, so the
+        // single-quoted embed below cannot be escaped from.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo '{line}' >&2; exit 1"))
+            .current_dir(cwd);
+        cmd
     }
 }
 
@@ -1118,8 +1144,14 @@ fn warn_fence_unenforced(config: &SandboxConfig) {
 ///   refuses with the typed [`SandboxUnavailable`] instead of running
 ///   unconfined (fail closed).
 pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
-    match decide_sandbox(config, HostOs::current(), &RealHostProbe) {
-        SandboxDecision::Confine(choice) => build_backend(choice, config),
+    let (sandbox, hides_folders) = match decide_sandbox(config, HostOs::current(), &RealHostProbe) {
+        SandboxDecision::Confine(choice) => (
+            build_backend(choice, config),
+            matches!(
+                choice,
+                SandboxBackendChoice::Bwrap | SandboxBackendChoice::Macos
+            ),
+        ),
         SandboxDecision::Unconfined(reason) => {
             match reason {
                 UnconfinedReason::Disabled => {
@@ -1129,7 +1161,7 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 UnconfinedReason::AutoNoBackend => warn_auto_unconfined_once(),
             }
             warn_fence_unenforced(config);
-            Box::new(NoSandbox)
+            (Box::new(NoSandbox) as Box<dyn Sandbox>, false)
         }
         SandboxDecision::Refuse(error) => {
             // The OPERATOR-facing remediation is logged here (and only here /
@@ -1139,8 +1171,122 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
                 remediation = %error.remediation,
                 "sandbox unavailable; failing closed — commands will refuse to run"
             );
-            Box::new(RefusingSandbox { error })
+            return Box::new(RefusingSandbox { error });
         }
+    };
+    match &config.hidden_folders {
+        Some(hidden) if !hides_folders => Box::new(HiddenFolderGuard {
+            inner: sandbox,
+            hidden: hidden.clone(),
+            read_allow_paths: config.read_allow_paths.clone(),
+        }),
+        _ => sandbox,
+    }
+}
+
+/// A backend that cannot hide a folder inside one it grants
+/// ([`SandboxConfig::hidden_folders`]): a command whose cwd or a configured
+/// read path holds a hidden folder, or lies in one, refuses to run. No
+/// sandbox grants every path the server can read for as long as a command
+/// runs, so under it every command refuses while any folder is hidden (a
+/// chat could be made in it before the command ends). Any other runs as the
+/// backend runs it.
+struct HiddenFolderGuard {
+    inner: Box<dyn Sandbox>,
+    hidden: octos_core::HiddenFolders,
+    read_allow_paths: Vec<String>,
+}
+
+impl HiddenFolderGuard {
+    fn exposes_hidden(&self, cwd: &Path) -> bool {
+        // A command outlives this check: one that starts while no chat
+        // exists yet could still be running when the first one is made.
+        if self.inner.is_noop() {
+            return !self.hidden.folders().is_empty();
+        }
+        let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+        let cwd = canonical(cwd);
+        let read: Vec<PathBuf> = self
+            .read_allow_paths
+            .iter()
+            .filter_map(|path| canonical(Path::new(path)))
+            .collect();
+        self.hidden
+            .folders()
+            .iter()
+            .filter_map(|f| canonical(f))
+            .any(|folder| {
+                cwd.as_ref()
+                    .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(&folder))
+                    || read.iter().any(|path| folder.starts_with(path))
+            })
+    }
+
+    fn refuse(&self, cwd: &Path) -> Command {
+        let backend = self.inner.backend_name();
+        let line = if self.inner.is_noop() {
+            "sandbox none: commands run without a sandbox here, which cannot hide chat folders \
+             from the shell while this server can make chats. Refusing to run the command. \
+             Install a sandbox backend; octos doctor shows which."
+                .to_string()
+        } else {
+            format!(
+                "sandbox {backend}: this folder holds chat folders, which this sandbox cannot \
+                 hide from the shell. Refusing to run the command. Work in a folder that does \
+                 not hold the octos data directory."
+            )
+        };
+        refusing_command(&line, cwd)
+    }
+}
+
+impl Sandbox for HiddenFolderGuard {
+    fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        if self.exposes_hidden(cwd) {
+            return self.refuse(cwd);
+        }
+        self.inner.wrap_command(shell_command, cwd)
+    }
+
+    fn wrap_command_with_build_cache_slot(
+        &self,
+        shell_command: &str,
+        cwd: &Path,
+        slot: Option<&Path>,
+    ) -> Command {
+        if self.exposes_hidden(cwd) {
+            return self.refuse(cwd);
+        }
+        self.inner
+            .wrap_command_with_build_cache_slot(shell_command, cwd, slot)
+    }
+
+    fn is_noop(&self) -> bool {
+        self.inner.is_noop()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        self.inner.backend_name()
+    }
+
+    fn docker_image(&self) -> Option<&str> {
+        self.inner.docker_image()
+    }
+
+    fn refusal(&self) -> Option<&SandboxUnavailable> {
+        self.inner.refusal()
+    }
+
+    fn is_docker(&self) -> bool {
+        self.inner.is_docker()
+    }
+
+    fn supports_repo_git_write(&self) -> bool {
+        self.inner.supports_repo_git_write()
+    }
+
+    fn runs_posix_sh(&self) -> bool {
+        self.inner.runs_posix_sh()
     }
 }
 
@@ -1191,6 +1337,7 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
     match choice {
         SandboxBackendChoice::Macos => Box::new(MacosSandbox {
             read_only_view: config.read_only_view.clone(),
+            hidden_folders: config.hidden_folders.clone(),
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
             strict_read_paths: config.strict_read_paths,
@@ -1207,6 +1354,7 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
         }),
         SandboxBackendChoice::Bwrap => Box::new(BwrapSandbox {
             read_only_view: config.read_only_view.clone(),
+            hidden_folders: config.hidden_folders.clone(),
             allow_network: config.allow_network,
             workspace_write: fence_degraded_workspace_write(config, "bwrap"),
             deliverable_root: config.deliverable_root.clone(),

@@ -200,6 +200,8 @@ pub struct MacosSandbox {
     pub(crate) toolchain_write_grants: super::ToolchainWriteGrants,
     /// UPCR-2026-034 `read_parent` (see `SandboxConfig::read_only_view`).
     pub(crate) read_only_view: Option<Box<super::SandboxReadOnlyView>>,
+    /// UPCR-2026-R1EFC56A3 (see `SandboxConfig::hidden_folders`).
+    pub(crate) hidden_folders: Option<octos_core::HiddenFolders>,
 }
 
 /// Whether `path` would break out of an SBPL string literal.
@@ -233,6 +235,35 @@ fn read_only_view_rules(view: &super::SandboxReadOnlyView, real_cwd: &str) -> Op
         rules.push_str(&format!("(deny file-read* (subpath \"{excluded}\"))\n"));
     }
     rules.push_str(&format!("(allow file-read* (subpath \"{real_cwd}\"))\n"));
+    Some(rules)
+}
+
+/// The SBPL rules that keep the shell out of each hidden folder, as named and
+/// resolved, to be emitted last so they win over every grant. The folders
+/// between the cwd and a hidden folder cannot be written themselves either,
+/// so the shell cannot rename one to move the folder out from under these
+/// rules. `None` when a path cannot be written into SBPL safely (the caller
+/// refuses to run).
+fn hidden_folder_rules(hidden: &[std::path::PathBuf], real_cwd: &Path) -> Option<String> {
+    let mut rules = String::new();
+    let mut deny = |rule: &str, path: &Path| {
+        let path = path.to_string_lossy();
+        if has_sbpl_metachars(&path) {
+            return None;
+        }
+        rules.push_str(&format!("(deny {rule} \"{path}\"))\n"));
+        Some(())
+    };
+    for folder in hidden {
+        let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone());
+        for path in [folder, &real] {
+            deny("file-read* file-write* (subpath", path)?;
+        }
+        let between = real.ancestors().skip(1);
+        for parent in between.take_while(|p| p.starts_with(real_cwd) && *p != real_cwd) {
+            deny("file-write* (literal", parent)?;
+        }
+    }
     Some(rules)
 }
 
@@ -601,6 +632,25 @@ impl Sandbox for MacosSandbox {
             None => String::new(),
         };
 
+        // Folders the shell never sees (every profile's chats folder, for a
+        // session that is not a chat), whatever the rules above grant.
+        let hidden_rules = match &self.hidden_folders {
+            None => String::new(),
+            Some(hidden) => match hidden_folder_rules(&hidden.folders(), Path::new(&real_cwd)) {
+                Some(rules) => rules,
+                None => {
+                    tracing::error!(
+                        "hidden folder contains SBPL metacharacters, refusing to execute"
+                    );
+                    let mut cmd = Command::new("sh");
+                    cmd.arg("-c").arg(
+                        "echo 'sandbox error: hidden folder path contains invalid characters' >&2; exit 1",
+                    );
+                    return cmd;
+                }
+            },
+        };
+
         let profile = format!(
             r#"(version 1)
 (deny default)
@@ -616,7 +666,7 @@ impl Sandbox for MacosSandbox {
 {read_rules}
 (allow file-write* (literal "/dev/null"))
 {workspace_write_rule}{deliverable_write_rule}{external_tmp_write_rule}{build_cache_slot_rules}{network_rule}
-"#,
+{hidden_rules}"#,
         );
 
         let mut cmd = Command::new("sandbox-exec");

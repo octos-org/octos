@@ -223,6 +223,15 @@ fn discover_git() -> Option<PathBuf> {
     GIT_BINARY.get_or_init(|| which::which("git").ok()).clone()
 }
 
+/// Whether the workspace path `path` (from its top, `/`-separated) lies in
+/// one of `folders`.
+fn in_any(folders: &[String], path: &str) -> bool {
+    folders.iter().any(|folder| {
+        path.strip_prefix(folder.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
 /// Platform null device, used to neutralise global/system git config.
 fn null_device() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
@@ -268,6 +277,8 @@ pub struct SnapshotManager {
     /// One-shot latch for the nested-git-repository (gitlink) advisory —
     /// warn once per manager, not once per snapshot.
     gitlink_warned: AtomicBool,
+    /// Folders snapshots leave out (see [`Self::with_hidden_folders`]).
+    hidden: Option<octos_core::HiddenFolders>,
 }
 
 impl SnapshotManager {
@@ -334,7 +345,49 @@ impl SnapshotManager {
             prune_expire: DEFAULT_PRUNE_EXPIRE.to_string(),
             seq: AtomicU64::new(0),
             gitlink_warned: AtomicBool::new(false),
+            hidden: None,
         }
+    }
+
+    /// Leave the folders of `hidden` that lie in the workspace out of every
+    /// snapshot and restore, as they are at the time, so neither reads or
+    /// rewrites them (UPCR-2026-R1EFC56A3: another chat's).
+    pub fn with_hidden_folders(mut self, hidden: octos_core::HiddenFolders) -> Self {
+        self.hidden = Some(hidden);
+        self
+    }
+
+    /// The hidden folders inside the workspace, as paths from its top.
+    fn hidden_inside(&self) -> Vec<String> {
+        let Some(hidden) = &self.hidden else {
+            return Vec::new();
+        };
+        let hidden = hidden.folders().into_iter();
+        hidden
+            .map(|folder| folder.canonicalize().unwrap_or(folder))
+            .filter_map(|folder| {
+                let rel = folder.strip_prefix(&self.workspace).ok()?;
+                let rel: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                (!rel.is_empty()).then(|| rel.join("/"))
+            })
+            .collect()
+    }
+
+    /// Run git with `args` over the whole workspace but `hidden`, by magic
+    /// pathspecs: unlike ignore rules, no file in the workspace can override
+    /// them.
+    fn run_git_without(&self, args: &[&str], hidden: &[String]) -> Result<String> {
+        let excluded: Vec<String> = hidden
+            .iter()
+            .map(|rel| format!(":(top,exclude,literal){rel}"))
+            .collect();
+        let mut args = args.to_vec();
+        args.extend(["--", ":/"]);
+        args.extend(excluded.iter().map(String::as_str));
+        self.run_git(&args)
     }
 
     /// The workspace this manager snapshots.
@@ -363,8 +416,21 @@ impl SnapshotManager {
 
         // Stage the whole workspace (honours .gitignore; the user's `.git`
         // dir is never tracked by git). The snapshot repo's index
-        // stat-cache makes repeat calls incremental.
-        self.run_git(&["add", "-A"])
+        // stat-cache makes repeat calls incremental. The hidden folders stay
+        // out, and whatever an earlier snapshot staged from them leaves the
+        // index, so no new snapshot carries it.
+        let hidden = self.hidden_inside();
+        if !hidden.is_empty() {
+            let purge: Vec<String> = hidden
+                .iter()
+                .map(|rel| format!(":(top,literal){rel}"))
+                .collect();
+            let mut args = vec!["rm", "-r", "--cached", "-f", "-q", "--ignore-unmatch", "--"];
+            args.extend(purge.iter().map(String::as_str));
+            self.run_git(&args)
+                .wrap_err("failed to unstage hidden folders for snapshot")?;
+        }
+        self.run_git_without(&["add", "-A"], &hidden)
             .wrap_err("failed to stage workspace state for snapshot")?;
         let tree = self.run_git(&["write-tree"])?.trim().to_string();
 
@@ -555,30 +621,39 @@ impl SnapshotManager {
         // were created after it and must be removed to reach the snapshot
         // state. Ignored files are not in the index, so they are never
         // listed here.
-        let created_raw = self.run_git(&[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--diff-filter=A",
-            "-z",
-            full,
-        ])?;
+        let hidden = self.hidden_inside();
+        let created_raw = self.run_git_without(
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "--diff-filter=A",
+                "-z",
+                full,
+            ],
+            &hidden,
+        )?;
 
         // Write snapshot content over the work tree (restores modified
         // AND deleted files). Skipped for an empty snapshot tree, where
         // the pathspec would match nothing and git would error.
-        let has_content = !self
-            .run_git(&["ls-tree", "--name-only", full])?
-            .trim()
-            .is_empty();
+        // An older snapshot may still hold files from a hidden folder: they
+        // are never written back.
+        let has_content = self
+            .run_git(&["ls-tree", "-r", "--name-only", "-z", full])?
+            .split('\0')
+            .any(|path| !path.is_empty() && !in_any(&hidden, path));
         if has_content {
-            self.run_git(&["checkout", "-f", full, "--", "."])
+            self.run_git_without(&["checkout", "-f", full], &hidden)
                 .wrap_err("failed to check out snapshot content")?;
         }
 
         let mut created_dirs: std::collections::BTreeSet<PathBuf> = Default::default();
         let mut failed_removals: Vec<String> = Vec::new();
-        for rel in created_raw.split('\0').filter(|p| !p.is_empty()) {
+        for rel in created_raw
+            .split('\0')
+            .filter(|p| !p.is_empty() && !in_any(&hidden, p))
+        {
             let path = Path::new(rel);
             // git emits workspace-relative paths; refuse anything absolute
             // or traversing (defence in depth against a tampered snapshot
@@ -663,7 +738,9 @@ impl SnapshotManager {
             return Ok(());
         }
         // Paths this restore would change.
-        let changed = self.run_git(&["diff", "--name-only", "-z", full, &current.0])?;
+        let hidden = self.hidden_inside();
+        let changed =
+            self.run_git_without(&["diff", "--name-only", "-z", full, &current.0], &hidden)?;
         let mut conflicts: Vec<String> = Vec::new();
         for rel in changed.split('\0').filter(|p| !p.is_empty()) {
             let path = Path::new(rel);

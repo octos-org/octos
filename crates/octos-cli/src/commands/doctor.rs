@@ -356,6 +356,9 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
             // And for `work_mode` replies (UPCR-2026-R6982BEFC).
             .filter(|feature| {
                 *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_WORK_MODE_V1
+            })
+            .filter(|feature| {
+                *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_CHAT_WORKSPACE_V1
             }),
     ));
 

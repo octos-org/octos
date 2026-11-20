@@ -120,6 +120,20 @@ impl Tool for DiffEditTool {
             }
         };
 
+        // Nor a folder the session's scope hides (UPCR-2026-R1EFC56A3: a
+        // chat's), though this tool resolves the path itself.
+        if ctx
+            .session_scope
+            .as_ref()
+            .is_some_and(|scope| scope.hides(&path))
+        {
+            return Ok(ToolResult {
+                output: format!("Path outside working directory: {}", input.path),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Never let a file tool touch a `.git` directory: its config/hooks
         // decide what the kernel's own git invocations execute.
         if let Err(reason) = super::refuse_git_internal_path(&path) {

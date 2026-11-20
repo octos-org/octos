@@ -11531,6 +11531,16 @@ fn monitor_watch_config(record: &AutonomyMonitorRecord) -> MonitorWatchConfig {
 /// an Auto host without any backend ALSO refuses rather than degrading the
 /// probe to unconfined execution.
 fn monitor_sandbox_config(record: &AutonomyMonitorRecord) -> octos_agent::SandboxConfig {
+    // A monitor runs for a session that is not a chat (a chat has no goal
+    // tools), so like that session's shell it never sees any profile's chat
+    // folders (UPCR-2026-R1EFC56A3).
+    octos_agent::SandboxConfig {
+        hidden_folders: Some(crate::runtime::chat_workspace::reserved_folders()),
+        ..profile_monitor_sandbox_config(record)
+    }
+}
+
+fn profile_monitor_sandbox_config(record: &AutonomyMonitorRecord) -> octos_agent::SandboxConfig {
     use octos_agent::SandboxConfig;
     let Some(root) = monitor_profile_registry_root(record) else {
         return SandboxConfig {
