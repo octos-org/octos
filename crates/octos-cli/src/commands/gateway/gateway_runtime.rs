@@ -350,6 +350,24 @@ impl GatewayRuntime {
             crate::profiles::ProfileStore::open_unified(&effective_octos_home)
                 .ok()
                 .map(Arc::new);
+        if let Some(store) = profile_store.as_ref() {
+            let profiles = store
+                .list()
+                .wrap_err("failed to list profiles while reserving gateway chats root")?;
+            let profile_data_dirs = profiles
+                .iter()
+                .map(|profile| store.resolve_data_dir(profile))
+                .collect::<Vec<_>>();
+            crate::runtime::chat_workspace::configure_server_root(
+                &effective_octos_home,
+                &profile_data_dirs,
+                std::slice::from_ref(&cwd),
+            )
+            .wrap_err("gateway chats root is unsafe")?;
+            for profile_data_dir in &profile_data_dirs {
+                crate::runtime::chat_workspace::register_existing_profile(profile_data_dir);
+            }
+        }
 
         // FIX 2 (single shared runtime-profile resolver): in profile-mode,
         // resolve the profile ONCE up front — parent/sub-account inheritance

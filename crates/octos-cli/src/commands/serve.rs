@@ -932,6 +932,20 @@ impl Executable for ServeCommand {
 }
 
 impl ServeCommand {
+    fn workspace_allowed_roots(cwd: &std::path::Path) -> Vec<PathBuf> {
+        let mut roots = vec![cwd.to_path_buf()];
+        if let Ok(configured) = std::env::var("OCTOS_WORKSPACE_ALLOWED_ROOTS") {
+            roots.extend(
+                configured
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|root| !root.is_empty())
+                    .map(PathBuf::from),
+            );
+        }
+        roots
+    }
+
     async fn run_async(self) -> Result<()> {
         if self.shared && self.host != "127.0.0.1" {
             eyre::bail!("--shared requires --host 127.0.0.1");
@@ -1291,6 +1305,52 @@ impl ServeCommand {
             crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
+        // UPCR-2026-R1EFC56A3/T-0652: the server-level chats root is fixed
+        // before the first sandbox is built. Profiles present now keep their
+        // legacy root; profiles created while this process runs use the
+        // stable root below. Overlap with a profile or a workspace a Code
+        // session may use is a startup error, never a later fallback.
+        let all_profiles = profile_store
+            .list()
+            .wrap_err("failed to list profiles while validating the server chats root")?;
+        let profile_data_dirs = all_profiles
+            .iter()
+            .map(|profile| {
+                let mut profile = profile.clone();
+                if crate::runtime::host_scope::active() {
+                    profile.data_dir = None;
+                }
+                profile_store.resolve_data_dir(&profile)
+            })
+            .collect::<Vec<_>>();
+        let workspace_allowed_roots = Self::workspace_allowed_roots(&cwd);
+        let mut chats_root_workspace_roots = workspace_allowed_roots.clone();
+        if let Some(default_cwd) = &config.appui.default_session_cwd {
+            chats_root_workspace_roots.push(default_cwd.clone());
+        }
+        for profile_data_dir in &profile_data_dirs {
+            chats_root_workspace_roots.extend(
+                crate::runtime::workspace_history::load(profile_data_dir)
+                    .wrap_err("failed to load workspace history while validating chats root")?,
+            );
+            chats_root_workspace_roots.extend(
+                crate::api::workspace_registry::registered_workspace_roots(profile_data_dir)
+                    .wrap_err("failed to load workspace catalog while validating chats root")?,
+            );
+        }
+        let server_chats_root = crate::runtime::chat_workspace::configure_server_root(
+            &data_dir,
+            &profile_data_dirs,
+            &chats_root_workspace_roots,
+        )
+        .wrap_err("server chats root is unsafe")?;
+        tracing::info!(
+            server_chats_root = %server_chats_root.display(),
+            "reserved server chats root"
+        );
+        for profile_data_dir in &profile_data_dirs {
+            crate::runtime::chat_workspace::register_existing_profile(profile_data_dir);
+        }
         // Operator goal transitions must serialize with the live
         // orchestrator. The data-dir serve lock tells the CLI whether this
         // endpoint is mandatory; a missing endpoint while the lock is held is
@@ -1353,7 +1413,6 @@ impl ServeCommand {
         // contention.
         let mut profile_runtimes: HashMap<String, Arc<crate::runtime::ProfileRuntime>> =
             HashMap::new();
-        let all_profiles = profile_store.list().unwrap_or_default();
         for profile in &all_profiles {
             if crate::runtime::host_scope::profile().is_some_and(|id| id != profile.id) {
                 continue;
@@ -1971,17 +2030,6 @@ impl ServeCommand {
         // method and the signal watcher (installed further down) share it.
         let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let shared_token = self.shared.then(|| auth_token.clone()).flatten();
-        // Every stored profile's chat folders are kept from other profiles'
-        // sessions, whether or not it starts in this run (UPCR-2026-R1EFC56A3).
-        match profile_store.list() {
-            Ok(stored) => {
-                for profile in &stored {
-                    let data_dir = profile_store.resolve_data_dir(profile);
-                    crate::runtime::chat_workspace::register_profile(&data_dir);
-                }
-            }
-            Err(error) => tracing::warn!(%error, "could not list profiles to reserve their chats"),
-        }
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -2075,19 +2123,7 @@ impl ServeCommand {
             appui_default_session_cwd: config.appui.default_session_cwd.clone(),
             // UPCR-2026-060: registration is limited to the actual serve cwd
             // plus explicitly configured roots, never the whole home or `/`.
-            workspace_allowed_roots: {
-                let mut roots = vec![cwd.clone()];
-                if let Ok(configured) = std::env::var("OCTOS_WORKSPACE_ALLOWED_ROOTS") {
-                    roots.extend(
-                        configured
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|root| !root.is_empty())
-                            .map(PathBuf::from),
-                    );
-                }
-                roots
-            },
+            workspace_allowed_roots,
             // Issue #1001 follow-up: in-memory signed-preview token
             // cache backs `POST /api/my/preview/sign` /
             // `GET /api/preview-signed/...` so the SPA iframe can drop

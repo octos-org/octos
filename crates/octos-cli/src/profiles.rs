@@ -1786,8 +1786,11 @@ impl ProfileStore {
             self.ensure_public_subdomain_available(slug, Some(&normalized.id))?;
         }
 
-        // Initialize data directory structure
+        // Initialize data directory structure, after proving a profile made
+        // while this server runs cannot overlap the fixed chats root.
         let data_dir = self.resolve_data_dir(&normalized);
+        crate::runtime::chat_workspace::ensure_profile_data_dir_safe(&data_dir)
+            .wrap_err("profile data directory overlaps the server chats root")?;
         for sub in ["memory", "sessions", "research", "skills", "history"] {
             std::fs::create_dir_all(data_dir.join(sub)).ok();
         }

@@ -95,8 +95,9 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
     sandbox: octos_agent::SandboxConfig,
 ) -> Arc<crate::runtime::ProfileRuntime> {
     std::fs::create_dir_all(data_dir).expect("profile data dir");
-    // As a started profile registers, for the chat folders it holds.
-    crate::runtime::chat_workspace::register_profile(data_dir);
+    // These fixtures model profiles that existed at server startup, so they
+    // keep the pre-upgrade per-profile chat root.
+    crate::runtime::chat_workspace::register_existing_profile(data_dir);
     let memory = Arc::new(
         octos_memory::EpisodeStore::open(data_dir)
             .await

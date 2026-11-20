@@ -291,7 +291,7 @@ async fn chat_session_list(
     let (data_dir, listed_profile) = (profile.data_dir.clone(), profile_id.clone());
     let sessions = tokio::task::spawn_blocking(move || {
         let listed = super::handlers::list_profile_sessions(&data_dir, &busy, &listed_profile);
-        let mut rows = chat_workspace::list(&data_dir)
+        let mut rows = chat_workspace::list(&data_dir, listed_profile.as_str())
             .into_iter()
             .filter(|chat| chat.profile_id == listed_profile)
             .map(|chat| {

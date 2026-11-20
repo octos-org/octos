@@ -2311,9 +2311,14 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `session/open`.
 - Result type: `ChatCreateResult` — `{ session_id, profile_id,
   workspace_root, work_mode: "chat" }`. The server creates the chat's private
-  folder (`<profile data dir>/chats/<name>/`, mode `0700`) and a binding
-  record beside it, and records the session with `work_mode: "chat"`.
-  Creating the same chat again returns the same folder. An existing session
+  folder and a binding record beside it (mode `0700`), and records the session
+  with `work_mode: "chat"`. Profiles that existed before the server started
+  keep the original `<profile data dir>/chats/<name>/` layout; a Profile
+  registered while the server runs uses the server-level root fixed at
+  startup, under `<server data dir>/chats/`, so every sandbox already knows
+  the root before its profile exists. A client must use the returned
+  `workspace_root` and must not derive the path. Creating the same chat again
+  returns the same folder. An existing session
   that is not a chat fails with `invalid_params`, `data.kind =
   "session_exists"`.
 - The chat's session is fenced to the folder whatever a client asks for:

@@ -1,11 +1,14 @@
 //! One server-created workspace per chat (UPCR-2026-R1EFC56A3).
 //!
-//! A chat's folder is `<profile data_dir>/chats/<name>/` and its record is
-//! `<profile data_dir>/chats/<name>.json`, naming the session that owns the
-//! folder. The record sits outside the folder, so nothing the chat writes can
-//! change whose folder it is. `<name>` is derived from the session id, so a
-//! lookup is a path computation, never a scan, and is cheap enough for every
-//! session bootstrap and permission read to ask "is this session a chat?".
+//! A chat's folder and record live in one of two layouts. Profiles known when
+//! the server starts keep the original `<profile data_dir>/chats/<name>/` and
+//! `<profile data_dir>/chats/<name>.json`. Profiles registered while the
+//! server runs use the stable root `<server data_dir>/chats/<profile>/<name>/`;
+//! that root exists before the first sandbox, so a shell command's hiding
+//! rules already cover every future runtime profile. The record sits outside
+//! the folder, so nothing the chat writes can change whose folder it is. Both
+//! layouts use the same record shape and are looked up together. If a session
+//! resolves in both, the lookup fails closed instead of choosing one.
 //!
 //! The folder is the chat's whole filesystem: its session runtime is scoped to
 //! it with no shared zones, its tools are cut down to [`CHAT_TOOLS`], and its
@@ -14,12 +17,43 @@
 //! deleted.
 
 use std::path::{Path, PathBuf};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
 use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 
 const CHATS_DIR: &str = "chats";
+
+#[derive(Default)]
+struct ChatWorkspaceLayout {
+    /// Stable root known before the first sandbox is built. New runtime
+    /// profiles create chats here; legacy profiles keep their old root.
+    server_root: Option<PathBuf>,
+    /// Canonical profile data dir -> server-level profile root chosen for it.
+    /// Keeping this separate from the current server root keeps unit-test
+    /// states independent and preserves a profile across unrelated reconfigures.
+    profile_server_roots: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Canonical profile data dir -> that profile's pre-upgrade chats root.
+    legacy_profiles: std::collections::HashMap<PathBuf, PathBuf>,
+}
+
+fn chat_layout() -> &'static RwLock<ChatWorkspaceLayout> {
+    static LAYOUT: std::sync::OnceLock<RwLock<ChatWorkspaceLayout>> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(|| RwLock::new(ChatWorkspaceLayout::default()))
+}
+
+fn layout_read() -> RwLockReadGuard<'static, ChatWorkspaceLayout> {
+    chat_layout()
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn layout_write() -> RwLockWriteGuard<'static, ChatWorkspaceLayout> {
+    chat_layout()
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 /// The tools a chat keeps. Every one of them reads and writes only through
 /// the session scope (or, for `send_file`, only from the chat's folder); no
@@ -68,16 +102,121 @@ pub(crate) fn chats_root(data_dir: &Path) -> PathBuf {
     data_dir.join(CHATS_DIR)
 }
 
+fn canonical_dir(path: &Path) -> PathBuf {
+    octos_core::canonicalize_lossy(path)
+}
+
+fn overlaps_path(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn profile_folder_name(profile_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(profile_id.as_bytes()));
+    digest[..32].to_owned()
+}
+
+fn server_root() -> Option<PathBuf> {
+    layout_read().server_root.clone()
+}
+
+fn server_profile_root(profile_id: &str) -> Option<PathBuf> {
+    server_root().map(|root| root.join(profile_folder_name(profile_id)))
+}
+
+fn server_profile_roots(data_dir: &Path, profile_id: &str) -> Vec<PathBuf> {
+    let profile_dir = canonical_dir(data_dir);
+    let mut roots = Vec::new();
+    let layout = layout_read();
+    if let Some(root) = layout.profile_server_roots.get(&profile_dir) {
+        roots.push(root.clone());
+    }
+    if let Some(root) = layout
+        .server_root
+        .as_ref()
+        .map(|root| root.join(profile_folder_name(profile_id)))
+        && !roots.contains(&root)
+    {
+        roots.push(root);
+    }
+    roots
+}
+
+/// Create and reserve the one server-level root. Its stable address is known
+/// before any sandbox is built, so even a profile created later is already
+/// hidden from every command started by this process.
+pub(crate) fn configure_server_root(
+    data_dir: &Path,
+    profile_data_dirs: &[PathBuf],
+    workspace_roots: &[PathBuf],
+) -> std::io::Result<PathBuf> {
+    let root = canonical_dir(&data_dir.join(CHATS_DIR));
+    for profile_dir in profile_data_dirs {
+        let profile_dir = canonical_dir(profile_dir);
+        if overlaps_path(&root, &profile_dir) {
+            return Err(std::io::Error::other(format!(
+                "server chats root {} overlaps profile data directory {}",
+                root.display(),
+                profile_dir.display()
+            )));
+        }
+    }
+    for workspace in workspace_roots {
+        let workspace = canonical_dir(workspace);
+        if overlaps_path(&root, &workspace) {
+            return Err(std::io::Error::other(format!(
+                "server chats root {} overlaps an allowed workspace {}",
+                root.display(),
+                workspace.display()
+            )));
+        }
+    }
+    private_dir(&root, true)?;
+    reserved_folders()
+        .add(root.clone())
+        .map_err(std::io::Error::other)?;
+    layout_write().server_root = Some(root.clone());
+    Ok(root)
+}
+
+/// Whether `path` is, contains, or is contained by the fixed server-level
+/// chats root. Workspace registration uses this so a workspace cannot be
+/// added later over the root that startup validated.
+pub(crate) fn overlaps_server_root(path: &Path) -> bool {
+    let Some(root) = server_root() else {
+        return false;
+    };
+    overlaps_path(&canonical_dir(&root), &canonical_dir(path))
+}
+
+/// A runtime-created profile must never move the server-level chats root into
+/// its own data directory, or its data directory into that root. This is the
+/// runtime half of the startup validation in `octos serve`.
+pub(crate) fn ensure_profile_data_dir_safe(data_dir: &Path) -> std::io::Result<()> {
+    let Some(root) = server_root() else {
+        return Ok(());
+    };
+    let profile_dir = canonical_dir(data_dir);
+    if overlaps_path(&root, &profile_dir) {
+        return Err(std::io::Error::other(format!(
+            "profile data directory {} overlaps server chats root {}",
+            profile_dir.display(),
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
 /// A chat's folder and record name, the same for every spelling of a
 /// session id that reaches the chat's transcript: the session store files the
 /// `default` topic as the bare id, and storage that folds case (as most macOS
 /// and Windows volumes do) makes ids that differ only in ASCII case one
 /// transcript. Where storage tells case apart, those stay separate sessions.
 /// [`lookup`] refuses every spelling but the chat's own.
-fn folder_name(data_dir: &Path, session_id: &SessionKey) -> String {
+fn folder_name_under(root: &Path, session_id: &SessionKey) -> String {
     use sha2::{Digest, Sha256};
     let base = session_id.base_key();
-    let base = if folds_case(data_dir) {
+    let base = if folds_case(root) {
         base.to_ascii_lowercase()
     } else {
         base.to_owned()
@@ -86,12 +225,13 @@ fn folder_name(data_dir: &Path, session_id: &SessionKey) -> String {
     digest[..32].to_owned()
 }
 
-/// Whether the storage holding `data_dir`'s chats folds ASCII case: `CHATS`
+/// Whether the storage holding `root`'s chats folds ASCII case: `CHATS`
 /// names the `chats` folder itself. Without a chats folder there is no chat
 /// to name, and [`create`] makes the folder before naming one.
-fn folds_case(data_dir: &Path) -> bool {
-    let chats = std::fs::metadata(chats_root(data_dir));
-    let folded = std::fs::metadata(data_dir.join(CHATS_DIR.to_ascii_uppercase()));
+fn folds_case(root: &Path) -> bool {
+    let parent = root.parent().unwrap_or(root);
+    let chats = std::fs::metadata(root);
+    let folded = std::fs::metadata(parent.join(CHATS_DIR.to_ascii_uppercase()));
     match (chats, folded) {
         (Ok(chats), Ok(folded)) => same_entry(&chats, &folded),
         _ => false,
@@ -118,8 +258,22 @@ fn may_be_chat(session_id: &SessionKey) -> bool {
         .is_none_or(|topic| topic.eq_ignore_ascii_case("default"))
 }
 
-fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
-    chats_root(data_dir).join(format!("{}.json", folder_name(data_dir, session_id)))
+fn record_candidates(data_dir: &Path, session_id: &SessionKey) -> Vec<(PathBuf, PathBuf)> {
+    let mut roots = vec![chats_root(data_dir)];
+    if let Some(profile_id) = session_id.profile_id() {
+        let server_roots = server_profile_roots(data_dir, profile_id)
+            .into_iter()
+            .filter(|root| !roots.contains(root))
+            .collect::<Vec<_>>();
+        roots.extend(server_roots);
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            let name = folder_name_under(&root, session_id);
+            (root.clone(), root.join(format!("{name}.json")))
+        })
+        .collect()
 }
 
 /// The chat `session_id` owns under `data_dir`. `Ok(None)`: it has no chat
@@ -127,15 +281,15 @@ fn record_path(data_dir: &Path, session_id: &SessionKey) -> PathBuf {
 /// another session, as for another spelling of the chat's id, or the folder is
 /// missing, unreadable or a symlink). A recorded chat stays a chat, so every
 /// caller refuses on the error instead of running the session as an ordinary
-/// one.
+/// one. Legacy and server roots are both checked; records in both fail closed.
 pub(crate) fn lookup(
     data_dir: &Path,
     session_id: &SessionKey,
 ) -> std::io::Result<Option<ChatWorkspace>> {
-    let Some(record) = read_record(data_dir, session_id)? else {
+    let Some((record, root)) = read_record(data_dir, session_id)? else {
         return Ok(None);
     };
-    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
+    let folder = root.join(folder_name_under(&root, session_id));
     if !std::fs::symlink_metadata(&folder)?.is_dir() {
         return Err(unusable("its folder is not a directory"));
     }
@@ -146,22 +300,33 @@ pub(crate) fn lookup(
     }))
 }
 
-/// `session_id`'s chat record, if it has one; one naming another session is
-/// an error. A session with a topic of its own has none.
-fn read_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<Option<ChatRecord>> {
+/// `session_id`'s chat record and its root, if it has one; one naming another
+/// session is an error. A session with a topic of its own has none. Finding a
+/// record in both roots refuses rather than choosing one.
+fn read_record(
+    data_dir: &Path,
+    session_id: &SessionKey,
+) -> std::io::Result<Option<(ChatRecord, PathBuf)>> {
     if !may_be_chat(session_id) {
         return Ok(None);
     }
-    let bytes = match std::fs::read(record_path(data_dir, session_id)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let record: ChatRecord = serde_json::from_slice(&bytes)?;
-    if record.session_id != session_id.0 {
-        return Err(unusable("its record names another session"));
+    let mut found = None;
+    for (root, path) in record_candidates(data_dir, session_id) {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if found.is_some() {
+            return Err(unusable("its record exists in multiple chat roots"));
+        }
+        let record: ChatRecord = serde_json::from_slice(&bytes)?;
+        if record.session_id != session_id.0 {
+            return Err(unusable("its record names another session"));
+        }
+        found = Some((record, root));
     }
-    Ok(Some(record))
+    Ok(found)
 }
 
 fn unusable(why: &str) -> std::io::Error {
@@ -171,27 +336,53 @@ fn unusable(why: &str) -> std::io::Error {
     )
 }
 
+fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> {
+    let profile_dir = canonical_dir(data_dir);
+    if layout_read().legacy_profiles.contains_key(&profile_dir) {
+        return Ok(chats_root(data_dir));
+    }
+    if let Some(root) = layout_read().profile_server_roots.get(&profile_dir) {
+        return Ok(root.clone());
+    }
+    if let Some(root) = server_profile_root(profile_id) {
+        layout_write()
+            .profile_server_roots
+            .insert(profile_dir, root.clone());
+        return Ok(root);
+    }
+    Err(std::io::Error::other(
+        "server chats root is not configured for a runtime-created profile",
+    ))
+}
+
 /// Create the chat's folder and record, or return the existing ones for the
-/// same session (a retried create is harmless).
+/// same session (a retried create is harmless). Existing profiles registered
+/// at server startup stay in their legacy root; profiles registered later use
+/// the stable server root.
 #[cfg(feature = "api")]
 pub(crate) fn create(
     data_dir: &Path,
     profile_id: &str,
     session_id: &SessionKey,
 ) -> std::io::Result<ChatWorkspace> {
-    // No chat exists that other sessions are not kept out of.
-    reserve_profile(data_dir)?;
     if let Some(existing) = lookup(data_dir, session_id)? {
         return Ok(existing);
     }
-    let root = chats_root(data_dir);
-    private_dir(&root.join(folder_name(data_dir, session_id)), false)?;
+    let root = creation_root(data_dir, profile_id)?;
+    if root == chats_root(data_dir) {
+        // No chat exists that other sessions are not kept out of.
+        reserve_profile(data_dir)?;
+    } else {
+        private_dir(&root, true)?;
+    }
+    let name = folder_name_under(&root, session_id);
+    private_dir(&root.join(&name), false)?;
     let record = serde_json::to_vec(&ChatRecord {
         session_id: session_id.0.clone(),
         profile_id: profile_id.to_owned(),
         created_at: Utc::now(),
     })?;
-    let path = record_path(data_dir, session_id);
+    let path = root.join(format!("{name}.json"));
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let written = (|| {
         use std::io::Write;
@@ -213,10 +404,13 @@ pub(crate) fn create(
 /// not a chat, is left alone.
 #[cfg(feature = "api")]
 pub(crate) fn restore_folder(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
-    if read_record(data_dir, session_id)?.is_none() || lookup(data_dir, session_id).is_ok() {
+    let Some((_record, root)) = read_record(data_dir, session_id)? else {
+        return Ok(());
+    };
+    if lookup(data_dir, session_id).is_ok() {
         return Ok(());
     }
-    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
+    let folder = root.join(folder_name_under(&root, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if !meta.is_dir() => std::fs::remove_file(&folder)?,
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
@@ -246,20 +440,34 @@ fn private_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
     }
 }
 
-/// Every chat recorded under `data_dir`.
+/// Every chat recorded for `profile_id`, across its legacy and server roots.
+/// A duplicate or unusable record is skipped here; direct lookup refuses it.
 #[cfg(feature = "api")]
-pub(crate) fn list(data_dir: &Path) -> Vec<ChatWorkspace> {
-    let Ok(entries) = std::fs::read_dir(chats_root(data_dir)) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|entry| {
-            let record: ChatRecord =
-                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
-            lookup(data_dir, &SessionKey(record.session_id)).ok()?
+pub(crate) fn list(data_dir: &Path, profile_id: &str) -> Vec<ChatWorkspace> {
+    let mut roots = vec![chats_root(data_dir)];
+    let server_roots = server_profile_roots(data_dir, profile_id)
+        .into_iter()
+        .filter(|root| !roots.contains(root))
+        .collect::<Vec<_>>();
+    roots.extend(server_roots);
+    roots
+        .into_iter()
+        .flat_map(|root| {
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(_) => return Vec::new(),
+            };
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .filter_map(|entry| {
+                    let record: ChatRecord =
+                        serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                    Some(record.session_id)
+                })
+                .collect::<Vec<_>>()
         })
+        .filter_map(|session_id| lookup(data_dir, &SessionKey(session_id)).ok()?)
         .collect()
 }
 
@@ -274,7 +482,15 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let holds = path.starts_with(&data_dir) && chats_root(&data_dir).starts_with(&path);
-    holds || is_in_chat_folder(&data_dir, &path)
+    let server_holds = server_root().is_some_and(|root| {
+        let root = canonical_dir(&root);
+        let boundary = root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+        path.starts_with(&boundary) && root.starts_with(&path)
+    });
+    holds || server_holds || is_in_chat_folder(&data_dir, &path)
 }
 
 /// The chats folders of the profiles this process serves, shared by every
@@ -285,12 +501,40 @@ pub(crate) fn reserved_folders() -> octos_core::HiddenFolders {
     RESERVED.get_or_init(Default::default).clone()
 }
 
-/// Reserve a profile's chats folder as the profile starts (or is stored),
-/// from every other session, whatever profile that runs as. A profile whose
-/// folder cannot be reserved gets no chats ([`create`]).
+/// Reserve a profile's chats folder as the profile starts. A profile already
+/// known when the server starts is legacy and keeps its old root; a profile
+/// registered later reserves the stable server root instead, so the folder
+/// that will hold its future chats existed before every sandbox did.
 pub(crate) fn register_profile(data_dir: &Path) {
-    if let Err(error) = reserve_profile(data_dir) {
+    let profile_dir = canonical_dir(data_dir);
+    let result = if layout_read().legacy_profiles.contains_key(&profile_dir) {
+        reserve_profile(data_dir)
+    } else if let Some(root) = server_root() {
+        reserved_folders()
+            .add(root.clone())
+            .map_err(std::io::Error::other)
+            .and_then(|()| private_dir(&root, true))
+    } else {
+        // A non-server process has no server-level root; preserve the old
+        // per-profile layout there. `octos serve` always configures one.
+        reserve_profile(data_dir)
+    };
+    if let Err(error) = result {
         tracing::warn!(%error, "cannot reserve this profile's chats");
+    }
+}
+
+/// A profile that existed when the server started keeps its pre-upgrade
+/// chats root. Runtime-created profiles are deliberately not marked here.
+pub(crate) fn register_existing_profile(data_dir: &Path) {
+    let profile_dir = canonical_dir(data_dir);
+    match reserve_profile(&profile_dir) {
+        Ok(()) => {
+            layout_write()
+                .legacy_profiles
+                .insert(profile_dir.clone(), chats_root(&profile_dir));
+        }
+        Err(error) => tracing::warn!(%error, "cannot reserve this profile's chats"),
     }
 }
 
@@ -299,7 +543,7 @@ pub(crate) fn register_profile(data_dir: &Path) {
 /// folder is made now, so a sandbox can hide it from a shell that started
 /// before the profile's first chat.
 fn reserve_profile(data_dir: &Path) -> std::io::Result<()> {
-    let root = chats_root(&octos_core::canonicalize_lossy(data_dir));
+    let root = chats_root(&canonical_dir(data_dir));
     reserved_folders()
         .add(root.clone())
         .map_err(std::io::Error::other)?;
@@ -344,14 +588,19 @@ pub(crate) fn hidden_from(data_dir: &Path, session_id: &SessionKey) -> Vec<PathB
     reserved_roots(data_dir)
 }
 
-/// Whether `path` is (inside) one of the chat folders under `data_dir`.
+/// Whether `path` is inside one of the legacy chat folders under `data_dir`,
+/// or inside the server-level root.
 pub(crate) fn is_in_chat_folder(data_dir: &Path, path: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(chats_root(data_dir)) else {
-        return false;
-    };
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    path.strip_prefix(&root)
-        .is_ok_and(|rest| rest.components().next().is_some())
+    let mut roots = vec![chats_root(data_dir)];
+    roots.extend(server_root());
+    roots.into_iter().any(|root| {
+        let Ok(root) = std::fs::canonicalize(root) else {
+            return false;
+        };
+        path.strip_prefix(&root)
+            .is_ok_and(|rest| rest.components().next().is_some())
+    })
 }
 
 /// Delete the chat's folder, then its record.
@@ -373,14 +622,14 @@ thread_local! {
 /// followed.
 #[cfg(feature = "api")]
 pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
-    if read_record(data_dir, session_id)?.is_none() {
+    let Some((_record, root)) = read_record(data_dir, session_id)? else {
         return Ok(());
-    }
+    };
     #[cfg(test)]
     if FAIL_FOLDER_REMOVAL.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("injected folder removal failure"));
     }
-    let folder = chats_root(data_dir).join(folder_name(data_dir, session_id));
+    let folder = root.join(folder_name_under(&root, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder),
         Ok(_) => std::fs::remove_file(&folder),
@@ -394,25 +643,199 @@ pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io
 pub(crate) fn remove_record(data_dir: &Path, session_id: &SessionKey) -> std::io::Result<()> {
     // Never another session's: a topic of its own has none, and another
     // spelling of a chat's id leaves the chat's. A record too damaged to
-    // name its session still goes.
+    // name its session still goes. Duplicate records fail closed instead of
+    // choosing one.
     if !may_be_chat(session_id) {
         return Ok(());
     }
-    let path = record_path(data_dir, session_id);
-    let named = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ChatRecord>(&bytes).ok());
-    if named.is_some_and(|record| record.session_id != session_id.0) {
-        return Err(unusable("its record names another session"));
+    let candidates = record_candidates(data_dir, session_id);
+    let mut present = 0;
+    for (_root, path) in &candidates {
+        let named = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ChatRecord>(&bytes).ok());
+        if named.is_some_and(|record| record.session_id != session_id.0) {
+            return Err(unusable("its record names another session"));
+        }
+        if path.try_exists()? {
+            present += 1;
+        }
     }
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
+    if present > 1 {
+        return Err(unusable("its record exists in multiple chat roots"));
     }
+    for (_root, path) in candidates {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+    }
+    Ok(())
 }
 
 /// Cut a registry down to the compiled-in [`CHAT_TOOLS`]: a plugin or MCP tool
 /// that takes one of their names is dropped too.
 pub(crate) fn confine_chat_tools(tools: &mut octos_agent::ToolRegistry) {
     tools.retain_builtin(|name| CHAT_TOOLS.contains(&name));
+}
+
+#[cfg(all(test, feature = "api"))]
+mod server_root_tests {
+    use super::*;
+
+    static LAYOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn should_refuse_server_root_overlapping_profile_or_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = temp.path().join("server");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            configure_server_root(
+                &server,
+                std::slice::from_ref(&server),
+                std::slice::from_ref(&workspace)
+            )
+            .is_err()
+        );
+        assert!(configure_server_root(&server, &[], std::slice::from_ref(&server)).is_err());
+    }
+
+    async fn new_profile_command_stays_fenced(mode: octos_agent::SandboxMode) {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let server_data = temp.path().join("server");
+        let workspace = temp.path().join("workspace");
+        let old_profile = temp.path().join("profiles/old/data");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&old_profile).unwrap();
+        let server_root = configure_server_root(
+            &server_data,
+            std::slice::from_ref(&old_profile),
+            std::slice::from_ref(&workspace),
+        )
+        .expect("configure server root");
+        assert_eq!(server_root, canonical_dir(&server_data.join(CHATS_DIR)));
+        let profile_store =
+            crate::profiles::ProfileStore::open(&temp.path().join("state"), &server_data)
+                .expect("profile store");
+        let bad_profile = crate::profiles::UserProfile {
+            id: "bad".to_owned(),
+            name: "Bad".to_owned(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: Some(server_root.display().to_string()),
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(profile_store.save(&bad_profile).is_err());
+        register_existing_profile(&old_profile);
+
+        let old_id = SessionKey::with_profile("old", "api", "old-chat");
+        let old_chat = create(&old_profile, "old", &old_id).expect("legacy chat");
+        assert!(old_chat.root.starts_with(chats_root(&old_profile)));
+
+        let new_record = crate::profiles::UserProfile {
+            id: "new".to_owned(),
+            name: "New".to_owned(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        profile_store.save(&new_record).expect("runtime profile");
+        let new_profile = profile_store.resolve_data_dir(&new_record);
+        let new_id = SessionKey::with_profile("new", "api", "late-chat");
+        let new_root = server_profile_root("new").expect("server profile root");
+        let name = folder_name_under(&new_root, &new_id);
+        let secret = new_root.join(&name).join("secret.txt");
+        let command = format!("sleep 1; cat \"{}\"", secret.display());
+        let sandbox = octos_agent::create_sandbox(&octos_agent::SandboxConfig {
+            mode,
+            hidden_folders: Some(reserved_folders()),
+            ..octos_agent::SandboxConfig::default()
+        });
+        if sandbox.refusal().is_some() {
+            println!("{} unavailable on this host", sandbox.backend_name());
+            return;
+        }
+        let child = sandbox
+            .wrap_command(&command, &workspace)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn long command");
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        register_profile(&new_profile);
+        assert!(!chats_root(&new_profile).exists());
+        let new_chat = create(&new_profile, "new", &new_id).expect("new chat");
+        assert!(new_chat.root.starts_with(&new_root));
+        std::fs::write(new_chat.root.join("secret.txt"), "late-chat-secret").unwrap();
+        let output = child.wait_with_output().await.expect("wait for command");
+        let said = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).into_owned();
+        assert!(!said.contains("late-chat-secret"), "{said}");
+        if sandbox.is_noop() {
+            assert!(!output.status.success(), "{said}");
+            assert!(said.contains("cannot hide chat folders"), "{said}");
+        }
+        remove(&new_profile, &new_id).expect("remove server-root chat");
+        assert!(!new_chat.root.exists());
+        let new_chat = create(&new_profile, "new", &new_id).expect("recreate chat");
+        assert!(new_chat.root.starts_with(&new_root));
+
+        // Reverse-mutation guard: a same-session record in the legacy root
+        // makes lookup fail closed; implementation must never pick one root.
+        let legacy_root = chats_root(&new_profile);
+        private_dir(&legacy_root, true).unwrap();
+        private_dir(
+            legacy_root
+                .join(folder_name_under(&legacy_root, &new_id))
+                .as_path(),
+            false,
+        )
+        .unwrap();
+        std::fs::write(
+            legacy_root.join(format!("{}.json", folder_name_under(&legacy_root, &new_id))),
+            serde_json::to_vec(&ChatRecord {
+                session_id: new_id.0.clone(),
+                profile_id: "new".to_owned(),
+                created_at: Utc::now(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = lookup(&new_profile, &new_id).expect_err("duplicate roots fail closed");
+        assert!(error.to_string().contains("multiple chat roots"), "{error}");
+        assert!(create(&new_profile, "new", &new_id).is_err());
+        assert!(remove_folder(&new_profile, &new_id).is_err());
+        assert!(remove_record(&new_profile, &new_id).is_err());
+        assert!(
+            list(&new_profile, "new")
+                .iter()
+                .all(|chat| chat.session_id != new_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_no_sandbox_command_started_before_runtime_profile() {
+        new_profile_command_stays_fenced(octos_agent::SandboxMode::None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn should_hide_new_profile_chat_from_bwrap_command() {
+        new_profile_command_stays_fenced(octos_agent::SandboxMode::Bwrap).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn should_hide_new_profile_chat_from_macos_command() {
+        new_profile_command_stays_fenced(octos_agent::SandboxMode::Macos).await;
+    }
 }
