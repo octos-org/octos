@@ -240,6 +240,7 @@ const HUMAN_SINK_GAP_WINDOW: Duration = Duration::from_secs(60);
 /// `suppressed: true`, exactly like the per-origin cap marker, so clients
 /// render it as truncation rather than activity. Never blocks: the append is
 /// the ledger's synchronous ring+disk path.
+#[cfg(feature = "api")]
 pub(crate) fn record_human_sink_drop(
     ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger,
     mut dropped: BackgroundActivityEvent,
@@ -316,7 +317,7 @@ pub(crate) const ORIGIN_KIND_MONITOR: &str = "monitor";
 /// Origin class for claimed fleet outbox events.
 pub(crate) const ORIGIN_KIND_FLEET: &str = "fleet";
 
-#[cfg(test)]
+#[cfg(all(test, feature = "api"))]
 mod tests {
     use super::*;
     use crate::api::ui_protocol_ledger::UiProtocolLedger;
