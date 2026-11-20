@@ -35204,7 +35204,6 @@ async fn run_m9_fixture_turn(
     // hard-coded `_main`).
     runtime_profile_id: Option<&str>,
     fixture: M9ProtocolFixture,
-    resolved_profile_id: Option<String>,
     turn_state: Arc<TokioMutex<TurnState>>,
     mut interrupt_rx: mpsc::Receiver<()>,
 ) {
@@ -35518,7 +35517,7 @@ async fn run_m9_fixture_turn(
             match seed_m9_task_output_fixture(
                 state.as_ref(),
                 &session_id,
-                resolved_profile_id.as_deref(),
+                runtime_profile_id,
                 ws.clone(),
                 Arc::clone(&ledger),
                 runtime_profile_id,

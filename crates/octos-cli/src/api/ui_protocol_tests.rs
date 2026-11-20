@@ -2914,8 +2914,8 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
         ledger,
         Arc::new(UiProtocolContractStores::default()),
         turn_start_params(&session, &TurnId::new(), "m9 task output fixture"),
+        Some(profile),
         M9ProtocolFixture::TaskOutput,
-        Some(profile.to_owned()),
         Arc::new(TokioMutex::new(TurnState::Active)),
         interrupt_rx,
     )
