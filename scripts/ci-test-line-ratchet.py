@@ -6,12 +6,16 @@ test files (`tests/`, `*_tests.rs`, `*_test.rs`, `test_*.rs`, `tests.rs`)
 plus inline `#[cfg(test)]` modules, JS/TS `*.test.*`/`*.spec.*` and
 `test_*.py`/`_test.py` — over `git archive` of the base and head refs.
 
-pull_request and merge_group enforce: net growth > 0 fails unless the PR
-carries `test-growth-approved` added by a human maintainer (see
-MAINTAINERS; the shared agent account never counts). The baseline is the
-merge-base of the event base and head refs, so a PR behind main is not
-credited with deleting main's newer tests. Push to main only reports the
-numbers.
+pull_request and merge_group enforce: net growth > 0 fails unless EITHER
+(a) the PR carries `test-growth-approved` added by a human maintainer, or
+(b) a human maintainer's LATEST review on the PR's CURRENT head is
+APPROVED (shu 2026-11-19 ruling: approving the current head IS approving
+its test growth — one maintainer action instead of two). See MAINTAINERS;
+the shared agent account never counts, approvals on stale heads do not
+count, and a later CHANGES_REQUESTED/DISMISSED supersedes an earlier
+approval. The baseline is the merge-base of the event base and head refs,
+so a PR behind main is not credited with deleting main's newer tests.
+Push to main only reports the numbers.
 
 `--self-test` runs offline cases in temporary git repositories.
 """
@@ -154,6 +158,77 @@ def label_approved(repo_slug: str, pr_number: int, events_json: Path | None) -> 
     return False, "no maintainer-applied label event found"
 
 
+def review_approved(
+    repo_slug: str, pr_number: int, reviews_json: Path | None
+) -> tuple[bool, str]:
+    """A maintainer's LATEST review on the PR's CURRENT head is APPROVED.
+
+    The head comes from `pulls/{n}` (`head.sha`), so a merge_group run
+    (whose GITHUB_SHA is the queue's synthetic merge commit) still checks
+    the real PR head. Each maintainer's latest review decides: an
+    approval on an older commit, or one superseded by a later
+    CHANGES_REQUESTED / DISMISSED, does not exempt. Reviews carry no
+    actor-generation problem like labels — the list is the full history.
+    """
+    if reviews_json is not None:
+        payload = json.loads(reviews_json.read_text())
+        head_sha, reviews = payload["head_sha"], payload["reviews"]
+    else:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            return False, "no GH_TOKEN available to read reviews"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        def get(url: str):
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
+
+        base = f"https://api.github.com/repos/{repo_slug}/pulls/{pr_number}"
+        head_sha = get(base)["head"]["sha"]
+        reviews = []
+        page = 1
+        while True:
+            batch = get(f"{base}/reviews?per_page=100&page={page}")
+            reviews.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+    # A review COMMENT does not supersede an approval — GitHub's own
+    # approval accounting treats COMMENTED (and PENDING) reviews as
+    # non-decisions, and alan0x routinely leaves a plain comment after
+    # approving. Skip them when picking each maintainer's latest review
+    # so the ratchet and the merge gate read the same verdict.
+    latest: dict[str, dict] = {}
+    for review in reviews:
+        login = review.get("user", {}).get("login")
+        if login not in MAINTAINERS:
+            continue
+        if review.get("state") in ("COMMENTED", "PENDING"):
+            continue
+        latest[login] = review  # the list is chronological; last wins
+    # Any ONE maintainer approving the current head exempts — check all of
+    # them before diagnosing, or a stale approval from one maintainer would
+    # mask a current-head approval from another.
+    for login, review in latest.items():
+        if review.get("state") == "APPROVED" and review.get("commit_id") == head_sha:
+            return True, f"{login} approved the current head {head_sha[:9]}"
+    for login, review in latest.items():
+        if review.get("state") == "APPROVED":
+            return False, (
+                f"{login}'s approval is on {str(review.get('commit_id'))[:9]}, "
+                f"not the current head {head_sha[:9]}"
+            )
+    if latest:
+        states = ", ".join(f"{login}: {r.get('state')}" for login, r in latest.items())
+        return False, f"latest maintainer reviews are not APPROVED ({states})"
+    return False, "no maintainer review found"
+
+
 def growth_detail(base: dict[str, int], head: dict[str, int]) -> list[str]:
     rows = []
     for name in sorted(set(base) | set(head)):
@@ -188,7 +263,12 @@ def run(args: argparse.Namespace) -> int:
         if approved:
             print(f"{LABEL} applied by maintainer {who}: growth exempt, green")
             return 0
-        print(f"exemption check: {who}")
+        print(f"exemption check (label): {who}")
+        approved, who = review_approved(args.repo_slug, args.pr, args.reviews_json)
+        if approved:
+            print(f"review exemption: {who}: growth exempt, green")
+            return 0
+        print(f"exemption check (review): {who}")
     print(f"::error::net test-line growth +{delta} lines in:")
     for row in growth_detail(base, head):
         print(row)
@@ -199,7 +279,9 @@ def run(args: argparse.Namespace) -> int:
     )
     print(
         f"If it truly cannot be offset, state why in the PR and ask a "
-        f"maintainer ({', '.join(sorted(MAINTAINERS))}) to apply `{LABEL}`."
+        f"maintainer ({', '.join(sorted(MAINTAINERS))}) to either approve the "
+        f"current head (an APPROVED review IS the test-growth approval), or "
+        f"apply `{LABEL}`."
     )
     return 1
 
@@ -313,6 +395,13 @@ def self_test(repo_root: Path) -> None:
         assert "merge-base" in out, out
         out = case(root, "report", 2, "--report-only", expect=0)
         assert "report-only" in out, out
+        no_reviews = root / "no-reviews.json"
+        no_reviews.write_text(json.dumps({"head_sha": "0" * 40, "reviews": []}))
+        # Mirror pinning for the review-only cases below: without
+        # --events-json the label path would consult the live API under
+        # CI's GH_TOKEN, so pair them with an empty events fixture too.
+        no_events = root / "no-events.json"
+        no_events.write_text("[]")
         maintainer_events = root / "maintainer.json"
         maintainer_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "anantheparty"}, "label": {"name": LABEL}},
@@ -320,7 +409,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(maintainer_events), expect=0,
+            "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+            expect=0,
         )
         assert "alan0x" in out, out
         bot_events = root / "bot.json"
@@ -329,7 +419,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "bot-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(bot_events), expect=1,
+            "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "applied by anantheparty, not a maintainer" in out, out
         # A maintainer's approval that was later removed must not exempt.
@@ -340,7 +431,8 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "removed-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(removed_events), expect=1,
+            "--events-json", str(removed_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "no maintainer-applied label event" in out, out
         # A bot re-label after maintainer approval supersedes the generation.
@@ -352,9 +444,87 @@ def self_test(repo_root: Path) -> None:
         ]))
         out = case(
             root, "bot-relabel", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
-            "--events-json", str(relabel_events), expect=1,
+            "--events-json", str(relabel_events), "--reviews-json", str(no_reviews),
+            expect=1,
         )
         assert "applied by anantheparty, not a maintainer" in out, out
+
+        # The label-only cases above are pinned offline on the review path
+        # via `no_reviews` (CI has GH_TOKEN; without the fixture the script
+        # would consult the live API and a real approval could mask them).
+
+        # shu 2026-11-19 ruling: a maintainer's APPROVED review on the PR's
+        # current head is itself the test-growth approval.
+        def reviews_fixture(path: Path, head_sha: str, *reviews: dict) -> str:
+            path.write_text(json.dumps({"head_sha": head_sha, "reviews": list(reviews)}))
+            return str(path)
+
+        repo, base, head = fixture_repo(root / "review-approve", 2)
+        fixture = reviews_fixture(root / "approve.json", head, {
+            "user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": head,
+        })
+        out = run_case("review-approve", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
+        assert "BH3GEI approved the current head" in out, out
+
+        repo, base, head = fixture_repo(root / "review-stale", 2)
+        fixture = reviews_fixture(root / "stale.json", head, {
+            "user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": "0" * 40,
+        })
+        out = run_case("review-stale", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
+        assert "not the current head" in out, out
+
+        repo, base, head = fixture_repo(root / "review-agent", 2)
+        fixture = reviews_fixture(root / "agent.json", head, {
+            "user": {"login": "anantheparty"}, "state": "APPROVED", "commit_id": head,
+        })
+        out = run_case("review-agent", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
+        assert "no maintainer review found" in out, out
+
+        repo, base, head = fixture_repo(root / "review-superseded", 2)
+        fixture = reviews_fixture(root / "superseded.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": head},
+            {"user": {"login": "alan0x"}, "state": "CHANGES_REQUESTED", "commit_id": head},
+        )
+        out = run_case("review-superseded", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
+        assert "not APPROVED" in out and "alan0x: CHANGES_REQUESTED" in out, out
+
+        # alan0x review: one maintainer's STALE approval must not mask
+        # another maintainer's current-head approval.
+        repo, base, head = fixture_repo(root / "review-two", 2)
+        fixture = reviews_fixture(root / "two.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": "0" * 40},
+            {"user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": head},
+        )
+        out = run_case("review-two", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
+        assert "BH3GEI approved the current head" in out, out
+
+        # Claude ruling 2026-11-20: a plain review COMMENT after approving
+        # the current head does not revoke the approval.
+        repo, base, head = fixture_repo(root / "review-commented", 2)
+        fixture = reviews_fixture(root / "commented.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": head},
+            {"user": {"login": "alan0x"}, "state": "COMMENTED", "commit_id": head},
+        )
+        out = run_case("review-commented", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
+        assert "alan0x approved the current head" in out, out
+
+        # Label still exempts without any approval (original behavior).
+        label_only = root / "label-only.json"
+        label_only.write_text(json.dumps([
+            {"event": "labeled", "actor": {"login": "ymote"}, "label": {"name": LABEL}},
+        ]))
+        repo, base, head = fixture_repo(root / "label-only", 2)
+        out = run_case("label-only", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos",
+                       "--events-json", str(label_only), "--reviews-json", str(no_reviews),
+                       expect=0)
+        assert "ymote" in out, out
 
     workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text()
     check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
@@ -377,6 +547,7 @@ def main() -> None:
     parser.add_argument("--pr", type=int)
     parser.add_argument("--repo-slug", default="octos-org/octos")
     parser.add_argument("--events-json", type=Path)
+    parser.add_argument("--reviews-json", type=Path)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
