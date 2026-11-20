@@ -408,3 +408,10 @@ Creation admission also retains these persistence regressions (T-0323):
 | 4 | `peers::first_inputs::tests::should_report_a_corrupt_declaration_instead_of_reading_it_as_none` | An unreadable recorded declaration is an error, never "no inputs", so a peer is not started silently without them. |
 | 2 | `goal_tool::declared_inputs_tests::should_offer_task_inputs_to_the_planner_and_carry_them_onto_the_task` | `goal_plan` tells the keeper what declaring a task input does, and a declared input reaches the planned task. |
 | 5 | `goal_tool::declared_inputs_tests::should_reject_plan_when_a_tasks_inputs_are_malformed` | A plan with a malformed `inputs` (not a list, no path, unknown field) is rejected naming the task, instead of planning a task that silently lacks them. |
+
+## /app deprecation (RFC #3262, step 1)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::static_files::tests::should_inject_the_deprecation_banner_into_the_app_index_only` | The /app index document carries the deprecation banner exactly once (before </body>) and names octoscode-web; content-hashed asset bytes pass through untouched. |
+| 3 | `api::static_files::tests::should_serve_a_body_less_index_unmodified` | An index without a closing </body> is served unmodified rather than mangled by the injection. |

@@ -3,6 +3,10 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
+### Deprecated
+
+- The `/app` web client (octos-web, the embedded legacy SPA) is deprecated and will be removed in a future release. Use [octoscode-web](https://github.com/octos-org/octoscode-web) as the web client instead. As step 1 (RFC #3262), `/app` now shows a deprecation banner on every load; the octos-web submodule and its build steps are removed in a later step.
+
 ## [2.1.0-rc.1] - 2026-11-02
 
 ### Highlights
