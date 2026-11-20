@@ -22,7 +22,9 @@ rescan through the existing in-flight guard, so concurrent retries coalesce and
 a closed WebSocket does not make the broker wait for a nonexistent active turn.
 
 Successful completion still writes the token tombstone and finalizes the slug
-record only after the erase, then removes the intent. Partial failure leaves it
-for an authorized retry. State 2 containment refusal, native worker semantics
-and all wire-level compatibility contracts are unchanged by
-`UPCR-2026-R60B1A9DC`.
+record only after the erase, then removes the intent. A retry that observes the
+token tombstone after a crash also finishes any missing slug finalization and
+intent cleanup for the same authorized generation, without repeating destructive
+erasure. Partial failure leaves the intent for an authorized retry. State 2
+containment refusal, native worker semantics and all wire-level compatibility
+contracts are unchanged by `UPCR-2026-R60B1A9DC`.

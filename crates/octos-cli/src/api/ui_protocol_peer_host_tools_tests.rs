@@ -2041,6 +2041,77 @@ async fn should_rescan_state1_residue_with_the_persisted_owner_intent() {
     assert_eq!(repeated["already_purged"], true, "{repeated}");
 }
 
+#[tokio::test]
+async fn should_finish_only_metadata_when_restart_follows_the_token_tombstone() {
+    let fx = fixture().await;
+    let provisioned = dunce::canonicalize(&fx.data_dir)
+        .unwrap()
+        .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
+        .join("app/mail/acct-1");
+    std::fs::create_dir_all(&provisioned).unwrap();
+    let prepared = raw_peer_prepare(
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "You are the Mail app's assistant.",
+                "names": ["Mail"],
+                "session_id": fx.system,
+                "memory_namespace": "app/mail/acct-1",
+                "cwd": provisioned.to_string_lossy(),
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("stage the mail peer");
+    let token = prepared["host_token"].as_str().unwrap().to_owned();
+    let peer_dir = peers_root(&fx).join("mail");
+    let binding = crate::peers::app_binding::read_peer_host_binding(&peers_root(&fx), "mail")
+        .expect("host binding");
+    let intent = crate::peers::purge::PurgeIntent::new(
+        "mail".into(),
+        Some("Mail".into()),
+        fx.system.0.clone(),
+        binding.clone(),
+        crate::peers::app_binding::context_bindings(&peers_root(&fx), "mail"),
+    );
+    let purged_at = "2026-11-20T18:00:00Z";
+    crate::peers::purge::write_purge_intent(&peers_root(&fx), &intent).unwrap();
+    crate::peers::purge::write_slug_tombstone(&peers_root(&fx), "mail", purged_at).unwrap();
+    crate::peers::purge::write_token_tombstone(
+        &peers_root(&fx),
+        &binding.token_sha256,
+        &crate::peers::purge::PurgeTombstone {
+            slug: "mail".into(),
+            name: Some("Mail".into()),
+            originator: fx.system.0.clone(),
+            memory_namespace: binding.memory_namespace.clone(),
+            purged_at: purged_at.into(),
+            errors: Vec::new(),
+        },
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&peer_dir).unwrap();
+    let sentinel = provisioned.join("must-not-be-erased-by-a-metadata-retry");
+    std::fs::write(&sentinel, b"metadata only").unwrap();
+
+    // Simulate a restart immediately after the token tombstone became durable
+    // but before slug finalization and intent cleanup. The retry must finish
+    // only those metadata steps, never repeat the destructive erase.
+    let (retry_ws, _retry_rx) = ws_connection_for_test(8);
+    let result = purge(&fx.state, &retry_ws, &fx.system, "mail", &token)
+        .await
+        .expect("the completed purge remains idempotent across restart");
+    assert_eq!(result["already_purged"], true, "{result}");
+    assert!(crate::peers::purge::slug_tombstone_is_finalized(
+        &peers_root(&fx),
+        "mail"
+    ));
+    assert!(!fx.data_dir.join("peer-purges/intents/mail.json").exists());
+    assert!(sentinel.exists());
+}
+
 // ---------------------------------------------------------------------------
 // UPCR-2026-034 `read_parent`: a request context's read-only view of its
 // peer's folder (#2603).

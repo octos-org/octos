@@ -213,6 +213,34 @@ pub(crate) fn purge_intent_for_retry(
     (same_staged_generation || unfinished_residue).then_some(intent)
 }
 
+/// Complete only the metadata tail of a purge whose token tombstone proves the
+/// destructive erase already finished. This covers a crash before slug
+/// finalization or intent cleanup without ever repeating that erase. Expiry is
+/// deliberately irrelevant here: no new deletion authority is granted.
+pub(crate) fn finish_purge_metadata_after_token_tombstone(
+    peers_root: &Path,
+    tombstone: &PurgeTombstone,
+    host_token: Option<&str>,
+) -> std::io::Result<bool> {
+    let Some(intent) = find_purge_intent(peers_root, &tombstone.slug) else {
+        return Ok(false);
+    };
+    if intent.originator != tombstone.originator || !host_token_matches(&intent.binding, host_token)
+    {
+        return Ok(false);
+    }
+    // A different staged binding is a later generation, not metadata for this
+    // purge. Leave both its slug record and the old intent untouched.
+    if super::app_binding::read_peer_host_binding(peers_root, &intent.slug)
+        .is_some_and(|binding| binding != intent.binding)
+    {
+        return Ok(false);
+    }
+    finalize_slug_tombstone(peers_root, &intent.slug, &tombstone.purged_at)?;
+    remove_purge_intent(peers_root, &intent.slug)?;
+    Ok(true)
+}
+
 /// A real non-symlink peer residue directory, without requiring `brief.md`.
 /// Missing paths are handled separately by the idempotent erase.
 pub(crate) fn purge_residue_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {

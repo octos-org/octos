@@ -15,9 +15,10 @@
 use super::*;
 
 use crate::peers::purge::{
-    PurgeIntent, PurgeTombstone, append_audit, finalize_slug_tombstone, is_real_path,
-    purge_intent_for_retry, purge_residue_dir, remove_purge_intent, remove_tree_within,
-    tombstone_for_token, write_purge_intent, write_slug_tombstone, write_token_tombstone,
+    PurgeIntent, PurgeTombstone, append_audit, finalize_slug_tombstone,
+    finish_purge_metadata_after_token_tombstone, is_real_path, purge_intent_for_retry,
+    purge_residue_dir, remove_purge_intent, remove_tree_within, tombstone_for_token,
+    write_purge_intent, write_slug_tombstone, write_token_tombstone,
 };
 
 /// `approval/cancelled` reason of a prompt cancelled by `peer/purge`.
@@ -251,6 +252,15 @@ pub(super) async fn raw_peer_purge(
             if let Some(tombstone) = token.and_then(|token| tombstone_for_token(&peers_root, token))
             {
                 if tombstone.names(&params.peer) && tombstone.originator == params.session_id.0 {
+                    // A crash may have landed after the token tombstone but
+                    // before slug finalization / intent cleanup. Finish only
+                    // that metadata tail; never repeat the destructive erase.
+                    finish_purge_metadata_after_token_tombstone(&peers_root, &tombstone, token)
+                        .map_err(|error| {
+                            RpcError::internal_error(format!(
+                                "failed to finish purge metadata: {error}"
+                            ))
+                        })?;
                     return Ok(json!({
                         "session_id": params.session_id,
                         "profile_id": profile_id,
