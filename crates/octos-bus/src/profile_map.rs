@@ -39,6 +39,21 @@ impl ChatProfileMap {
         })
     }
 
+    /// True when neither map has any entry: routing is fully legacy, and
+    /// callers can skip ALL routing work (including Discord's thread-parent
+    /// channel lookup, which is an HTTP round-trip without a cache).
+    pub fn is_empty(&self) -> bool {
+        self.chat.is_empty() && self.guild.is_empty()
+    }
+
+    /// True when any chat/channel entry exists. Only these entries make
+    /// Discord's thread-parent lookup load-bearing: a guild-only map never
+    /// consults the parent, so the lookup can be skipped (and its failure
+    /// need not refuse the message).
+    pub fn has_chat_entries(&self) -> bool {
+        !self.chat.is_empty()
+    }
+
     /// Resolve the explicit profile for an inbound message: an exact
     /// chat/channel id match wins; otherwise (Discord) the guild map is
     /// consulted. `None` means "no explicit route" — never a default.
@@ -161,9 +176,22 @@ mod tests {
         );
         assert_eq!(map.route_with_parent("thread-4", None, None), None);
 
+        // Lookup gating (#1506 follow-up): empty maps skip all routing
+        // work; a guild-only map never needs the thread-parent lookup.
+        assert!(!map.is_empty());
+        assert!(map.has_chat_entries());
+        let guild_only = ChatProfileMap::from_settings(&serde_json::json!({
+            "guild_profile_map": {"999": "guild-profile"}
+        }))
+        .unwrap();
+        assert!(!guild_only.is_empty());
+        assert!(!guild_only.has_chat_entries());
+
         // Absent or null maps parse to empty (legacy entries unchanged).
         let empty = ChatProfileMap::from_settings(&serde_json::json!({})).unwrap();
         assert_eq!(empty.route("1", None), None);
+        assert!(empty.is_empty());
+        assert!(!empty.has_chat_entries());
         let null = ChatProfileMap::from_settings(&serde_json::json!({
             "chat_profile_map": null
         }))
