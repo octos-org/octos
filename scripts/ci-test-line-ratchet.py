@@ -397,6 +397,11 @@ def self_test(repo_root: Path) -> None:
         assert "report-only" in out, out
         no_reviews = root / "no-reviews.json"
         no_reviews.write_text(json.dumps({"head_sha": "0" * 40, "reviews": []}))
+        # Mirror pinning for the review-only cases below: without
+        # --events-json the label path would consult the live API under
+        # CI's GH_TOKEN, so pair them with an empty events fixture too.
+        no_events = root / "no-events.json"
+        no_events.write_text("[]")
         maintainer_events = root / "maintainer.json"
         maintainer_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "anantheparty"}, "label": {"name": LABEL}},
@@ -459,7 +464,7 @@ def self_test(repo_root: Path) -> None:
             "user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": head,
         })
         out = run_case("review-approve", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
         assert "BH3GEI approved the current head" in out, out
 
         repo, base, head = fixture_repo(root / "review-stale", 2)
@@ -467,7 +472,7 @@ def self_test(repo_root: Path) -> None:
             "user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": "0" * 40,
         })
         out = run_case("review-stale", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=1)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
         assert "not the current head" in out, out
 
         repo, base, head = fixture_repo(root / "review-agent", 2)
@@ -475,7 +480,7 @@ def self_test(repo_root: Path) -> None:
             "user": {"login": "anantheparty"}, "state": "APPROVED", "commit_id": head,
         })
         out = run_case("review-agent", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=1)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
         assert "no maintainer review found" in out, out
 
         repo, base, head = fixture_repo(root / "review-superseded", 2)
@@ -484,7 +489,7 @@ def self_test(repo_root: Path) -> None:
             {"user": {"login": "alan0x"}, "state": "CHANGES_REQUESTED", "commit_id": head},
         )
         out = run_case("review-superseded", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=1)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=1)
         assert "not APPROVED" in out and "alan0x: CHANGES_REQUESTED" in out, out
 
         # alan0x review: one maintainer's STALE approval must not mask
@@ -495,7 +500,7 @@ def self_test(repo_root: Path) -> None:
             {"user": {"login": "BH3GEI"}, "state": "APPROVED", "commit_id": head},
         )
         out = run_case("review-two", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
         assert "BH3GEI approved the current head" in out, out
 
         # Claude ruling 2026-11-20: a plain review COMMENT after approving
@@ -506,7 +511,7 @@ def self_test(repo_root: Path) -> None:
             {"user": {"login": "alan0x"}, "state": "COMMENTED", "commit_id": head},
         )
         out = run_case("review-commented", repo, base, head, "--pr", "1",
-                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
         assert "alan0x approved the current head" in out, out
 
         # Label still exempts without any approval (original behavior).
