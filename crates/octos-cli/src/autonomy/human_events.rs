@@ -30,6 +30,12 @@
 //!   DoS. The per-origin budget below caps admissions per window and emits ONE
 //!   explicit marker row when it starts dropping — silent truncation reads as
 //!   "nothing more happened" (#2015).
+//! - **Queue-full drops leave a DURABLE gap, not just a log (#2021).** The
+//!   bounded sink channel can fill faster than the drain appends. Previously
+//!   that drop was only a `debug!` line, so a reconnecting client replayed a
+//!   stream that looked complete. [`record_human_sink_drop`] appends ONE
+//!   rate-limited marker row per session to the SAME durable ledger the drain
+//!   uses, so the replay shows the hole.
 //! - **Never fed back into model context.** This stream exists so the human can
 //!   see what the model was woken by. Routing it back would be a compaction and
 //!   cost problem, and would make the loop observe itself. The model's view is
@@ -222,6 +228,53 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
     sink(event);
 }
 
+/// Minimum spacing between durable queue-gap markers for one session. A full
+/// sink can drop hundreds of events; one marker per window is enough for the
+/// replay to show the hole without the marker itself becoming the flood.
+const HUMAN_SINK_GAP_WINDOW: Duration = Duration::from_secs(60);
+
+/// #2021 — record a sink queue-full drop as a VISIBLE, DURABLE gap row on the
+/// session's ledger (the same store the drain appends to), rate-limited per
+/// session. Returns `true` when a marker was appended. The dropped event's
+/// own origin is preserved so the replay attributes the hole; the marker is
+/// `suppressed: true`, exactly like the per-origin cap marker, so clients
+/// render it as truncation rather than activity. Never blocks: the append is
+/// the ledger's synchronous ring+disk path.
+pub(crate) fn record_human_sink_drop(
+    ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger,
+    mut dropped: BackgroundActivityEvent,
+    now: Instant,
+) -> bool {
+    struct Gap {
+        last: Instant,
+        count: u64,
+    }
+    static GAPS: OnceLock<StdMutex<HashMap<octos_core::SessionKey, Gap>>> = OnceLock::new();
+    let gaps = GAPS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut gaps = gaps.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gap = gaps.entry(dropped.session_id.clone()).or_insert(Gap {
+        last: now.checked_sub(HUMAN_SINK_GAP_WINDOW).unwrap_or(now),
+        count: 0,
+    });
+    gap.count = gap.count.saturating_add(1);
+    if now.duration_since(gap.last) < HUMAN_SINK_GAP_WINDOW {
+        return false;
+    }
+    gap.last = now;
+    dropped.suppressed = true;
+    dropped.dropped_count = Some(gap.count);
+    gap.count = 0;
+    dropped.text = "background activity was dropped because the human event \
+                    queue was full; the replay above has a gap here"
+        .to_string();
+    drop(gaps);
+    ledger
+        .try_append_notification(octos_core::ui_protocol::UiNotification::BackgroundActivity(
+            dropped,
+        ))
+        .is_ok()
+}
+
 /// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
 pub(crate) fn now_ms_for_activity() -> i64 {
     std::time::SystemTime::now()
@@ -262,3 +315,148 @@ pub(crate) fn background_activity(
 pub(crate) const ORIGIN_KIND_MONITOR: &str = "monitor";
 /// Origin class for claimed fleet outbox events.
 pub(crate) const ORIGIN_KIND_FLEET: &str = "fleet";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ui_protocol_ledger::UiProtocolLedger;
+    use octos_core::ui_protocol::UiNotification;
+
+    fn activity(session: &str, origin: &str, text: &str) -> BackgroundActivityEvent {
+        background_activity(
+            &octos_core::SessionKey(session.to_owned()),
+            Some("dev"),
+            "monitor",
+            origin,
+            None,
+            text,
+        )
+    }
+
+    fn from_start(session: &octos_core::SessionKey) -> octos_core::ui_protocol::UiCursor {
+        octos_core::ui_protocol::UiCursor {
+            stream: session.0.clone(),
+            seq: 0,
+        }
+    }
+
+    fn replayed_activity(
+        ledger: &UiProtocolLedger,
+        session: &octos_core::SessionKey,
+    ) -> Vec<BackgroundActivityEvent> {
+        ledger
+            .replay_after(session, Some(&from_start(session)))
+            .expect("replay succeeds")
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::api::ui_protocol_ledger::UiProtocolLedgerEvent::Notification(
+                    UiNotification::BackgroundActivity(activity),
+                ) => Some(activity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #2021 — a sink queue-full drop must leave a durable, rate-limited gap
+    /// marker on the SAME ledger the drain writes, so a reconnecting client's
+    /// replay shows the hole instead of a silently complete-looking stream.
+    #[test]
+    fn should_record_queue_full_drop_as_durable_rate_limited_gap() {
+        let ledger = UiProtocolLedger::new(64);
+        let key = octos_core::SessionKey("web:tester#sink-gap".to_owned());
+        let now = Instant::now();
+
+        // First drop in a window appends ONE marker; the rest are accounted.
+        assert!(record_human_sink_drop(
+            &ledger,
+            activity("web:tester#sink-gap", "m1", "lost"),
+            now
+        ));
+        assert!(!record_human_sink_drop(
+            &ledger,
+            activity("web:tester#sink-gap", "m1", "lost"),
+            now
+        ));
+        assert!(!record_human_sink_drop(
+            &ledger,
+            activity("web:tester#sink-gap", "m1", "lost"),
+            now + Duration::from_secs(5)
+        ));
+        let events = replayed_activity(&ledger, &key);
+        assert_eq!(events.len(), 1, "one marker per window: {events:?}");
+        assert!(events[0].suppressed, "marker row, not an activity line");
+        // Each marker carries the drops SINCE the previous marker; the ledger
+        // as a whole accounts for every drop (1 here + 3 on the next marker).
+        assert_eq!(events[0].dropped_count, Some(1));
+        assert_eq!(events[0].origin_id, "m1", "the hole keeps its origin");
+        assert!(events[0].text.contains("queue was full"));
+
+        // After the window a new marker is appended (with its own count).
+        assert!(record_human_sink_drop(
+            &ledger,
+            activity("web:tester#sink-gap", "m1", "lost"),
+            now + HUMAN_SINK_GAP_WINDOW + Duration::from_secs(1)
+        ));
+        let events = replayed_activity(&ledger, &key);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].dropped_count,
+            Some(3),
+            "the 2 rate-limited drops + this one"
+        );
+    }
+
+    /// #2021 — agent wake and UI stream are two READ-ONLY projections of one
+    /// authoritative source: replaying the same ledger twice (the reconnect
+    /// path) must yield identical order, cursors, and payloads, and a replay
+    /// after the head must be empty rather than re-delivering old events.
+    #[test]
+    fn should_project_one_ordered_stream_to_both_consumers_without_duplicates() {
+        let ledger = UiProtocolLedger::new(64);
+        let key = octos_core::SessionKey("web:tester#dual-projection".to_owned());
+        ledger.append_notification(UiNotification::BackgroundActivity(activity(
+            "web:tester#dual-projection",
+            "m1",
+            "first",
+        )));
+        assert!(record_human_sink_drop(
+            &ledger,
+            activity("web:tester#dual-projection", "m1", "lost"),
+            Instant::now()
+        ));
+        ledger.append_notification(UiNotification::BackgroundActivity(activity(
+            "web:tester#dual-projection",
+            "m1",
+            "second",
+        )));
+
+        // Two independent consumers (agent wake replay + UI reconnect replay)
+        // read the SAME source and agree on every frame and cursor.
+        let (agent_view, agent_head) = ledger
+            .replay_after_with_head(&key, Some(&from_start(&key)))
+            .unwrap();
+        let (ui_view, ui_head) = ledger
+            .replay_after_with_head(&key, Some(&from_start(&key)))
+            .unwrap();
+        assert_eq!(agent_view, ui_view, "both projections read one source");
+        assert_eq!(agent_head, ui_head, "identical cursor head");
+        assert_eq!(agent_view.len(), 3);
+
+        // Replaying FROM the head (reconnect with a current cursor) delivers
+        // nothing again — no duplicate wake, no duplicated UI rows.
+        let cursor = octos_core::ui_protocol::UiCursor {
+            stream: key.0.clone(),
+            seq: agent_head,
+        };
+        assert!(ledger.replay_after(&key, Some(&cursor)).unwrap().is_empty());
+
+        // A third event lands after the cursor: exactly the delta replays.
+        ledger.append_notification(UiNotification::BackgroundActivity(activity(
+            "web:tester#dual-projection",
+            "m1",
+            "third",
+        )));
+        let delta = ledger.replay_after(&key, Some(&cursor)).unwrap();
+        assert_eq!(delta.len(), 1, "only the post-cursor event replays");
+    }
+}

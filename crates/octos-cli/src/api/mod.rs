@@ -55,7 +55,7 @@ pub(crate) mod ui_protocol_transport;
 // gateway approval path can write the same audit log without the `api`
 // feature; re-exported here so api-internal paths keep working.
 pub(crate) use crate::approvals_audit as ui_protocol_audit;
-mod ui_protocol_ledger;
+pub(crate) mod ui_protocol_ledger;
 pub(crate) mod ui_protocol_progress;
 mod ui_protocol_reasoning_effort;
 pub(crate) use crate::contracts::sanitize as ui_protocol_sanitize;

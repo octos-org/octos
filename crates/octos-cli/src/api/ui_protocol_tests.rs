@@ -2818,3 +2818,86 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
         tokio::task::yield_now().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2021 — the peer awaiting-input wake is ONE projection of the authoritative
+// continuation source. Its prompt must carry the uniform provenance stamp
+// (automated system event, NOT consent), and replaying the same park must not
+// wake the master twice.
+#[tokio::test(flavor = "current_thread")]
+async fn should_stamp_peer_wake_as_automated_event_and_dedupe_replays() {
+    let master = SessionKey("web:tester#peer-wake-authority".to_owned());
+    let profile_id = "test-peer-wake-authority";
+    let orchestrator = default_agent_orchestrator();
+
+    let first = orchestrator.enqueue_peer_awaiting_input_continuation(
+        &master,
+        profile_id,
+        "researcher",
+        "pending-1",
+        "approval",
+        "may I run the migration?",
+    );
+    assert!(!first.is_duplicate(), "the first park wakes the master");
+
+    // Reconnect/replay of the SAME park (same pending id) must not wake twice.
+    let replayed = orchestrator.enqueue_peer_awaiting_input_continuation(
+        &master,
+        profile_id,
+        "researcher",
+        "pending-1",
+        "approval",
+        "may I run the migration?",
+    );
+    assert!(
+        replayed.is_duplicate(),
+        "a replayed park dedupes by pending id"
+    );
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&master, profile_id),
+        1,
+        "one wake for one park"
+    );
+
+    // A DIFFERENT park is a different gap: it wakes independently (concurrent
+    // peers never share a dedupe key).
+    let second = orchestrator.enqueue_peer_awaiting_input_continuation(
+        &master,
+        profile_id,
+        "researcher",
+        "pending-2",
+        "question",
+        "which dataset?",
+    );
+    assert!(!second.is_duplicate());
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&master, profile_id),
+        2
+    );
+
+    let drained = orchestrator.drain_ready_continuations_for_session(
+        &master,
+        profile_id,
+        MasterContinuationRuntimeState::idle(),
+        usize::MAX,
+    );
+    assert_eq!(drained.len(), 2);
+    for continuation in &drained {
+        let prompt = master_continuation_prompt(continuation);
+        assert!(
+            prompt.contains("[system-internal]"),
+            "system-originated framing: {prompt}"
+        );
+        assert!(
+            prompt.contains("automated system event")
+                && prompt.contains("not a message from the user")
+                && prompt.contains("NOT an approval or confirmation"),
+            "the wake confers NO authority over anything pending: {prompt}"
+        );
+    }
+    assert_eq!(
+        orchestrator.pending_continuation_count_for_session_for_test(&master, profile_id),
+        0,
+        "drain closes the wake gap exactly once"
+    );
+}

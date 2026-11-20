@@ -27908,6 +27908,10 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
     let (tx, mut rx) = mpsc::channel::<octos_core::ui_protocol::BackgroundActivityEvent>(
         BACKGROUND_ACTIVITY_QUEUE_CAPACITY,
     );
+    // The drain publishes its ledger here once resolved so the producer-side
+    // drop path can append a durable gap row WITHOUT awaiting it (#2021).
+    let drain_ledger = std::sync::Arc::new(std::sync::OnceLock::<Arc<UiProtocolLedger>>::new());
+    let gap_ledger = drain_ledger.clone();
     // Best-effort, non-blocking producer side. `try_send` is the whole
     // contract: a producer must never await, block, or fail on the human sink.
     crate::autonomy::human_events::set_background_activity_sink(std::sync::Arc::new(
@@ -27919,6 +27923,18 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
                     reason = %err,
                     "background activity dropped: human sink queue full or closed"
                 );
+                // #2021 — a drop must leave a VISIBLE, DURABLE gap, not just a
+                // log line: the replaying client otherwise sees a stream that
+                // looks complete. Rate-limited per session; a closed channel
+                // (drain gone) still records, because the ledger outlives it.
+                if let Some(ledger) = gap_ledger.get() {
+                    let dropped = err.into_inner();
+                    crate::autonomy::human_events::record_human_sink_drop(
+                        ledger,
+                        dropped,
+                        std::time::Instant::now(),
+                    );
+                }
             }
         },
     ));
@@ -27930,6 +27946,7 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
         tokio::spawn(async move { while writer_rx.recv().await.is_some() {} });
         let ws = WsConnection::new(writer_tx);
         let ledger = event_ledger(&state).await;
+        let _ = drain_ledger.set(ledger.clone());
         info!("background activity human sink started (#2019)");
         while let Some(event) = rx.recv().await {
             let _ =
