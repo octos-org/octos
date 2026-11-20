@@ -228,55 +228,95 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
     sink(event);
 }
 
-/// Minimum spacing between durable queue-gap markers for one session. A full
-/// sink can drop hundreds of events; one marker per window is enough for the
-/// replay to show the hole without the marker itself becoming the flood.
-const HUMAN_SINK_GAP_WINDOW: Duration = Duration::from_secs(60);
-
-/// #2021 — record a sink queue-full drop as a VISIBLE, DURABLE gap row on the
-/// session's ledger (the same store the drain appends to), rate-limited per
-/// session. Returns `true` when a marker was appended. The dropped event's
-/// own origin is preserved so the replay attributes the hole; the marker is
-/// `suppressed: true`, exactly like the per-origin cap marker, so clients
-/// render it as truncation rather than activity. Never blocks: the append is
-/// the ledger's synchronous ring+disk path.
-#[cfg(feature = "api")]
-pub(crate) fn record_human_sink_drop(
-    ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger,
-    mut dropped: BackgroundActivityEvent,
-    now: Instant,
-) -> bool {
-    struct Gap {
-        last: Instant,
-        count: u64,
-    }
-    static GAPS: OnceLock<StdMutex<HashMap<octos_core::SessionKey, Gap>>> = OnceLock::new();
-    let gaps = GAPS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut gaps = gaps.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let gap = gaps.entry(dropped.session_id.clone()).or_insert(Gap {
-        last: now.checked_sub(HUMAN_SINK_GAP_WINDOW).unwrap_or(now),
-        count: 0,
-    });
-    gap.count = gap.count.saturating_add(1);
-    if now.duration_since(gap.last) < HUMAN_SINK_GAP_WINDOW {
-        return false;
-    }
-    gap.last = now;
-    dropped.suppressed = true;
-    dropped.dropped_count = Some(gap.count);
-    gap.count = 0;
-    dropped.text = "background activity was dropped because the human event \
-                    queue was full; the replay above has a gap here"
-        .to_string();
-    drop(gaps);
-    ledger
-        .try_append_notification(octos_core::ui_protocol::UiNotification::BackgroundActivity(
-            dropped,
-        ))
-        .is_ok()
+/// #2021 — one session's unflushed sink drops: how many, plus the most recent
+/// dropped event (its origin attribution labels the gap marker).
+struct PendingSinkDrops {
+    count: u64,
+    template: BackgroundActivityEvent,
 }
 
-/// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
+fn pending_sink_drops() -> &'static StdMutex<HashMap<octos_core::SessionKey, PendingSinkDrops>> {
+    static PENDING: OnceLock<StdMutex<HashMap<octos_core::SessionKey, PendingSinkDrops>>> =
+        OnceLock::new();
+    PENDING.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// #2021 — producer-side drop accounting. Runs on the emitter's thread when
+/// the bounded sink queue is full: ONLY increments an in-memory counter
+/// (poison-tolerant mutex, no IO, no ledger), so a producer never waits on
+/// storage — even when slow storage is exactly why the queue filled. The
+/// drain persists the counts via [`flush_human_sink_drops`]; a drop noted
+/// before the drain's ledger exists is still accounted (startup window
+/// closed), and a session whose client is gone still gets its marker once
+/// the drain next flushes.
+pub(crate) fn note_human_sink_drop(dropped: BackgroundActivityEvent) {
+    let mut pending = pending_sink_drops()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = pending
+        .entry(dropped.session_id.clone())
+        .or_insert_with(|| PendingSinkDrops {
+            count: 0,
+            template: dropped.clone(),
+        });
+    entry.count = entry.count.saturating_add(1);
+    entry.template = dropped;
+}
+
+/// Drain-side persistence for [`note_human_sink_drop`]. Writes ONE gap marker
+/// per session with pending drops onto the same durable ledger as the drain,
+/// and clears a session's count ONLY after its append succeeded — a failed
+/// append leaves the count for the next flush, so no drop is ever lost.
+/// Called from the drain task (never the producer), so the synchronous
+/// ledger append cannot stall an emitter.
+#[cfg(feature = "api")]
+pub(crate) fn flush_human_sink_drops(ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger) {
+    loop {
+        // Take ONE session's pending count out of the lock, append WITHOUT
+        // holding the map lock, and only then clear what was appended. If the
+        // append fails the count is restored (merged with any new drops).
+        let Some((session, count, template)) = ({
+            let mut pending = pending_sink_drops()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.keys().next().cloned().and_then(|session| {
+                pending
+                    .remove(&session)
+                    .map(|p| (session, p.count, p.template))
+            })
+        }) else {
+            return;
+        };
+        let mut marker = template.clone();
+        marker.suppressed = true;
+        marker.dropped_count = Some(count);
+        marker.text = "background activity was dropped because the human event \
+                       queue was full; the replay above has a gap here"
+            .to_string();
+        let appended = ledger
+            .try_append_notification(octos_core::ui_protocol::UiNotification::BackgroundActivity(
+                marker,
+            ))
+            .is_ok();
+        if !appended {
+            // Restore the un-appended count (merged with drops noted while we
+            // were appending) so the next flush retries with the full total.
+            let mut pending = pending_sink_drops()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = pending.entry(session).or_insert_with(|| PendingSinkDrops {
+                count: 0,
+                template: template.clone(),
+            });
+            entry.count = entry.count.saturating_add(count);
+            // Stop flushing on failure: the ledger is unavailable; retry on
+            // the next drain tick rather than spinning on every session.
+            return;
+        }
+    }
+}
+
+/// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`./// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`./// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
 pub(crate) fn now_ms_for_activity() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -358,59 +398,48 @@ mod tests {
             .collect()
     }
 
-    /// #2021 — a sink queue-full drop must leave a durable, rate-limited gap
-    /// marker on the SAME ledger the drain writes, so a reconnecting client's
-    /// replay shows the hole instead of a silently complete-looking stream.
+    /// #2021 / alan0x review — the producer notes drops with NO ledger access
+    /// (a full queue caused by slow storage must not stall the emitter on the
+    /// same storage), drops noted while the writer is unavailable accumulate,
+    /// and once the writer resumes the flush persists ONE marker per burst
+    /// with the full count. A second flush writes nothing (counts are cleared
+    /// only after a successful append), so replay never duplicates markers.
     #[test]
-    fn should_record_queue_full_drop_as_durable_rate_limited_gap() {
+    fn should_buffer_drops_while_writer_is_down_and_flush_exactly_once_on_recovery() {
+        let key = octos_core::SessionKey("web:tester#sink-gap-buffered".to_owned());
+        // Writer "down": the producer only touches the in-memory counter and
+        // returns immediately — no ledger exists at this point at all.
+        for _ in 0..3 {
+            note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
+        }
+        // Writer "resumes": the drain flushes; one durable gap row appears.
         let ledger = UiProtocolLedger::new(64);
-        let key = octos_core::SessionKey("web:tester#sink-gap".to_owned());
-        let now = Instant::now();
-
-        // First drop in a window appends ONE marker; the rest are accounted.
-        assert!(record_human_sink_drop(
-            &ledger,
-            activity("web:tester#sink-gap", "m1", "lost"),
-            now
-        ));
-        assert!(!record_human_sink_drop(
-            &ledger,
-            activity("web:tester#sink-gap", "m1", "lost"),
-            now
-        ));
-        assert!(!record_human_sink_drop(
-            &ledger,
-            activity("web:tester#sink-gap", "m1", "lost"),
-            now + Duration::from_secs(5)
-        ));
+        flush_human_sink_drops(&ledger);
         let events = replayed_activity(&ledger, &key);
-        assert_eq!(events.len(), 1, "one marker per window: {events:?}");
-        assert!(events[0].suppressed, "marker row, not an activity line");
-        // Each marker carries the drops SINCE the previous marker; the ledger
-        // as a whole accounts for every drop (1 here + 3 on the next marker).
-        assert_eq!(events[0].dropped_count, Some(1));
-        assert_eq!(events[0].origin_id, "m1", "the hole keeps its origin");
+        assert_eq!(events.len(), 1, "one marker per burst: {events:?}");
+        assert!(events[0].suppressed);
+        assert_eq!(
+            events[0].dropped_count,
+            Some(3),
+            "all buffered drops accounted"
+        );
+        assert_eq!(events[0].origin_id, "m1");
         assert!(events[0].text.contains("queue was full"));
-
-        // After the window a new marker is appended (with its own count).
-        assert!(record_human_sink_drop(
-            &ledger,
-            activity("web:tester#sink-gap", "m1", "lost"),
-            now + HUMAN_SINK_GAP_WINDOW + Duration::from_secs(1)
-        ));
+        // Counts were cleared by the successful append: no duplicate marker.
+        flush_human_sink_drops(&ledger);
+        assert_eq!(replayed_activity(&ledger, &key).len(), 1);
+        // A new burst writes its own marker with its own count.
+        note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
+        flush_human_sink_drops(&ledger);
         let events = replayed_activity(&ledger, &key);
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[1].dropped_count,
-            Some(3),
-            "the 2 rate-limited drops + this one"
-        );
+        assert_eq!(events[1].dropped_count, Some(1));
     }
 
     /// #2021 — agent wake and UI stream are two READ-ONLY projections of one
     /// authoritative source: replaying the same ledger twice (the reconnect
-    /// path) must yield identical order, cursors, and payloads, and a replay
-    /// after the head must be empty rather than re-delivering old events.
+    /// path) yields identical order, cursors, and payloads, and a replay from
+    /// the head is empty rather than re-delivering old events.
     #[test]
     fn should_project_one_ordered_stream_to_both_consumers_without_duplicates() {
         let ledger = UiProtocolLedger::new(64);
@@ -420,19 +449,14 @@ mod tests {
             "m1",
             "first",
         )));
-        assert!(record_human_sink_drop(
-            &ledger,
-            activity("web:tester#dual-projection", "m1", "lost"),
-            Instant::now()
-        ));
+        note_human_sink_drop(activity("web:tester#dual-projection", "m1", "lost"));
+        flush_human_sink_drops(&ledger);
         ledger.append_notification(UiNotification::BackgroundActivity(activity(
             "web:tester#dual-projection",
             "m1",
             "second",
         )));
 
-        // Two independent consumers (agent wake replay + UI reconnect replay)
-        // read the SAME source and agree on every frame and cursor.
         let (agent_view, agent_head) = ledger
             .replay_after_with_head(&key, Some(&from_start(&key)))
             .unwrap();
@@ -443,15 +467,12 @@ mod tests {
         assert_eq!(agent_head, ui_head, "identical cursor head");
         assert_eq!(agent_view.len(), 3);
 
-        // Replaying FROM the head (reconnect with a current cursor) delivers
-        // nothing again — no duplicate wake, no duplicated UI rows.
         let cursor = octos_core::ui_protocol::UiCursor {
             stream: key.0.clone(),
             seq: agent_head,
         };
         assert!(ledger.replay_after(&key, Some(&cursor)).unwrap().is_empty());
 
-        // A third event lands after the cursor: exactly the delta replays.
         ledger.append_notification(UiNotification::BackgroundActivity(activity(
             "web:tester#dual-projection",
             "m1",
