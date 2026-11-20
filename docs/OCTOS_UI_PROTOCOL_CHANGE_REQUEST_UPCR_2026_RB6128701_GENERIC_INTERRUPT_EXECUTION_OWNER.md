@@ -11,13 +11,16 @@ cancellation through `SessionTaskQueryStore`, the same execution-owner bridge
 used by explicit `task/cancel`, instead of cancelling only the current turn's
 restored `TaskSupervisor` projection.
 
-A restored supervisor remains a read-only projection on this path: it can name
-the task to interrupt and refresh the owner's persisted terminal result, but it
-is not treated as the producer's cancellation authority. The real owner receives
-the cancel token, so its producer terminates through the existing interrupted
-branch and cannot later publish a competing `Completed`. If normal completion
-wins first, a repeated interrupt remains idempotent and preserves `Completed`.
-When no session store exists, the legacy direct-supervisor fallback is unchanged.
+A restored supervisor is not used as a substitute for a reachable execution
+owner: it can name the task to interrupt and refresh the owner's persisted
+terminal result, while the real owner receives the cancel token. Its producer
+therefore terminates through the existing interrupted branch and cannot later
+publish a competing `Completed`. If normal completion wins first, a repeated
+interrupt remains idempotent and preserves `Completed`. When the owner is gone
+or out of process, the store retains its existing `task/cancel` fallback and may
+cancel the restored projection; this change does not invent a cross-process
+owner. Store-less `octos serve` non-stdio callers likewise retain the legacy
+direct-supervisor fallback.
 
 The independent `native_subagent` cancellation bridge is unchanged. No protocol
 field, session/turn identifier, cross-host routing rule, or capability is added

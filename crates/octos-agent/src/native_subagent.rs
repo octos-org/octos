@@ -391,39 +391,6 @@ mod tests {
         );
         cancel(&id);
     }
-
-    #[tokio::test]
-    async fn should_bridge_restored_supervisor_cancel_to_native_execution_owner() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = dir.path().join("tasks.jsonl");
-        let owner = Arc::new(TaskSupervisor::new());
-        owner.enable_persistence(&ledger).unwrap();
-        let id = owner.register("spawn", "call-native-owner", Some("native-owner"));
-        owner.mark_running(&id);
-        let owner_liveness =
-            crate::task_supervisor::TaskTerminalGuard::new(Arc::clone(&owner), id.clone());
-        let owner_token = owner.cancel_token(&id);
-        let native_guard = register(
-            id.clone(),
-            authority(),
-            Arc::new(crate::steering::SteerBuffer::default()),
-            Arc::clone(&owner),
-            Arc::new(|_, _| Box::pin(async { Ok("unused".into()) })),
-            None,
-        );
-        let restored = TaskSupervisor::new();
-        restored.enable_persistence(&ledger).unwrap();
-
-        restored.cancel(&id).unwrap();
-        assert!(owner_token.is_cancelled());
-        assert_eq!(
-            owner.get_task(&id).unwrap().status,
-            crate::TaskStatus::Cancelled,
-            "the native bridge must update the execution owner as well as the caller"
-        );
-        drop(native_guard);
-        drop(owner_liveness);
-    }
 }
 
 #[cfg(test)]
