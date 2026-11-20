@@ -256,8 +256,17 @@ async fn a_turn_id_runs_once_and_only_in_its_own_chat() {
 async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
     let dir = tempfile::tempdir().unwrap();
     let llm = scripted();
-    let key = unique("restart");
-    let (finished, unstarted, interrupted) = (TurnId::new(), TurnId::new(), TurnId::new());
+    let (key, unreadable) = (unique("restart"), unique("unreadable"));
+    let [finished, unstarted, interrupted, other] = [(); 4].map(|_| TurnId::new());
+    // The ledger's session folders: a new one per session that wrote.
+    let ledger_root = dir.path().join("ui-protocol");
+    let folders = || {
+        let entries = std::fs::read_dir(&ledger_root).unwrap();
+        entries
+            .map(|entry| entry.unwrap().path())
+            .collect::<HashSet<_>>()
+    };
+    let unreadable_folder;
     {
         let fx = serve(dir.path(), llm.clone()).await;
         let chat = fx.chat(&key).await;
@@ -279,46 +288,76 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         fx.ledger
             .try_append_notification(UiNotification::TurnStarted(started))
             .unwrap();
+        // Ended in another chat, whose ledger cannot be read after the restart.
+        let before = folders();
+        let chat = fx.chat(&unreadable).await;
+        fx.entry.start(&chat, other.clone(), "other").await.unwrap();
+        assert_eq!(fx.ended(&chat, &other).await, TurnRecord::Completed);
+        unreadable_folder = folders().difference(&before).next().unwrap().clone();
+    }
+    let files: Vec<PathBuf> = std::fs::read_dir(&unreadable_folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    for file in &files {
+        std::fs::rename(file, file.with_extension("held")).unwrap();
+        std::fs::create_dir(file).unwrap();
     }
 
     let fx = serve(dir.path(), llm.clone()).await;
-    let chat = BoundChat::verify(fx.profile.clone(), key.clone()).unwrap();
-    let settled = |mut turns: Vec<(SessionKey, TurnId, TurnRecord)>| {
-        assert!(turns.iter().all(|(session, ..)| *session == key));
-        turns.sort_by_key(|(_, turn, _)| turn.0);
+    let reconciled = async || {
+        let mut turns: Vec<_> = (fx.entry.reconcile(&fx.profile).await.into_iter())
+            .map(|(_, turn, record)| (turn, record.ok()))
+            .collect();
+        turns.sort_by_key(|(turn, _)| turn.0);
         turns
-            .into_iter()
-            .map(|(_, turn, record)| (turn, record))
-            .collect::<Vec<_>>()
     };
     let mut expected = vec![
-        (finished.clone(), TurnRecord::Completed),
-        (unstarted.clone(), TurnRecord::NotStarted),
-        (interrupted.clone(), TurnRecord::Orphaned),
+        (finished.clone(), Some(TurnRecord::Completed)),
+        (unstarted.clone(), Some(TurnRecord::NotStarted)),
+        (interrupted.clone(), Some(TurnRecord::Orphaned)),
+        (other.clone(), None),
     ];
     expected.sort_by_key(|(turn, _)| turn.0);
-    assert_eq!(
-        settled(fx.entry.reconcile(&fx.profile).await.unwrap()),
-        expected
-    );
-    // Ended turns are forgotten once reported; the unstarted one may run.
-    let again = settled(fx.entry.reconcile(&fx.profile).await.unwrap());
-    assert_eq!(again, [(unstarted.clone(), TurnRecord::NotStarted)]);
-    assert_eq!(
+    // One unreadable session costs no other result, and forgets nothing.
+    assert_eq!(reconciled().await, expected);
+    for file in &files {
+        std::fs::remove_dir(file).unwrap();
+        std::fs::rename(file.with_extension("held"), file).unwrap();
+    }
+    for (_, record) in &mut expected {
+        record.get_or_insert(TurnRecord::Completed);
+    }
+    // Repaired, it reports its turn; the others are still there.
+    assert_eq!(reconciled().await, expected);
+    for (turn, session) in [
+        (&finished, &key),
+        (&interrupted, &key),
+        (&other, &unreadable),
+    ] {
+        let acknowledged = fx.entry.acknowledge(&fx.profile, session, turn).await;
+        acknowledged.unwrap();
+    }
+    assert!(
         fx.entry
-            .start(&chat, unstarted.clone(), "after")
+            .acknowledge(&fx.profile, &key, &unstarted)
             .await
-            .unwrap(),
-        Started::Now
+            .is_err()
     );
+    assert_eq!(
+        reconciled().await,
+        [(unstarted.clone(), Some(TurnRecord::NotStarted))]
+    );
+    let chat = BoundChat::verify(fx.profile.clone(), key.clone()).unwrap();
+    let start =
+        async |turn: &TurnId, text| fx.entry.start(&chat, turn.clone(), text).await.unwrap();
+    assert_eq!(start(&unstarted, "after").await, Started::Now);
     assert_eq!(fx.ended(&chat, &unstarted).await, TurnRecord::Completed);
-    let replay = fx
-        .entry
-        .start(&chat, interrupted.clone(), "again")
-        .await
-        .unwrap();
-    assert_eq!(replay, Started::Already(TurnRecord::Orphaned));
-    assert_eq!(*llm.prompts.lock().unwrap(), ["before", "after"]);
+    assert_eq!(
+        start(&interrupted, "again").await,
+        Started::Already(TurnRecord::Orphaned)
+    );
+    assert_eq!(*llm.prompts.lock().unwrap(), ["before", "other", "after"]);
 }
 
 #[tokio::test]

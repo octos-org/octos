@@ -12,9 +12,9 @@
 //! disk before the turn runs, and answers a second start of the same id with
 //! what became of the first instead of running it again. After a restart,
 //! [`ExternalTurns::reconcile`] reports each recorded turn by its exact id:
-//! never started, running, ended, or orphaned by the restart. The server
-//! neither picks nor deduplicates turn ids, so nothing is matched by text or
-//! time.
+//! never started, running, ended, or orphaned by the restart. A record stays
+//! until the caller acknowledges the ended turn. The server neither picks nor
+//! deduplicates turn ids, so nothing is matched by text or time.
 //!
 //! Turns run on a [`LedgerConnection`] and are external (UPCR-2026-036):
 //! they keep the external tool allowlist, a session-wide approval granted
@@ -269,25 +269,50 @@ impl ExternalTurns {
         }
     }
 
-    /// The turns `profile` recorded, each with what became of it. A turn
-    /// that has ended is forgotten once reported.
+    /// The turns `profile` recorded, each with what became of it or why that
+    /// cannot be told now. Nothing is forgotten here: the caller
+    /// [acknowledges](Self::acknowledge) each ended turn once it has
+    /// delivered the result, so a failed read or delivery loses none.
     pub(crate) async fn reconcile(
         &self,
         profile: &BoundProfile,
-    ) -> Result<Vec<(SessionKey, TurnId, TurnRecord)>, RpcError> {
+    ) -> Vec<(SessionKey, TurnId, Result<TurnRecord, RpcError>)> {
         let mut turns = Vec::new();
-        for (path, session_id, turn_id) in recorded_dispatches(&profile.data_dir) {
+        for (session_id, turn_id) in recorded_dispatches(&profile.data_dir) {
             let chat = BoundChat {
                 profile: profile.clone(),
                 session_id,
             };
-            let record = self.record(&chat, &turn_id).await?;
-            if !matches!(record, TurnRecord::NotStarted | TurnRecord::Running) {
-                let _ = std::fs::remove_file(path);
-            }
+            let record = self.record(&chat, &turn_id).await;
             turns.push((chat.session_id, turn_id, record));
         }
-        Ok(turns)
+        turns
+    }
+
+    /// Forget a recorded turn whose result the caller has delivered. Only a
+    /// turn that has ended can be forgotten.
+    pub(crate) async fn acknowledge(
+        &self,
+        profile: &BoundProfile,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Result<(), RpcError> {
+        let chat = BoundChat {
+            profile: profile.clone(),
+            session_id: session_id.clone(),
+        };
+        if let TurnRecord::NotStarted | TurnRecord::Running = self.record(&chat, turn_id).await? {
+            return Err(RpcError::invalid_params(format!(
+                "turn {} has not ended",
+                turn_id.0
+            )));
+        }
+        match std::fs::remove_file(dispatch_path(&profile.data_dir, session_id, turn_id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(
+                RpcError::internal_error(format!("could not forget the turn: {error}")),
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// Interrupt `turn_id` in `chat`, if this entry started it.
@@ -356,9 +381,7 @@ fn record_dispatch(
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir)?;
-    // A turn id names a turn within its session only.
-    let session = format!("{:x}", sha2::Sha256::digest(session_id.0.as_bytes()));
-    let path = dir.join(format!("{}-{}.json", &session[..16], turn_id.0));
+    let path = dispatch_path(data_dir, session_id, turn_id);
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
     let record = serde_json::to_vec(&json!({ "session_id": session_id, "turn_id": turn_id }))?;
     let written = (|| {
@@ -373,9 +396,18 @@ fn record_dispatch(
     written
 }
 
-/// Every turn recorded under `data_dir`, with the file it is recorded in. A
-/// record that cannot be read is skipped.
-fn recorded_dispatches(data_dir: &Path) -> Vec<(PathBuf, SessionKey, TurnId)> {
+/// Where `turn_id` of `session_id` is recorded. A turn id names a turn within
+/// its session only.
+fn dispatch_path(data_dir: &Path, session_id: &SessionKey, turn_id: &TurnId) -> PathBuf {
+    let session = format!("{:x}", sha2::Sha256::digest(session_id.0.as_bytes()));
+    data_dir
+        .join(JOURNAL_DIR)
+        .join(format!("{}-{}.json", &session[..16], turn_id.0))
+}
+
+/// Every turn recorded under `data_dir`. A record that cannot be read is
+/// skipped.
+fn recorded_dispatches(data_dir: &Path) -> Vec<(SessionKey, TurnId)> {
     #[derive(Deserialize)]
     struct Dispatch {
         session_id: SessionKey,
@@ -390,7 +422,7 @@ fn recorded_dispatches(data_dir: &Path) -> Vec<(PathBuf, SessionKey, TurnId)> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .filter_map(|path| {
             let dispatch: Dispatch = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-            Some((path, dispatch.session_id, dispatch.turn_id))
+            Some((dispatch.session_id, dispatch.turn_id))
         })
         .collect()
 }
