@@ -76,7 +76,7 @@ fn job_json(j: &octos_bus::CronJob, now_ms: i64) -> serde_json::Value {
         "id": j.id,
         "name": j.name,
         "enabled": j.enabled,
-        "schedule": serde_json::to_value(&j.schedule).unwrap_or_default(),
+        "schedule": j.schedule.for_display(),
         "message": crate::api::admin::truncate_str(&j.payload.message, 100),
         "channel": j.payload.channel,
         "last_run": last_run,
@@ -457,6 +457,12 @@ impl CronApplicationService {
                 if expr.trim().is_empty() {
                     return Err(CronApplicationError::CronExprRequired);
                 }
+                // CLI/tool compatibility allows field-internal spaces; OUP does not.
+                if expr.split_whitespace().count() != 6 {
+                    return Err(CronApplicationError::InvalidCronExpr);
+                }
+                let expr = octos_bus::cron_expression::standard_cron_expression(&expr)
+                    .map_err(|_| CronApplicationError::InvalidCronExpr)?;
                 if !octos_bus::cron_types::is_valid_cron_expression(
                     &expr,
                     params.timezone.as_deref(),

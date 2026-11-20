@@ -292,3 +292,9 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 3 | `commands::gateway::tests::should_refuse_only_misresolved_explicit_profile_routes` | Only an operator-pinned (explicit map) route whose target failed to resolve is refused; heuristic routes keep their legacy fallback and a resolved target dispatches — an explicit mapping can never silently land on the default profile. |
+
+## Standard cron weekdays (T-0263 / UPCR-058)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool (including internally spaced fields) and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |

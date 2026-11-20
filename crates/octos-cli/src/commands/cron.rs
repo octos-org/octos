@@ -40,7 +40,7 @@ pub enum CronSubcommand {
         /// Run every N seconds (recurring).
         #[arg(long)]
         every: Option<i64>,
-        /// Cron expression (e.g. "0 0 9 * * * *").
+        /// Cron expression with seconds first; weekday 0/7=Sun, 1-5=Mon-Fri.
         #[arg(long)]
         cron: Option<String>,
         /// Run once at this ISO timestamp.
@@ -129,7 +129,7 @@ fn format_schedule(schedule: &CronSchedule) -> String {
     match schedule {
         CronSchedule::At { .. } => "one-time".into(),
         CronSchedule::Every { every_ms } => format!("every {}s", every_ms / 1000),
-        CronSchedule::Cron { expr } => expr.clone(),
+        CronSchedule::Cron { expr } => octos_bus::cron_expression::display_cron_expression(expr),
     }
 }
 
@@ -220,7 +220,7 @@ fn cmd_add(
         }
         CronSchedule::Every { every_ms }
     } else if let Some(expr) = cron {
-        CronSchedule::Cron { expr }
+        CronSchedule::from_standard_cron(&expr)?
     } else if let Some(at_str) = at {
         let dt = chrono::DateTime::parse_from_rfc3339(&at_str)
             .or_else(|_| {
