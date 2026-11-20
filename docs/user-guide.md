@@ -98,6 +98,8 @@ Deployment behavior depends on `config.mode`:
 - `tenant` — Default end-user machine setup. Direct installs land on `/app/` the same way; managed registration setup can also configure the machine's public tunnel. `/admin/` remains the admin dashboard.
 - `cloud` — Advanced relay-host setup. `/` serves the landing page, `/app/` serves the octos-web app, and `/admin/` remains the admin dashboard.
 
+> **Deprecation (RFC #3262):** the `/app` web client (octos-web) is deprecated and will be removed in a future release — use [octoscode-web](https://github.com/octos-org/octoscode-web) as the web client instead. Until removal, `/app` loads with a visible deprecation banner announcing the replacement.
+
 `~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-host-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
 
 ### 2.1.1 Cloud Host Bootstrap

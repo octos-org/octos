@@ -304,3 +304,10 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
+
+## /app deprecation (RFC #3262, step 1)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::static_files::tests::should_inject_the_deprecation_banner_into_the_app_index_only` | The /app index document carries the deprecation banner exactly once (before </body>) and names octoscode-web; content-hashed asset bytes pass through untouched. |
+| 3 | `api::static_files::tests::should_serve_a_body_less_index_unmodified` | An index without a closing </body> is served unmodified rather than mangled by the injection. |
