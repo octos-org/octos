@@ -11,9 +11,9 @@ use octos_llm::{
 };
 use tracing::{debug, info, trace, warn};
 
-use super::Agent;
 use super::prompt_cache::{build_prompt_cache_context, fingerprint_prompt};
 use super::turn_state::{LoopRetryReason, LoopTurnState};
+use super::{Agent, TokenTracker};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
 
@@ -23,6 +23,12 @@ impl Agent {
 
     /// Call the LLM with before/after lifecycle hooks.
     /// Automatically retries on empty responses and retryable stream errors.
+    ///
+    /// `tracker` counts the call as open until it returns. The caller records
+    /// the returned usage before its next await, so an interrupt (which stops
+    /// the turn at an await) finds the tracker exact; a call cut off before
+    /// it returned stays open, and the turn's total is then unknown.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_llm_with_hooks(
         &self,
         messages: &[Message],
@@ -31,6 +37,7 @@ impl Agent {
         iteration: u32,
         total_usage: &TokenUsage,
         turn: &mut LoopTurnState,
+        tracker: Option<&TokenTracker>,
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
         self.call_llm_with_hooks_mode(
             messages,
@@ -40,6 +47,7 @@ impl Agent {
             total_usage,
             turn,
             true,
+            tracker,
         )
         .await
     }
@@ -47,6 +55,7 @@ impl Agent {
     /// Internal checkpoint call: retain hooks, retries, usage attribution and
     /// provider failover, but do not stream private reflection into the user's
     /// transcript.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_llm_with_hooks_silent(
         &self,
         messages: &[Message],
@@ -55,6 +64,7 @@ impl Agent {
         iteration: u32,
         total_usage: &TokenUsage,
         turn: &mut LoopTurnState,
+        tracker: Option<&TokenTracker>,
     ) -> Result<(ChatResponse, bool, Option<f64>)> {
         self.call_llm_with_hooks_mode(
             messages,
@@ -64,12 +74,45 @@ impl Agent {
             total_usage,
             turn,
             false,
+            tracker,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn call_llm_with_hooks_mode(
+        &self,
+        messages: &[Message],
+        tools_spec: &[ToolSpec],
+        config: &ChatConfig,
+        iteration: u32,
+        total_usage: &TokenUsage,
+        turn: &mut LoopTurnState,
+        emit_progress: bool,
+        tracker: Option<&TokenTracker>,
+    ) -> Result<(ChatResponse, bool, Option<f64>)> {
+        if let Some(tracker) = tracker {
+            tracker.begin_spend();
+        }
+        let result = self
+            .call_llm_attempts(
+                messages,
+                tools_spec,
+                config,
+                iteration,
+                total_usage,
+                turn,
+                emit_progress,
+            )
+            .await;
+        if let Some(tracker) = tracker {
+            tracker.end_spend();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_llm_attempts(
         &self,
         messages: &[Message],
         tools_spec: &[ToolSpec],

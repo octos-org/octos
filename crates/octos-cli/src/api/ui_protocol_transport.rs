@@ -37963,6 +37963,79 @@ fn tracker_live_spend(tracker: &octos_agent::TokenTracker) -> u64 {
     )
 }
 
+fn envelope_token_usage(usage: &octos_core::TokenUsage) -> EnvelopeTokenUsage {
+    EnvelopeTokenUsage {
+        input_tokens: u64::from(usage.input_tokens),
+        output_tokens: u64::from(usage.output_tokens),
+        reasoning_tokens: u64::from(usage.reasoning_tokens),
+        cache_read_tokens: u64::from(usage.cache_read_tokens),
+        cache_write_tokens: u64::from(usage.cache_write_tokens),
+    }
+}
+
+/// Record a turn that ended without completing (interrupted by the client,
+/// or failed after real model calls) in the persistent usage ledger, so a
+/// session's totals cover every token its provider reported and not only
+/// completed runs. Priced from the catalog at the agent's model. A turn with
+/// no recorded usage writes nothing; a request cut off mid-stream reported
+/// nothing to record.
+async fn record_unfinished_run_usage(
+    usage_ledger: &PersistentUsageLedger,
+    profile_id: &str,
+    session_id: &str,
+    run_id: &str,
+    provider: Option<String>,
+    model: Option<String>,
+    usage: &octos_core::TokenUsage,
+) {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cache_read_tokens == 0
+        && usage.cache_write_tokens == 0
+    {
+        return;
+    }
+    let estimated_cost_usd = model.as_deref().and_then(model_pricing).map(|pricing| {
+        pricing.cost_with_cache_for_provider(
+            provider.as_deref().unwrap_or(""),
+            model.as_deref().unwrap_or(""),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        )
+    });
+    let cost_source = if estimated_cost_usd.is_some() {
+        UsageCostSource::CatalogEstimate
+    } else {
+        UsageCostSource::Unavailable
+    };
+    let event = UsageEvent::completed_run(
+        profile_id,
+        session_id,
+        run_id,
+        provider,
+        model,
+        None,
+        u64::from(usage.input_tokens),
+        u64::from(usage.output_tokens),
+        estimated_cost_usd,
+        cost_source,
+        "appui",
+        None,
+    )
+    .with_cache_read_tokens(u64::from(usage.cache_read_tokens))
+    .with_cache_write_tokens(u64::from(usage.cache_write_tokens));
+    if let Err(error) = usage_ledger.record(event).await {
+        warn!(
+            session = %session_id,
+            run = %run_id,
+            error = %error,
+            "failed to record AppUI usage event for an unfinished turn"
+        );
+    }
+}
+
 /// #1969 — resolve the token charge for a turn that may have been INTERRUPTED.
 /// The AppUI drain loop breaks on interrupt before the done/error arm folds the
 /// turn's usage into `folded`, so an interrupted goal/peer turn would charge 0.
@@ -41285,6 +41358,21 @@ async fn run_standalone_turn(
     let interrupt_persist_thread = turn_thread_id_for_persist.clone();
     let interrupt_persist_context_manager = context_manager_for_result.clone();
     let interrupt_persist_context_data_dir = context_data_dir_for_result.clone();
+    // A turn's usage reaches the usage ledger once: written by the agent task
+    // when it ends with its own figures (completed or failed), else by the
+    // interrupt arm below, from the live tracker once the task is stopped.
+    let run_usage_recorded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run_usage_recorded_task = Arc::clone(&run_usage_recorded);
+    let run_provider = {
+        let provider = request_agent.provider_name();
+        (!provider.is_empty()).then(|| provider.to_string())
+    };
+    let run_model = {
+        let model = request_agent.model_id();
+        (!model.is_empty()).then(|| model.to_string())
+    };
+    let run_provider_task = run_provider.clone();
+    let run_model_task = run_model.clone();
     // Publish the prompt and child-task handles atomically with dispatch.
     // Connection cleanup holds this registry lock while aborting the turn.
     let registry = active_turns_registry();
@@ -41943,6 +42031,7 @@ async fn run_standalone_turn(
                     None
                 };
                 let _ = final_reply_tx.send(final_send);
+                run_usage_recorded_task.store(true, std::sync::atomic::Ordering::Release);
                 if let Some(usage_ledger) = usage_ledger_for_result.as_ref() {
                     let provider_metadata = response.provider_metadata.clone();
                     let provider = provider_metadata
@@ -42154,14 +42243,27 @@ async fn run_standalone_turn(
                         )
                     })
                     .unwrap_or((0, 0, 0));
-                let token_usage = error.downcast_ref::<octos_agent::PartialTurnUsage>()
-                    .map(|partial| EnvelopeTokenUsage {
-                        input_tokens: u64::from(partial.total.input_tokens),
-                        output_tokens: u64::from(partial.total.output_tokens),
-                        reasoning_tokens: u64::from(partial.total.reasoning_tokens),
-                        cache_read_tokens: u64::from(partial.total.cache_read_tokens),
-                        cache_write_tokens: u64::from(partial.total.cache_write_tokens),
-                    });
+                let partial_usage = error
+                    .downcast_ref::<octos_agent::PartialTurnUsage>()
+                    .map(|partial| partial.total.clone());
+                let token_usage = partial_usage.as_ref().map(envelope_token_usage);
+                // A failed turn's model calls were spent as surely as a
+                // completed one's: the session totals include them.
+                if let Some(usage) = partial_usage.as_ref()
+                    && let Some(usage_ledger) = usage_ledger_for_result.as_ref()
+                    && !run_usage_recorded_task.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    record_unfinished_run_usage(
+                        usage_ledger,
+                        &usage_profile_id_for_result,
+                        &usage_session_id_for_result,
+                        &usage_run_id_for_result,
+                        run_provider_task.clone(),
+                        run_model_task.clone(),
+                        usage,
+                    )
+                    .await;
+                }
                 let error = json!({
                     "type": "error",
                     "message": wire_message,
@@ -43226,6 +43328,27 @@ async fn run_standalone_turn(
             &turn_id,
         )
         .await;
+        // The agent task is stopped, so the live tracker holds everything the
+        // provider reported for this turn: record it in the usage ledger
+        // unless the task already did. The terminal carries it only when it is
+        // the exact total; a model call cut off by the stop never reported
+        // its figures, and an absent `token_usage` means unknown.
+        let stopped_usage = token_tracker.usage();
+        let settled_usage = token_tracker.settled_usage();
+        if let Some(usage_ledger) = usage_ledger.as_ref()
+            && !run_usage_recorded.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            record_unfinished_run_usage(
+                usage_ledger,
+                &usage_profile_id,
+                &session_id.to_string(),
+                &turn_id.0.to_string(),
+                run_provider.clone(),
+                run_model.clone(),
+                &stopped_usage,
+            )
+            .await;
+        }
         // Handler is awaiting our terminal emission + ack. Emit exactly once.
         try_emit_terminal(
             &turn_state,
@@ -43238,7 +43361,10 @@ async fn run_standalone_turn(
                 "interrupted",
                 captured_interrupt_origin(&turn_state).await.message(),
             )),
-            None,
+            Some(TurnCompletionDetails {
+                token_usage: settled_usage.as_ref().map(envelope_token_usage),
+                ..TurnCompletionDetails::default()
+            }),
             steer_buffer.as_ref(),
             peers_root.as_deref(),
             // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
@@ -44248,7 +44374,8 @@ struct TurnCompletionDetails {
 /// state-machine details.
 ///
 /// `completion_details` is consulted only when `expected_reason` is
-/// `Completed`, except `token_usage`, which also accompanies an error.
+/// `Completed`, except `token_usage`, which also accompanies an error or an
+/// interrupt (the standalone turn's live tracker after its task stopped).
 /// Populated on the standalone-turn path
 /// from `done` (input/output tokens + structured token usage + cursor +
 /// per-row identity); left as
@@ -44409,8 +44536,16 @@ async fn try_emit_terminal(
         }
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
-            let result =
-                send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
+            // Only the usage the turn reported before it stopped; an
+            // interrupted turn has no partial result.
+            let details = completion_details.map(|details| TurnCompletionDetails {
+                token_usage: details.token_usage,
+                ..TurnCompletionDetails::default()
+            });
+            let result = send_turn_error_with_details_offloaded(
+                ws, ledger, session_id, turn_id, code, message, details,
+            )
+            .await;
             // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
             // `write_peer_result_if_peer_session` (it aborts the agent task
             // before the done/error event), so the peer's held slot must be
@@ -46918,20 +47053,7 @@ async fn transition_to_terminal_settling_steers(
 /// #2807 — the turn drain loop's terminal forward: same event shape the
 /// sync `send_turn_error` family used to deliver, now through the offloaded
 /// lifecycle lane so a stalled stdio host reader pins no executor worker.
-async fn send_turn_error_offloaded(
-    ws: &WsConnection,
-    ledger: &UiProtocolLedger,
-    session_id: &SessionKey,
-    turn_id: &TurnId,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> Result<(), SendError> {
-    send_turn_error_with_details_offloaded(ws, ledger, session_id, turn_id, code, message, None)
-        .await
-}
-
-/// #2807 — the turn drain loop's detailed terminal forward: same event
-/// shape, delivered through the offloaded lifecycle lane.
+/// An interrupted terminal carries only the usage reported before the stop.
 async fn send_turn_error_with_details_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,

@@ -538,11 +538,20 @@ impl Agent {
             },
         ];
         let verifier_config = verifier_chat_config();
+        // Open until the call returns; its usage is recorded below before the
+        // next await (see `call_llm_with_hooks`).
+        if let Some(tracker) = tracker {
+            tracker.begin_spend();
+        }
         let response = octos_llm::with_lane_context(
             config.lane_context.clone(),
             config.provider.chat(&messages, &[], &verifier_config),
         )
-        .await?;
+        .await;
+        if let Some(tracker) = tracker {
+            tracker.end_spend();
+        }
+        let response = response?;
         // The verifier runs on its own provider — price its usage at the
         // model that actually answered, resolved from the provider (which
         // also handles verifier-side failover). `config.model_label` is a

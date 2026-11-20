@@ -3216,6 +3216,11 @@ impl Tool for SpawnTool {
         super::ConcurrencyClass::Exclusive
     }
 
+    fn reports_token_usage(&self) -> bool {
+        // A sync spawn returns its sub-agent's usage when it finishes.
+        true
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         // Build dynamic model field based on available sub-providers
         let model_prop = match &self.provider_router {

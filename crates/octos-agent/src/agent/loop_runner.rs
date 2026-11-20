@@ -1670,6 +1670,7 @@ impl Agent {
                                 iteration,
                                 &total_usage,
                                 &mut turn,
+                                tracker,
                             )
                             .await
                         {
@@ -1759,6 +1760,7 @@ impl Agent {
                             iteration,
                             &total_usage,
                             &mut turn,
+                            tracker,
                         )
                         .await
                     {
@@ -1794,6 +1796,7 @@ impl Agent {
                                     iteration,
                                     &total_usage,
                                     &mut turn,
+                                    tracker,
                                 )
                                 .await
                             {
@@ -3023,6 +3026,7 @@ impl Agent {
                         iteration,
                         &total_usage,
                         &mut turn,
+                        tracker,
                     )
                     .await
                 {
@@ -3743,6 +3747,18 @@ impl Agent {
         let mut tool_files = Vec::new();
         let mut tool_send_files = Vec::new();
         let mut tool_tokens = TokenUsage::default();
+        // A tool that reports a sub-agent's usage keeps the turn's total open
+        // until that usage is recorded below; a stop in between leaves it
+        // unknown (`TokenTracker::settled_usage`).
+        let spending_tools = tracker.filter(|_| {
+            limited_response
+                .tool_calls
+                .iter()
+                .any(|call| self.tools.reports_token_usage(&call.name))
+        });
+        if let Some(tracker) = spending_tools {
+            tracker.begin_spend();
+        }
         let mut tool_metadata: Vec<(String, serde_json::Value)> = Vec::new();
         // Codex round-2 MAJOR 2 (PR #1187 fixup): collect per-tool-call
         // success bits across every batch in this turn. Threaded out via
@@ -3902,6 +3918,9 @@ impl Agent {
                 None,
             ),
         );
+        if let Some(tracker) = spending_tools {
+            tracker.end_spend();
+        }
         // Codex round-3: return the sanitized response so the caller's
         // synth-ack gate sees the SAME tool_call_ids that the success-bit
         // sink was keyed by. See doc-comment on this fn.

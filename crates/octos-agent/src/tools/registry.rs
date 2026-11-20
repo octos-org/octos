@@ -844,6 +844,15 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// Whether the named tool reports model tokens of its own. Mirrors
+    /// [`Tool::reports_token_usage`]; unknown tools report `false`.
+    pub fn reports_token_usage(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|t| t.reports_token_usage())
+            .unwrap_or(false)
+    }
+
     /// Return a tool's declared foreground execution budget, when it has
     /// one. The agent dispatcher uses this before spawning a batch so plugin
     /// manifest timeouts are not accidentally shortened by the generic

@@ -148,14 +148,22 @@ impl LoopTurnState {
             self.priced_usage = true;
         }
         if let Some(tracker) = tracker {
-            tracker.input_tokens.store(
-                self.total_usage.input_tokens,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            tracker.output_tokens.store(
-                self.total_usage.output_tokens,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let relaxed = std::sync::atomic::Ordering::Relaxed;
+            tracker
+                .input_tokens
+                .store(self.total_usage.input_tokens, relaxed);
+            tracker
+                .output_tokens
+                .store(self.total_usage.output_tokens, relaxed);
+            tracker
+                .reasoning_tokens
+                .store(self.total_usage.reasoning_tokens, relaxed);
+            tracker
+                .cache_read_tokens
+                .store(self.total_usage.cache_read_tokens, relaxed);
+            tracker
+                .cache_write_tokens
+                .store(self.total_usage.cache_write_tokens, relaxed);
         }
     }
 
@@ -274,4 +282,53 @@ impl std::fmt::Display for PartialTurnUsage {
 pub(crate) fn attach_partial_usage(err: eyre::Report, total: TokenUsage) -> eyre::Report {
     let display = err.to_string();
     err.wrap_err(PartialTurnUsage { total, display })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live tracker mirrors every usage component of the running turn,
+    /// so an aborted turn can still report its cache and reasoning tokens.
+    #[test]
+    fn tracker_mirrors_every_usage_component_of_the_turn() {
+        let tracker = TokenTracker::new();
+        let mut state = LoopTurnState::new(Instant::now());
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 7,
+            reasoning_tokens: 2,
+            cache_read_tokens: 20,
+            cache_write_tokens: 30,
+        };
+        state.record_usage(&usage, Some(&tracker), None);
+        state.record_usage(&usage, Some(&tracker), None);
+        let mirrored = tracker.usage();
+        assert_eq!(mirrored.input_tokens, 20);
+        assert_eq!(mirrored.output_tokens, 14);
+        assert_eq!(mirrored.reasoning_tokens, 4);
+        assert_eq!(mirrored.cache_read_tokens, 40);
+        assert_eq!(mirrored.cache_write_tokens, 60);
+        assert_eq!(mirrored.input_tokens, state.total_usage().input_tokens);
+    }
+
+    /// The total is exact only while no step that spends tokens is open. Only
+    /// `end_spend` closes one, and a surplus end must not hide a later open.
+    #[test]
+    fn tracker_total_is_unknown_while_a_spend_is_open() {
+        let tracker = TokenTracker::new();
+        let zero = tracker
+            .settled_usage()
+            .expect("nothing started yet: a known zero");
+        assert_eq!(zero.input_tokens + zero.output_tokens, 0);
+        tracker.begin_spend();
+        tracker.begin_spend();
+        tracker.end_spend();
+        assert!(tracker.settled_usage().is_none());
+        tracker.end_spend();
+        tracker.end_spend();
+        assert!(tracker.settled_usage().is_some());
+        tracker.begin_spend();
+        assert!(tracker.settled_usage().is_none());
+    }
 }

@@ -355,9 +355,23 @@ impl std::fmt::Display for FailedConversationProgress {
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
+///
+/// Each counter mirrors the running turn's total of that `TokenUsage`
+/// component, so a turn that ends without its own usage payload (an
+/// interrupted turn's aborted task) can still report what the provider
+/// processed before the end. `input_tokens` and `output_tokens` keep their
+/// meaning for the status and budget readers.
 pub struct TokenTracker {
     pub input_tokens: AtomicU32,
     pub output_tokens: AtomicU32,
+    pub reasoning_tokens: AtomicU32,
+    pub cache_read_tokens: AtomicU32,
+    pub cache_write_tokens: AtomicU32,
+    /// Steps of the running turn that spend tokens and have started but not
+    /// yet recorded their usage: a model call, or a tool that reports a
+    /// sub-agent's usage when it finishes. An aborted step stays open, so a
+    /// turn stopped during one knows its total is incomplete.
+    open_spends: AtomicU32,
 }
 
 impl TokenTracker {
@@ -365,7 +379,46 @@ impl TokenTracker {
         Self {
             input_tokens: AtomicU32::new(0),
             output_tokens: AtomicU32::new(0),
+            reasoning_tokens: AtomicU32::new(0),
+            cache_read_tokens: AtomicU32::new(0),
+            cache_write_tokens: AtomicU32::new(0),
+            open_spends: AtomicU32::new(0),
         }
+    }
+
+    /// The turn's usage so far, as last recorded.
+    pub fn usage(&self) -> TokenUsage {
+        let load = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
+        TokenUsage {
+            input_tokens: load(&self.input_tokens),
+            output_tokens: load(&self.output_tokens),
+            reasoning_tokens: load(&self.reasoning_tokens),
+            cache_read_tokens: load(&self.cache_read_tokens),
+            cache_write_tokens: load(&self.cache_write_tokens),
+        }
+    }
+
+    /// A step that spends tokens starts. Only [`Self::end_spend`] closes it,
+    /// never a drop: an aborted step must stay open.
+    pub fn begin_spend(&self) {
+        self.open_spends.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A step that [`Self::begin_spend`] opened has recorded its usage (or
+    /// ended without any to record).
+    pub fn end_spend(&self) {
+        let _ = self
+            .open_spends
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                open.checked_sub(1)
+            });
+    }
+
+    /// The turn's exact usage: what was recorded, when no step that spends
+    /// tokens is still open. `None` means the total is unknown (a model call
+    /// was cut off before the provider reported its figures).
+    pub fn settled_usage(&self) -> Option<TokenUsage> {
+        (self.open_spends.load(Ordering::Acquire) == 0).then(|| self.usage())
     }
 }
 

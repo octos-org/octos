@@ -1148,6 +1148,151 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
     assert!(crate::peers::host_tools::pending_calls_for(&peers_root, "news").is_empty());
 }
 
+/// A model that never answers, so a stop cuts its call off.
+struct HangingLlm(std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for HangingLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending().await
+    }
+
+    fn model_id(&self) -> &str {
+        "hanging"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+/// Where the person stops the turn.
+enum StopAt {
+    /// While the host works on a call: the model call that asked for it has
+    /// returned.
+    HostCall,
+    /// While this model's first call is still unanswered.
+    ModelCall(Arc<HangingLlm>),
+}
+
+/// The data of the turn's terminal. Every connection receives it as its v2
+/// projection (`projection/envelope` with a `turn_terminal` payload); the
+/// source `turn/error` record never goes on the wire.
+async fn next_turn_terminal(rx: &mut mpsc::Receiver<WsMessage>) -> Value {
+    loop {
+        let frame = next_frame(rx, "projection/envelope").await;
+        if frame["payload"]["type"] == "turn_terminal" {
+            return frame["payload"]["data"].clone();
+        }
+    }
+}
+
+/// Start one turn on the News peer session, stop it at `at`, and return the
+/// interrupted terminal's data.
+async fn interrupted_terminal(e: &mut E2e, at: StopAt) -> Value {
+    let session = SessionKey(format!("{}#peer-news", e.system.base_key()));
+    let mut rx = e.rx.take().unwrap();
+    let ledger = Arc::new(UiProtocolLedger::new(256));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let turn_id = TurnId::new();
+    handle_turn_start(
+        &e.ws,
+        &e.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-1".into(),
+        TurnStartParams {
+            session_id: session.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "follow rust".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    match at {
+        StopAt::HostCall => {
+            next_frame(&mut rx, "peer/tool/call").await;
+        }
+        StopAt::ModelCall(llm) => {
+            let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+            while !llm.0.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the model was never called"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+    handle_turn_interrupt(
+        &e.ws,
+        &e.state,
+        &ledger,
+        &active_turns,
+        &contracts,
+        None,
+        "int-1".into(),
+        TurnInterruptParams {
+            session_id: session,
+            turn_id,
+        },
+    )
+    .await;
+    let terminal = next_turn_terminal(&mut rx).await;
+    assert_eq!(terminal["outcome"], "interrupted");
+    assert_eq!(terminal["error"]["code"], "interrupted");
+    terminal
+}
+
+/// The model call that asked for a host tool had returned and been recorded
+/// when the person stopped the turn: the interrupted terminal carries the
+/// turn's exact usage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_carry_the_exact_usage_on_a_turn_stopped_between_model_calls() {
+    let llm = ScriptedHostToolLlm::new("news_topics_set", json!({"topics": ["rust"]}));
+    let mut e = e2e_fixture(llm, json!({ "tools": [news_topics_set()] })).await;
+    let terminal = interrupted_terminal(&mut e, StopAt::HostCall).await;
+    assert_eq!(
+        terminal["token_usage"],
+        json!({"input_tokens": 10, "output_tokens": 5})
+    );
+}
+
+/// A stop during a model call cuts it off before the provider reported its
+/// figures: the terminal leaves `token_usage` out (unknown) instead of
+/// reporting what was recorded so far as the total.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_leave_the_usage_unknown_on_a_turn_stopped_during_a_model_call() {
+    let llm = Arc::new(HangingLlm(Default::default()));
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [news_topics_set()] })).await;
+    let terminal = interrupted_terminal(&mut e, StopAt::ModelCall(llm)).await;
+    assert!(
+        terminal.get("token_usage").is_none(),
+        "an absent token_usage means unknown: {terminal}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #2567 post-approval follow-ups (N1–N4)
 // ---------------------------------------------------------------------------

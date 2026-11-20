@@ -180,6 +180,7 @@ async fn assert_mixed_terminal_usage(
             1,
             &previous,
             &mut turn,
+            None,
         )
         .await;
     assert_eq!(result.is_ok(), succeeds, "{result:?}");
@@ -222,6 +223,107 @@ async fn assert_mixed_terminal_usage(
         + (f64::from(expected.2) + 1.25 * f64::from(expected.3)) * pricing.input_per_million
             / 1_000_000.0;
     assert!((turn.priced_spend().unwrap() - (0.5 + expected_cost)).abs() < 1e-12);
+}
+
+/// A provider whose answer never comes, so the caller cuts the call off.
+struct NeverAnswers;
+
+#[async_trait]
+impl LlmProvider for NeverAnswers {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        std::future::pending().await
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        std::future::pending().await
+    }
+
+    fn model_id(&self) -> &str {
+        "planner-test"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+/// A stop drops a model call before its provider reported any figures: the
+/// turn's total is then unknown, not the usage recorded so far. A call that
+/// returned and whose usage was recorded leaves the total exact.
+#[tokio::test]
+async fn a_model_call_cut_off_by_a_stop_leaves_the_turn_total_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let tracker = TokenTracker::new();
+    let mut turn = LoopTurnState::new(Instant::now());
+
+    let answered = Agent::new(
+        AgentId::new("answered"),
+        Arc::new(ScriptedProvider::new(vec![end_turn("done", 10, 20)])),
+        ToolRegistry::new(),
+        memory.clone(),
+    );
+    let total = turn.total_usage().clone();
+    let (response, _, cost) = answered
+        .call_llm_with_hooks(
+            &[Message::user("hello")],
+            &[],
+            &ChatConfig::default(),
+            1,
+            &total,
+            &mut turn,
+            Some(&tracker),
+        )
+        .await
+        .unwrap();
+    turn.record_llm_usage(&response.usage, Some(&tracker), cost);
+    let settled = tracker
+        .settled_usage()
+        .expect("a recorded call leaves the total exact");
+    assert_eq!((settled.input_tokens, settled.output_tokens), (10, 20));
+
+    let silent = Agent::new(
+        AgentId::new("silent"),
+        Arc::new(NeverAnswers),
+        ToolRegistry::new(),
+        memory,
+    );
+    let total = turn.total_usage().clone();
+    let messages = [Message::user("hello")];
+    let config = ChatConfig::default();
+    let call = silent.call_llm_with_hooks(
+        &messages,
+        &[],
+        &config,
+        2,
+        &total,
+        &mut turn,
+        Some(&tracker),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), call)
+            .await
+            .is_err()
+    );
+    assert!(
+        tracker.settled_usage().is_none(),
+        "the dropped call's usage is unknown"
+    );
+    assert_eq!(
+        tracker.usage().input_tokens,
+        10,
+        "what was reported stays readable for the usage ledger"
+    );
 }
 
 #[tokio::test]
