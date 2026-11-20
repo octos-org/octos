@@ -15,8 +15,9 @@
 use super::*;
 
 use crate::peers::purge::{
-    PurgeTombstone, append_audit, finalize_slug_tombstone, is_real_path, remove_tree_within,
-    tombstone_for_token, write_slug_tombstone, write_token_tombstone,
+    PurgeIntent, PurgeTombstone, append_audit, finalize_slug_tombstone, is_real_path,
+    purge_intent_for_retry, purge_residue_dir, remove_purge_intent, remove_tree_within,
+    tombstone_for_token, write_purge_intent, write_slug_tombstone, write_token_tombstone,
 };
 
 /// `approval/cancelled` reason of a prompt cancelled by `peer/purge`.
@@ -257,13 +258,25 @@ pub(super) async fn raw_peer_purge(
                         "purged": false,
                         "already_purged": true,
                         "purged_at": tombstone.purged_at,
-                        // Surface any residue the original purge recorded
-                        // (#2659): the retry is the caller's chance to
-                        // finish or escalate the partial erase.
                         "partial": !tombstone.errors.is_empty(),
                         "residual_errors": tombstone.errors,
                     }));
                 }
+            }
+            if let Some(intent) =
+                purge_intent_for_retry(&peers_root, &params.peer, &params.session_id.0, token)
+            {
+                return execute_peer_purge(
+                    ws,
+                    state,
+                    ledger,
+                    contracts,
+                    active_turns,
+                    profile_id,
+                    data_dir,
+                    intent,
+                )
+                .await;
             }
             return Err(error);
         }
@@ -275,6 +288,43 @@ pub(super) async fn raw_peer_purge(
             format!("peer '{slug}' is not a host-owned app peer; only those can be purged"),
         ));
     };
+    let Some(peer_dir) = staged_peer_dir(&peers_root, &slug) else {
+        return Err(purge_error(
+            "peer_not_found",
+            format!("peer '{slug}' is not staged"),
+        ));
+    };
+    let name = peer_io::read_peer_file(&peer_dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    let contexts = crate::peers::app_binding::context_bindings(&peers_root, &slug);
+    let intent = PurgeIntent::new(slug, name, params.session_id.0.clone(), binding, contexts);
+    execute_peer_purge(
+        ws,
+        state,
+        ledger,
+        contracts,
+        active_turns,
+        profile_id,
+        data_dir,
+        intent,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_peer_purge(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    active_turns: &SharedActiveTurns,
+    profile_id: String,
+    data_dir: PathBuf,
+    intent: PurgeIntent,
+) -> Result<Value, RpcError> {
+    let peers_root = data_dir.join("peers");
+    let slug = intent.slug.clone();
     // The peer's tool host, when it has one, is the owning connection: only
     // it may erase the peer. With no live route (the host reconnected and has
     // not registered again) the host token is the credential.
@@ -298,18 +348,25 @@ pub(super) async fn raw_peer_purge(
         ));
     }
     let _in_flight = InFlight(in_flight_key);
-    let Some(peer_dir) = staged_peer_dir(&peers_root, &slug) else {
+    // Before any destructive step, durably retain the already-authorized
+    // owner and complete erase scope. The record alone never authorizes work.
+    write_purge_intent(&peers_root, &intent).map_err(|error| {
+        RpcError::internal_error(format!("failed to record purge intent: {error}"))
+    })?;
+    let peer_dir = peers_root.join(&slug);
+    if std::fs::symlink_metadata(&peer_dir).is_ok()
+        && purge_residue_dir(&peers_root, &slug).is_none()
+    {
         return Err(purge_error(
             "peer_not_found",
-            format!("peer '{slug}' is not staged"),
+            format!("peer '{slug}' residue is not a real non-symlink directory"),
         ));
-    };
-    let name = peer_io::read_peer_file(&peer_dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty());
-    let originator = params.session_id.clone();
+    }
+    let name = intent.name.clone();
+    let originator = SessionKey(intent.originator.clone());
     let peer_session = SessionKey(format!("{}#peer-{slug}", originator.base_key()));
-    let contexts = crate::peers::app_binding::context_bindings(&peers_root, &slug);
+    let binding = intent.binding.clone();
+    let contexts = intent.contexts.clone();
     let context_sessions: Vec<(String, SessionKey)> = contexts
         .iter()
         .map(|(id, _)| {
@@ -330,7 +387,7 @@ pub(super) async fn raw_peer_purge(
     //    from here on (the peer's session and its contexts), and the close
     //    path clears the input queue, the wire and the build-cache slot.
     let was_open = !peer_is_closed(&peers_root, &slug);
-    if was_open {
+    if was_open && staged_peer_dir(&peers_root, &slug).is_some() {
         let closed_ws = ws.clone();
         let closed_ledger = ledger.clone();
         close_authorized_peer(
@@ -353,7 +410,7 @@ pub(super) async fn raw_peer_purge(
     }
     let mut contexts_closed = 0;
     for (id, context) in &contexts {
-        if !context.closed {
+        if !context.closed && staged_peer_dir(&peers_root, &slug).is_some() {
             let mut closed = context.clone();
             closed.closed = true;
             crate::peers::app_binding::write_context_binding(&peers_root, &slug, id, &closed)
@@ -570,6 +627,9 @@ pub(super) async fn raw_peer_purge(
     // debris (#2712).
     finalize_slug_tombstone(&peers_root, &slug, &purged_at).map_err(|error| {
         RpcError::internal_error(format!("failed to record the purge: {error}"))
+    })?;
+    remove_purge_intent(&peers_root, &slug).map_err(|error| {
+        RpcError::internal_error(format!("failed to clear the purge intent: {error}"))
     })?;
     for session in &all_sessions {
         state.session_cache.invalidate_session(session).await;

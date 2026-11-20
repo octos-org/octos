@@ -1917,6 +1917,130 @@ async fn should_finish_a_retry_when_an_earlier_attempt_erased_the_provisioned_wo
     assert!(!peers_root(&fx).join("mail").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn should_rescan_state1_residue_with_the_persisted_owner_intent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture().await;
+    let provisioned = dunce::canonicalize(&fx.data_dir)
+        .unwrap()
+        .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
+        .join("app/mail/acct-1");
+    std::fs::create_dir_all(&provisioned).unwrap();
+    let prepared = raw_peer_prepare(
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "You are the Mail app's assistant.",
+                "names": ["Mail"],
+                "session_id": fx.system,
+                "memory_namespace": "app/mail/acct-1",
+                "cwd": provisioned.to_string_lossy(),
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("stage the mail peer");
+    let token = prepared["host_token"].as_str().unwrap().to_owned();
+    let peer_dir = peers_root(&fx).join("mail");
+    let blocked = peer_dir.join("blocked");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("residue"), b"partial erase").unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (ws, _rx) = ws_connection_for_test(8);
+    let error = purge(&fx.state, &ws, &fx.system, "mail", &token)
+        .await
+        .unwrap_err();
+    assert_eq!(error.data.unwrap()["kind"], "peer_purge_incomplete");
+    assert!(crate::peers::purge::slug_tombstone_exists(
+        &peers_root(&fx),
+        "mail"
+    ));
+    assert!(!crate::peers::purge::slug_tombstone_is_finalized(
+        &peers_root(&fx),
+        "mail"
+    ));
+
+    // State 2 stays fail-closed while the brief survives but the binding and
+    // closed marker were torn away by the partial erase. remove_dir_all order
+    // is arbitrary, so normalize the exact residue instead of assuming which
+    // authorization leaves the real erase reached first.
+    let remove_if_present = |leaf: &str| {
+        if let Err(error) = std::fs::remove_file(peer_dir.join(leaf)) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{leaf}");
+        }
+    };
+    remove_if_present("host_binding.json");
+    remove_if_present("closed");
+    if !peer_dir.join("brief.md").exists() {
+        std::fs::write(
+            peer_dir.join("brief.md"),
+            "You are the Mail app's assistant.",
+        )
+        .unwrap();
+    }
+    if !peer_dir.join("originator").exists() {
+        std::fs::write(peer_dir.join("originator"), fx.system.0.as_bytes()).unwrap();
+    }
+    let stale_session = SessionKey(format!("{}#peer-mail", fx.system.base_key()));
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &stale_session),
+        crate::peers::app_binding::SessionAppBinding::Refused(_)
+    ));
+
+    // State 1: the ordinary retry can no longer resolve or authorize the
+    // residue from the staged files. A fresh WS also proves there is no live
+    // host route to fall back on. The pre-authorized durable intent must drive
+    // the rescan, not the missing task id/brief by themselves.
+    remove_if_present("brief.md");
+    remove_if_present("originator");
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (retry_ws, _retry_rx) = ws_connection_for_test(8);
+    let (concurrent_ws, _concurrent_rx) = ws_connection_for_test(8);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            purge(&fx.state, &retry_ws, &fx.system, "mail", &token),
+            purge(&fx.state, &concurrent_ws, &fx.system, "mail", &token),
+        )
+    })
+    .await
+    .expect("concurrent State1 rescans must not block the broker on closed WS turns");
+    for outcome in [&first, &second] {
+        match outcome {
+            Ok(result) => assert!(
+                result["purged"] == true || result["already_purged"] == true,
+                "{result}"
+            ),
+            Err(error) => assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "peer_purge_in_progress",
+                "concurrent retries must coalesce, not both erase: {error:?}"
+            ),
+        }
+    }
+    let retry = [&first, &second]
+        .into_iter()
+        .find_map(|outcome| {
+            outcome
+                .as_ref()
+                .ok()
+                .filter(|result| result["purged"] == true)
+        })
+        .expect("one authorized State1 rescan finishes");
+    assert_eq!(retry["purged"], true, "{retry}");
+    assert!(!peer_dir.exists());
+
+    let (repeat_ws, _repeat_rx) = ws_connection_for_test(8);
+    let repeated = purge(&fx.state, &repeat_ws, &fx.system, "mail", &token)
+        .await
+        .expect("a completed rescan is idempotent");
+    assert_eq!(repeated["already_purged"], true, "{repeated}");
+}
+
 // ---------------------------------------------------------------------------
 // UPCR-2026-034 `read_parent`: a request context's read-only view of its
 // peer's folder (#2603).
