@@ -112,6 +112,24 @@ that already retired the generation is not cancelled again. A stale socket
 holds its original generation and cannot cancel later grant/browser work.
 There is no polling watcher: a close without a subsequent text frame does not
 observe revocation, and a silent sibling's foreground turn is not closed by
-another socket. Synchronous child calls and already-running native tools retain
-their existing completion/timeout limitation. Connection cleanup releases the global turn-registry lock before waiting on
+another socket. Grant-file reads use a blocking-worker boundary before the global
+turn-registry lock: bind and interactive admission take that lock only after their
+snapshot is available, and per-frame revalidation yields while storage is slow.
+The authoritative bind/turn snapshot also holds a shared lock on the stable
+`work_secrets.lock` sidecar (never the renamed JSON inode). Issue, revoke, and
+reissue take the exclusive lock across load→modify→rename. The shared guard is
+released immediately after generation observation, background-work admission,
+and ActiveTurn insertion, so a CLI mutation either completes before the snapshot
+or waits until after admission; a completed revocation cannot be followed by
+admission of the older snapshot. Lock acquisition and reads stay on the blocking
+worker, never under `active_turns`, and the guard never enters socket/turn state.
+A per-session/profile observation gate serializes each read with its subsequent
+validate/observe/admit step, so a late old snapshot cannot overwrite a replacement
+grant or clear a newer revocation; different sessions do not share that gate.
+If the fenced snapshot itself cannot be read, only a caller without an ingress
+generation may use the non-mutating browser fallback; a bound work-secret caller
+fails closed instead of admitting work without the authoritative snapshot.
+No session holds the global admission lock across grant-file I/O. Synchronous child
+calls and already-running native tools retain their existing completion/timeout
+limitation. Connection cleanup releases the global turn-registry lock before waiting on
 gateway or session-manager operations.

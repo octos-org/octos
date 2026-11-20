@@ -1777,6 +1777,10 @@ mod ws_lifetime_tests;
 #[path = "ui_protocol_chat_workspace_tests.rs"]
 mod chat_workspace_tests;
 
+#[cfg(unix)]
+#[path = "ui_protocol_grant_io_tests.rs"]
+mod grant_io_tests;
+
 include!("ui_protocol_file_mutation_tests.rs");
 include!("ui_protocol_terminal_time_tests.rs");
 

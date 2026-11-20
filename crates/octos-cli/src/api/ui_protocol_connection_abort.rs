@@ -218,17 +218,54 @@ fn retire_background_continuations(
     contracts.scopes.evict_session(session);
 }
 
-fn observe_background_grant(
+/// Serialize snapshot read and generation observation per session/profile.
+/// Different sessions keep running during slow storage, while an older read
+/// cannot complete after a replacement and overwrite its newer grant stamp.
+/// Lock order: grant observation → active_turns → BackgroundWorkStore.
+async fn lock_background_grant_observation(
+    session: &SessionKey,
+    profile: &str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    type GrantLocks = std::sync::Mutex<
+        HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >;
+    static LOCKS: std::sync::OnceLock<GrantLocks> = std::sync::OnceLock::new();
+    let key = (session.0.clone(), profile.to_owned());
+    let lock = {
+        let mut locks = LOCKS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
+
+async fn load_background_grants(
     state: &AppState,
+) -> eyre::Result<octos_agent::bridge::work_secret::WorkSecretGrantSnapshot> {
+    state.work_secret_store.list_for_admission_async().await
+}
+
+fn observe_background_grant_read(
+    read: &eyre::Result<octos_agent::bridge::work_secret::WorkSecretGrantSnapshot>,
     contracts: &UiProtocolContractStores,
     ledger: &UiProtocolLedger,
     session: &SessionKey,
     profile: &str,
     expected_hash: Option<&str>,
+    fail_closed_on_error: bool,
 ) -> Result<crate::contracts::background_work::Observation, RpcError> {
-    let grants = match state.work_secret_store.list() {
-        Ok(grants) => grants,
-        Err(error) if expected_hash.is_none() => {
+    let grants = match read {
+        Ok(snapshot) => snapshot.records().to_vec(),
+        Err(error) if !fail_closed_on_error => {
             // Ordinary browser / non-ingress turn (T-0309): a corrupt or
             // unreadable grants file must not strip existing browser
             // capabilities, and must NOT be read as a revocation (which would
@@ -344,6 +381,81 @@ async fn reject_ingress_bind(
     (1008, "session_ingress_revoked")
 }
 
+#[cfg(test)]
+fn test_ingress_bind_read_gates() -> &'static std::sync::Mutex<
+    HashMap<SessionKey, Arc<tokio::sync::Semaphore>>,
+> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<SessionKey, Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Delay one test socket immediately before its bind-time grant read. This
+/// replaces the old active-turn lock barrier, which cannot order a read that
+/// now deliberately happens before that lock.
+#[cfg(test)]
+fn install_ingress_bind_read_gate(session: &SessionKey) -> Arc<tokio::sync::Semaphore> {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    test_ingress_bind_read_gates()
+        .lock()
+        .unwrap()
+        .insert(session.clone(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
+async fn await_ingress_bind_read_gate(session: &SessionKey) {
+    let gate = test_ingress_bind_read_gates().lock().unwrap().remove(session);
+    if let Some(gate) = gate {
+        let _permit = gate.acquire().await.expect("test bind gate remains open");
+    }
+}
+
+#[cfg(not(test))]
+async fn await_ingress_bind_read_gate(_session: &SessionKey) {}
+
+#[cfg(test)]
+type IngressAdmissionGate = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(test)]
+fn test_ingress_bind_admission_gates() -> &'static std::sync::Mutex<
+    HashMap<SessionKey, IngressAdmissionGate>,
+> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<SessionKey, IngressAdmissionGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_ingress_bind_admission_gate(session: &SessionKey) -> IngressAdmissionGate {
+    let gate = (
+        Arc::new(tokio::sync::Semaphore::new(0)),
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    );
+    test_ingress_bind_admission_gates()
+        .lock()
+        .unwrap()
+        .insert(session.clone(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
+async fn await_ingress_bind_admission_gate(session: &SessionKey) {
+    let gate = test_ingress_bind_admission_gates()
+        .lock()
+        .unwrap()
+        .remove(session);
+    if let Some((entered, release)) = gate {
+        entered.add_permits(1);
+        let _permit = release.acquire().await.expect("admission gate remains open");
+    }
+}
+
+#[cfg(not(test))]
+async fn await_ingress_bind_admission_gate(_session: &SessionKey) {}
+
 async fn bind_ingress_generation(
     state: &AppState,
     contracts: &UiProtocolContractStores,
@@ -353,17 +465,23 @@ async fn bind_ingress_generation(
     profile: &str,
     turn_profile: &str,
 ) -> Result<(u64, crate::contracts::background_work::ScopeLease), (u16, &'static str)> {
+    // Complete the blocking read before taking the global admission lock. The
+    // same snapshot and timestamp still drive validation and observation.
+    await_ingress_bind_read_gate(&scope.session_id).await;
+    let _grant_guard = lock_background_grant_observation(&scope.session_id, profile).await;
+    let grant_snapshot = state
+        .work_secret_store
+        .list_for_admission_async()
+        .await
+        .map_err(|error| {
+            warn!(%error, "cannot read ingress grants during connection bind");
+            (1011, "session_ingress_unavailable")
+        })?;
+    await_ingress_bind_admission_gate(&scope.session_id).await;
     let active = active_turns.lock().await;
-    // Validate and observe one snapshot and timestamp under the admission lock.
-    // A revocation between two independent reads must not bypass cleanup or bind
-    // an old bearer to a replacement generation.
-    let grants = state.work_secret_store.list().map_err(|error| {
-        warn!(%error, "cannot read ingress grants during connection bind");
-        (1011, "session_ingress_unavailable")
-    })?;
     let now = chrono::Utc::now();
     let grant = match octos_agent::bridge::work_secret::WorkSecretGrantStore::validate_records_at(
-        &grants,
+        grant_snapshot.records(),
         &scope.session_id.0,
         &scope.token,
         now,
@@ -378,7 +496,7 @@ async fn bind_ingress_generation(
         ledger,
         &scope.session_id,
         profile,
-        grants,
+        grant_snapshot.records().to_vec(),
         Some(&grant.token_hash),
         now,
     ) {
@@ -393,6 +511,7 @@ async fn bind_ingress_generation(
         .filter(|turn| turn.owner.is_none() && turn.profile_id == turn_profile)
         .map(|turn| (turn.state.clone(), turn.interrupt_tx.clone()));
     drop(active);
+    drop(grant_snapshot);
     if let Some((state, interrupt_tx)) = continuation {
         let _ = capture_turn_interrupt(state, interrupt_tx, InterruptOrigin::IngressRevoked).await;
     }

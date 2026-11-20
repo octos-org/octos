@@ -681,6 +681,17 @@ impl<'a> SessionTurnService<'a> {
                 .await;
         });
 
+        // Serialize observation only within this session/profile. Different
+        // sessions retain independent storage and admission progress. Read the
+        // fenced snapshot before the global admission lock, then keep its guard
+        // through observation, background-work admission, and ActiveTurn insert.
+        let grant_profile = background_profile
+            .as_deref()
+            .unwrap_or(&profile_for_stamp)
+            .to_owned();
+        let grant_guard = lock_background_grant_observation(&session_id, &grant_profile).await;
+        let background_grants = load_background_grants(state).await;
+        await_ingress_bind_admission_gate(&session_id).await;
         // `None` => admitted. `Some(refusal)` => refused; an occupied session
         // carries the id of the turn that actually holds it. The id is captured in the SAME
         // lock scope that makes the decision (never by re-acquiring the registry
@@ -709,8 +720,16 @@ impl<'a> SessionTurnService<'a> {
             };
             let admission = admission.and_then(|()| {
                 let profile = background_profile.as_deref().unwrap_or(&profile_for_stamp);
-                let _observed =
-                    observe_background_grant(state, contracts, ledger, &session_id, profile, None)?;
+                let fail_closed_on_error = caller.ingress_generation().is_some();
+                let _observed = observe_background_grant_read(
+                    &background_grants,
+                    contracts,
+                    ledger,
+                    &session_id,
+                    profile,
+                    None,
+                    fail_closed_on_error,
+                )?;
                 let work = contracts
                     .background_work
                     .admit(&session_id, profile, &turn_id, caller.ingress_generation())
@@ -743,6 +762,10 @@ impl<'a> SessionTurnService<'a> {
             }
             admission
         };
+        // The block above has released active_turns; only now release the
+        // cross-process snapshot fence and the per-session observation gate.
+        drop(background_grants);
+        drop(grant_guard);
         let background_work = match admission {
             Ok(work) => work,
             Err(error) => {

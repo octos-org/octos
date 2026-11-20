@@ -438,6 +438,79 @@ fn issue_ingress_grant(
         .unwrap();
 }
 
+#[tokio::test]
+async fn turn_admission_holds_grant_fence_through_active_turn_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = SessionKey(format!(
+        "{MAIN_PROFILE_ID}:api:turn-admission-fence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let (mut state, _profile) =
+        state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
+    Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
+        octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
+    issue_ingress_grant(&state, addr, &session, MAIN_PROFILE_ID, &token);
+    let app = crate::api::build_router(state.clone());
+    let _server = TestServer(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    }));
+    let mut socket = connect_ingress(addr, &session, &token).await;
+    await_ingress_bind(&mut socket, &session).await;
+    let (entered, release) = install_ingress_bind_admission_gate(&session);
+    let turn = TurnId::new();
+    socket
+        .send(ClientMessage::Text(
+            json!({
+                "jsonrpc":"2.0", "id":"turn-fence", "method":"turn/start",
+                "params":{"session_id":session,"turn_id":turn,"input":[{"kind":"text","text":"admit under the grant fence"}]},
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    entered.acquire().await.unwrap().forget();
+    let lock_probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.work_secret_store.path().with_extension("lock"))
+        .unwrap();
+    let contention = fs2::FileExt::try_lock_exclusive(&lock_probe)
+        .expect_err("turn snapshot must remain fenced before ActiveTurn insertion");
+    assert_eq!(contention.kind(), fs2::lock_contended_error().kind());
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(frame) = socket.next().await {
+            if let ClientMessage::Text(text) = frame.unwrap() {
+                let response: Value = serde_json::from_str(&text).unwrap();
+                if response["id"] == "turn-fence" {
+                    assert!(response.get("error").is_none(), "{response}");
+                    return;
+                }
+            }
+        }
+        panic!("socket closed before turn admission completed");
+    })
+    .await
+    .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock_probe)
+        .expect("completed turn admission must release the grant fence");
+    fs2::FileExt::unlock(&lock_probe).unwrap();
+    let cli_store = octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path());
+    assert!(cli_store.revoke_token(&token).unwrap());
+    socket.send(ClientMessage::Text("{}".into())).await.unwrap();
+    expect_revoked_close(&mut socket).await;
+}
+
 /// A pre-bind 1008 must retire the presented grant's old generation, without
 /// letting that delayed socket cancel a newer grant or post-revocation browser work.
 #[tokio::test]
@@ -519,10 +592,10 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
     let automatic_state = automatic.state.clone();
     active.lock().await.insert(session.clone(), automatic);
 
-    let admission = active.lock().await;
+    let bind_gate = install_ingress_bind_read_gate(&session);
     let mut rejected = connect_ingress(addr, &session, &token).await;
     assert!(state.work_secret_store.revoke_token(&token).unwrap());
-    drop(admission);
+    bind_gate.add_permits(1);
     expect_revoked_close(&mut rejected).await;
 
     assert_eq!(old.status(), octos_agent::TaskStatus::Cancelled);
@@ -596,12 +669,21 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
             .generation;
         let previous =
             BackgroundProbe::new(&contracts, &new_session, &profile, previous_generation);
-        let mut admission = active.lock().await;
+        let bind_gate = install_ingress_bind_read_gate(&new_session);
         let mut stale = connect_ingress(addr, &new_session, &old_token).await;
         issue_ingress_grant(&state, addr, &new_session, &profile, &new_token);
-        let replacement =
-            observe_background_grant(&state, &contracts, &ledger, &new_session, &profile, None)
-                .unwrap();
+        let grant_guard = lock_background_grant_observation(&new_session, &profile).await;
+        let mut admission = active.lock().await;
+        let replacement = observe_background_grant_read(
+            &load_background_grants(&state).await,
+            &contracts,
+            &ledger,
+            &new_session,
+            &profile,
+            None,
+            true,
+        )
+        .unwrap();
         let fresh =
             BackgroundProbe::new(&contracts, &new_session, &profile, replacement.generation);
         assert_eq!(previous.status(), octos_agent::TaskStatus::Cancelled);
@@ -612,6 +694,8 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
         let fresh_automatic_state = fresh_automatic.state.clone();
         admission.insert(new_session.clone(), fresh_automatic);
         drop(admission);
+        drop(grant_guard);
+        bind_gate.add_permits(1);
         // The already-bound old socket must also fail its per-frame revision
         // check when the same token string now authenticates a newer grant.
         previous_socket
@@ -652,7 +736,7 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
         &profile,
         browser_old_generation,
     );
-    let admission = active.lock().await;
+    let bind_gate = install_ingress_bind_read_gate(&browser_session);
     let mut browser_stale = connect_ingress(addr, &browser_session, &browser_token).await;
     assert!(
         state
@@ -660,19 +744,24 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
             .revoke_token(&browser_token)
             .unwrap()
     );
-    let browser = observe_background_grant(
-        &state,
+    let grant_guard = lock_background_grant_observation(&browser_session, &profile).await;
+    let admission = active.lock().await;
+    let browser = observe_background_grant_read(
+        &load_background_grants(&state).await,
         &contracts,
         &ledger,
         &browser_session,
         &profile,
         None,
+        true,
     )
     .unwrap();
     let browser_work =
         BackgroundProbe::new(&contracts, &browser_session, &profile, browser.generation);
     assert_eq!(browser_old.status(), octos_agent::TaskStatus::Cancelled);
     drop(admission);
+    drop(grant_guard);
+    bind_gate.add_permits(1);
     expect_revoked_close(&mut browser_stale).await;
     assert_eq!(browser_work.status(), octos_agent::TaskStatus::Running);
 

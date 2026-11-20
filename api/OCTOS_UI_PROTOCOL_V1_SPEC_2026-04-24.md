@@ -146,8 +146,17 @@ Session-ingress transport rules:
   conservatively included; other sessions/profiles are unaffected.
 - Authenticated ingress binding and interactive turn admission also observe the
   grant revision. A replaced or invalidated generation is retired before fresh
-  work is admitted. A stale socket's later text frame or teardown cannot cancel
-  work admitted under a newer grant or by a browser after that retirement.
+  work is admitted. Authoritative bind/turn snapshots hold a shared lock on the
+  stable `work_secrets.lock` sidecar through observation, background-work
+  admission, and ActiveTurn insertion; CLI issue/revoke/reissue uses the
+  corresponding exclusive lock across load→modify→rename. Thus a completed
+  mutation either precedes the snapshot or follows admission, never lands between
+  them. Snapshot lock/read work stays off the global turn-registry lock. If that
+  snapshot cannot be read, a bound work-secret caller fails closed; the existing
+  non-mutating fallback is limited to callers without an ingress generation.
+  A stale
+  socket's later text frame or teardown cannot cancel work admitted under a newer
+  grant or by a browser after that retirement.
   Queue ticks do not poll grants. Revoking and then disconnecting without another
   text frame, disconnecting before revocation, or leaving a sibling socket idle
   does not by itself trigger background cleanup. Valid-grant disconnect also

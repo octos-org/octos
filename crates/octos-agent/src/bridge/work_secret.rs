@@ -96,6 +96,21 @@ struct WorkSecretGrantFile {
     grants: Vec<WorkSecretGrantRecord>,
 }
 
+/// A grant-file snapshot fenced by a stable cross-process shared lock. The lock
+/// is acquired and the file read on a blocking worker; callers hold the guard
+/// through their admission linearization point so revoke/reissue cannot complete
+/// in between. The renamed JSON inode is never used as the lock target.
+pub struct WorkSecretGrantSnapshot {
+    records: Vec<WorkSecretGrantRecord>,
+    _lock: std::fs::File,
+}
+
+impl WorkSecretGrantSnapshot {
+    pub fn records(&self) -> &[WorkSecretGrantRecord] {
+        &self.records
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkSecretValidationError {
     Missing,
@@ -144,12 +159,13 @@ impl WorkSecretGrantStore {
             expires_at: now + ttl,
             revoked_at: None,
         };
+        let _lock = self.lock_grant_file(true)?;
         let mut file = self.load_file()?;
         file.grants.retain(|grant| {
             !(grant.token_hash == record.token_hash || grant.session_id == record.session_id)
         });
         file.grants.push(record.clone());
-        self.save_file(&file)?;
+        self.save_file_locked(&file)?;
         Ok(record)
     }
 
@@ -162,6 +178,24 @@ impl WorkSecretGrantStore {
             .load_file()
             .map_err(|_| WorkSecretValidationError::Missing)?;
         Self::validate_records_at(&file.grants, session_id, token, Utc::now())
+    }
+
+    /// Offload the blocking grant-file read so async transports do not park an
+    /// executor worker while a slow filesystem is being queried.
+    pub async fn validate_async(
+        &self,
+        session_id: &str,
+        token: &str,
+    ) -> std::result::Result<WorkSecretGrantRecord, WorkSecretValidationError> {
+        let store = self.clone();
+        let session_id = session_id.to_owned();
+        let token = token.to_owned();
+        tokio::task::spawn_blocking(move || store.validate(&session_id, &token))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "work-secret validation blocking task failed");
+                WorkSecretValidationError::Missing
+            })?
     }
 
     /// Validate against one grant-file snapshot and timestamp so a caller can
@@ -193,6 +227,7 @@ impl WorkSecretGrantStore {
 
     pub fn revoke_token(&self, token: &str) -> Result<bool> {
         let hash = hash_token(token);
+        let _lock = self.lock_grant_file(true)?;
         let mut file = self.load_file()?;
         let now = Utc::now();
         let mut changed = false;
@@ -205,13 +240,63 @@ impl WorkSecretGrantStore {
             }
         }
         if changed {
-            self.save_file(&file)?;
+            self.save_file_locked(&file)?;
         }
         Ok(changed)
     }
 
     pub fn list(&self) -> Result<Vec<WorkSecretGrantRecord>> {
         Ok(self.load_file()?.grants)
+    }
+
+    /// Async counterpart of [`Self::list`], keeping disk latency off the
+    /// caller's executor. Callers must invoke this BEFORE taking shared
+    /// admission locks rather than awaiting it while holding those locks.
+    pub async fn list_async(&self) -> Result<Vec<WorkSecretGrantRecord>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.list())
+            .await
+            .wrap_err("work-secret list blocking task failed")?
+    }
+
+    /// Read a consistent grant snapshot while holding a shared cross-process
+    /// admission fence. Both lock acquisition and file I/O stay off the async
+    /// executor and, crucially, happen before callers take `active_turns`.
+    pub async fn list_for_admission_async(&self) -> Result<WorkSecretGrantSnapshot> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let lock = store.lock_grant_file(false)?;
+            let records = store.load_file()?.grants;
+            Ok(WorkSecretGrantSnapshot {
+                records,
+                _lock: lock,
+            })
+        })
+        .await
+        .wrap_err("work-secret admission snapshot blocking task failed")?
+    }
+
+    fn lock_grant_file(&self, exclusive: bool) -> Result<std::fs::File> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).wrap_err_with(|| {
+                format!("failed to create grant lock dir: {}", parent.display())
+            })?;
+        }
+        let path = self.path.with_extension("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .wrap_err_with(|| format!("failed to open grant lock {}", path.display()))?;
+        if exclusive {
+            fs2::FileExt::lock_exclusive(&file)
+        } else {
+            fs2::FileExt::lock_shared(&file)
+        }
+        .wrap_err_with(|| format!("failed to lock grant store {}", path.display()))?;
+        Ok(file)
     }
 
     fn load_file(&self) -> Result<WorkSecretGrantFile> {
@@ -224,7 +309,7 @@ impl WorkSecretGrantStore {
             .wrap_err_with(|| format!("failed to parse {}", self.path.display()))
     }
 
-    fn save_file(&self, file: &WorkSecretGrantFile) -> Result<()> {
+    fn save_file_locked(&self, file: &WorkSecretGrantFile) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("failed to create dir: {}", parent.display()))?;
