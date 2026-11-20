@@ -115,7 +115,6 @@ impl TurnRunner for WsConnection {
                 // agent mirrors (same value run_standalone_turn receives).
                 run.resolved_profile_id.as_deref(),
                 fixture,
-                run.resolved_profile_id,
                 run.turn_state,
                 run.interrupt_rx,
             )
