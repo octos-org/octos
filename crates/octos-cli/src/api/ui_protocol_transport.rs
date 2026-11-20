@@ -27952,14 +27952,17 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
                             );
                         }
                         None => {
-                            crate::autonomy::human_events::flush_human_sink_drops(&ledger);
+                            crate::autonomy::human_events::flush_human_sink_drops(&ledger, std::time::Instant::now());
                             return;
                         }
                     }
                 }
                 _ = flush_tick.tick() => {}
             }
-            crate::autonomy::human_events::flush_human_sink_drops(&ledger);
+            crate::autonomy::human_events::flush_human_sink_drops(
+                &ledger,
+                std::time::Instant::now(),
+            );
         }
     });
 }

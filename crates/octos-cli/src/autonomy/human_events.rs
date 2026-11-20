@@ -233,6 +233,9 @@ pub(crate) fn emit_background_activity(mut event: BackgroundActivityEvent) {
 struct PendingSinkDrops {
     count: u64,
     template: BackgroundActivityEvent,
+    /// Last time a marker for this session was successfully appended. Bounds
+    /// marker writes to one per window even though the drain flushes often.
+    last_flushed: Option<Instant>,
 }
 
 fn pending_sink_drops() -> &'static StdMutex<HashMap<octos_core::SessionKey, PendingSinkDrops>> {
@@ -258,35 +261,59 @@ pub(crate) fn note_human_sink_drop(dropped: BackgroundActivityEvent) {
         .or_insert_with(|| PendingSinkDrops {
             count: 0,
             template: dropped.clone(),
+            last_flushed: None,
         });
     entry.count = entry.count.saturating_add(1);
     entry.template = dropped;
 }
 
-/// Drain-side persistence for [`note_human_sink_drop`]. Writes ONE gap marker
-/// per session with pending drops onto the same durable ledger as the drain,
-/// and clears a session's count ONLY after its append succeeded — a failed
-/// append leaves the count for the next flush, so no drop is ever lost.
+/// Minimum spacing between durable gap markers for one session. The drain
+/// flushes after every event and on a tick; the window keeps that from
+/// turning into a marker-per-burst write amplification on the same storage
+/// that is already slow enough to fill the queue.
+const HUMAN_SINK_GAP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Drain-side persistence for [`note_human_sink_drop`]. Writes AT MOST ONE
+/// gap marker per session per [`HUMAN_SINK_GAP_WINDOW`]; drops noted inside
+/// the window keep accumulating and merge into the NEXT window's marker.
+/// A session's count is cleared only after its append succeeded — a failed
+/// append leaves the full count for a later flush, so no drop is ever lost.
 /// Called from the drain task (never the producer), so the synchronous
 /// ledger append cannot stall an emitter.
 #[cfg(feature = "api")]
-pub(crate) fn flush_human_sink_drops(ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger) {
+pub(crate) fn flush_human_sink_drops(
+    ledger: &crate::api::ui_protocol_ledger::UiProtocolLedger,
+    now: Instant,
+) {
     loop {
         // Take ONE session's pending count out of the lock, append WITHOUT
-        // holding the map lock, and only then clear what was appended. If the
-        // append fails the count is restored (merged with any new drops).
-        let Some((session, count, template)) = ({
-            let mut pending = pending_sink_drops()
+        // holding the map lock, and only then clear what was appended. The
+        // last-flushed stamp stays behind so the window is honored even if
+        // the append fails.
+        let candidate = {
+            let pending = pending_sink_drops()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.keys().next().cloned().and_then(|session| {
-                pending
-                    .remove(&session)
-                    .map(|p| (session, p.count, p.template))
+            pending.iter().find_map(|(session, entry)| {
+                let window_open = entry
+                    .last_flushed
+                    .is_none_or(|last| now.duration_since(last) >= HUMAN_SINK_GAP_WINDOW);
+                (entry.count > 0 && window_open)
+                    .then(|| (session.clone(), entry.count, entry.template.clone()))
             })
-        }) else {
+        };
+        let Some((session, count, template)) = candidate else {
             return;
         };
+        // Mark the count as in-flight by zeroing it under the lock, so a
+        // concurrent note starts a NEW count instead of double-counting.
+        let mut pending = pending_sink_drops()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = pending.get_mut(&session) {
+            entry.count = entry.count.saturating_sub(count);
+        }
+        drop(pending);
         let mut marker = template.clone();
         marker.suppressed = true;
         marker.dropped_count = Some(count);
@@ -298,25 +325,30 @@ pub(crate) fn flush_human_sink_drops(ledger: &crate::api::ui_protocol_ledger::Ui
                 marker,
             ))
             .is_ok();
-        if !appended {
-            // Restore the un-appended count (merged with drops noted while we
-            // were appending) so the next flush retries with the full total.
-            let mut pending = pending_sink_drops()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let entry = pending.entry(session).or_insert_with(|| PendingSinkDrops {
-                count: 0,
-                template: template.clone(),
-            });
-            entry.count = entry.count.saturating_add(count);
-            // Stop flushing on failure: the ledger is unavailable; retry on
-            // the next drain tick rather than spinning on every session.
-            return;
+        let mut pending = pending_sink_drops()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if appended {
+            if let Some(entry) = pending.get_mut(&session) {
+                entry.last_flushed = Some(now);
+            }
+            // Continue with any OTHER session whose window is open.
+            continue;
         }
+        // Restore the un-appended count (merged with drops noted while we
+        // were appending) so a later flush retries with the full total, and
+        // stop: the ledger is unavailable, retry on a later drain tick.
+        let entry = pending.entry(session).or_insert_with(|| PendingSinkDrops {
+            count: 0,
+            template: template.clone(),
+            last_flushed: None,
+        });
+        entry.count = entry.count.saturating_add(count);
+        return;
     }
 }
 
-/// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`./// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`./// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
+/// Current wall clock in ms since the Unix epoch, for `emitted_at_ms`.
 pub(crate) fn now_ms_for_activity() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -401,12 +433,15 @@ mod tests {
     /// #2021 / alan0x review — the producer notes drops with NO ledger access
     /// (a full queue caused by slow storage must not stall the emitter on the
     /// same storage), drops noted while the writer is unavailable accumulate,
-    /// and once the writer resumes the flush persists ONE marker per burst
-    /// with the full count. A second flush writes nothing (counts are cleared
-    /// only after a successful append), so replay never duplicates markers.
+    /// and once the writer resumes the flush persists ONE marker with the
+    /// full count. Marker writes are bounded per window: a second burst
+    /// inside the window appends NOTHING, and its drops merge into the next
+    /// window's marker (lead-core rework: no marker-per-burst write
+    /// amplification on already-slow storage).
     #[test]
-    fn should_buffer_drops_while_writer_is_down_and_flush_exactly_once_on_recovery() {
+    fn should_buffer_drops_while_writer_is_down_and_flush_once_per_window_on_recovery() {
         let key = octos_core::SessionKey("web:tester#sink-gap-buffered".to_owned());
+        let now = Instant::now();
         // Writer "down": the producer only touches the in-memory counter and
         // returns immediately — no ledger exists at this point at all.
         for _ in 0..3 {
@@ -414,9 +449,9 @@ mod tests {
         }
         // Writer "resumes": the drain flushes; one durable gap row appears.
         let ledger = UiProtocolLedger::new(64);
-        flush_human_sink_drops(&ledger);
+        flush_human_sink_drops(&ledger, now);
         let events = replayed_activity(&ledger, &key);
-        assert_eq!(events.len(), 1, "one marker per burst: {events:?}");
+        assert_eq!(events.len(), 1, "one marker for the burst: {events:?}");
         assert!(events[0].suppressed);
         assert_eq!(
             events[0].dropped_count,
@@ -426,14 +461,33 @@ mod tests {
         assert_eq!(events[0].origin_id, "m1");
         assert!(events[0].text.contains("queue was full"));
         // Counts were cleared by the successful append: no duplicate marker.
-        flush_human_sink_drops(&ledger);
+        flush_human_sink_drops(&ledger, now);
         assert_eq!(replayed_activity(&ledger, &key).len(), 1);
-        // A new burst writes its own marker with its own count.
+
+        // A second burst INSIDE the window: no new marker (bounded writes).
         note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
-        flush_human_sink_drops(&ledger);
+        note_human_sink_drop(activity("web:tester#sink-gap-buffered", "m1", "lost"));
+        flush_human_sink_drops(&ledger, now + Duration::from_secs(5));
+        assert_eq!(
+            replayed_activity(&ledger, &key).len(),
+            1,
+            "window-bounded: the second burst appends nothing yet"
+        );
+        // After the window the buffered drops merge into the NEXT marker.
+        flush_human_sink_drops(
+            &ledger,
+            now + HUMAN_SINK_GAP_WINDOW + Duration::from_secs(1),
+        );
         let events = replayed_activity(&ledger, &key);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].dropped_count, Some(1));
+        assert_eq!(
+            events[1].dropped_count,
+            Some(2),
+            "window-inner drops merge forward"
+        );
+        // And nothing further without new drops.
+        flush_human_sink_drops(&ledger, now + 2 * HUMAN_SINK_GAP_WINDOW);
+        assert_eq!(replayed_activity(&ledger, &key).len(), 2);
     }
 
     /// #2021 — agent wake and UI stream are two READ-ONLY projections of one
@@ -450,7 +504,7 @@ mod tests {
             "first",
         )));
         note_human_sink_drop(activity("web:tester#dual-projection", "m1", "lost"));
-        flush_human_sink_drops(&ledger);
+        flush_human_sink_drops(&ledger, Instant::now());
         ledger.append_notification(UiNotification::BackgroundActivity(activity(
             "web:tester#dual-projection",
             "m1",
