@@ -78,6 +78,18 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 5 | `api::ui_protocol_transport::session_turn_service::tests::turn_start_matches_the_handler_on_admission_and_each_refusal` | Admission (registry owner and profile, connection turn, the turn run once through the caller's runner) and each refusal — no text, no runtime, foreign profile, occupied for ordinary and external callers, revoked work-secret grant — match between handler and service. |
 | 5 | `api::ui_protocol_transport::session_turn_service::tests::session_open_matches_the_handler_for_ordinary_ingress_and_foreign_scope` | Ordinary, work-secret ingress (filtered capabilities) and foreign-profile opens reply, record and write the same through the handler and the service. |
 
+## External turns (T-0637, `docs/IM_REMOTE_CONTROL.md` §14)
+
+`ExternalTurns` runs turns on the ledger-only connection against a real serve runtime, its durable ledger and existing chats, with a scripted model.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::ui_protocol_transport::external_turns::tests::only_an_existing_chat_of_a_served_profile_can_be_bound` | An unknown profile, another profile's or an unprofiled session, a topic, a Code session, a chat that was never made and a broken chat cannot be bound; nothing falls back to `_main` or another session. |
+| 1 | `api::ui_protocol_transport::external_turns::tests::a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_writes` | A turn with no socket writes the same durable rows, reply included, as an external WebSocket client's turn, and is offered no tool beyond the external allowlist. |
+| 4 | `api::ui_protocol_transport::external_turns::tests::a_turn_id_runs_once_and_only_in_its_own_chat` | Starting a running or ended turn id again returns its record and runs nothing; the same id names no turn in another chat. |
+| 4 | `api::ui_protocol_transport::external_turns::tests::after_a_restart_each_recorded_turn_is_settled_by_its_exact_id` | After a restart, a recorded turn that never started may run, one cut off mid-turn is orphaned and never rerun, an ended one is reported once and forgotten. |
+| 3 | `api::ui_protocol_transport::external_turns::tests::the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope` | The entry cannot answer another connection's approval or interrupt another connection's turn; its own approval is answered without recording the requested session scope. |
+
 ## Peer host tools and shared history
 
 | Cat. | Exact test | Guard |

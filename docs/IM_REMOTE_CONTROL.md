@@ -148,6 +148,15 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 已准入的 turn 仍由调用方的 runner 执行；WebSocket 的 runner 是 `run_standalone_turn`，它在约 70 处直接向自己的连接投递。bridge（T-0637）需要一个不经 socket、只写 ledger 的 runner，这是下一刀，不能用"分离的 `WsConnection`"凑。
 
+第二刀 a（T-0637，按 T-0633 评审的 B1/B2/B5/B6 收窄）：
+
+- **runner**：`run_standalone_turn` 和它调用的发送 helper 改为经 `TurnConnection` 投递（`crates/octos-cli/src/api/ui_protocol_turn_connection.rs`）。`WsConnection` 照旧直送自己的客户端并写 ledger；`LedgerConnection` 没有客户端，turn 的持久事件只经 session ledger 到达读者。
+- **内部入口 `ExternalTurns`**（`ui_protocol_external_turns.rs`）：
+  - 每个调用都带 `BoundChat`：`BoundProfile` 是本 server 服务的 profile；session 必须是这个 profile 的、已存在且可用的 Chat，带 profile 前缀、不带 topic。Code session 不能绑定。没有 `Option` profile，不退到 `_main`，不跨 profile 查找，也不改开别的 session。
+  - turn_id 由调用方给。`start` 先在 profile 数据目录（`external_turns/`）落盘这个 id，再启动 turn；同一 id 再来时，返回第一次的结果，不再执行。重启后 `reconcile` 按精确 turn_id 报告每个已记录的 turn：未开始、运行中、已结束，或被重启打断（ledger 重载时补的 `orphaned_by_restart`，不重跑）。不按摘要或时间窗猜测。
+  - turn 是 external（UPCR-2026-036）：只保留 external 工具白名单；别处授予的 session 级批准对它不生效；它只能停、只能批自己的 turn 和审批，批准时请求的 scope 一律丢弃。
+- 还没有调用方。fake Channel 绑定核心是 T-0653，配置和单 owner 是 T-0654；附件、IM 审批 UI、持久 outbox 都不在这一刀。
+
 ## 15. 待 Claude / shu 定（本文不擅自决定）
 
 1. **首渠道**：Telegram（实现最简）还是飞书/企业微信（国内用户主阵地，WorkBuddy 对标）——T-0093 已明确此项归 shu。
