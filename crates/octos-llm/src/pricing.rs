@@ -91,6 +91,35 @@ pub fn seed_pricing_catalog(entries: &[(String, f64, f64)]) {
     *PRICING_CATALOG.write().unwrap_or_else(|e| e.into_inner()) = Some(map);
 }
 
+/// Exact catalog hit: the deployment's own rate for this id wins over
+/// every other source.
+fn catalog_exact(model_id: &str) -> Option<ModelPricing> {
+    let guard = PRICING_CATALOG.read().ok()?;
+    let map = guard.as_ref()?;
+    map.get(&model_id.to_lowercase()).copied()
+}
+
+/// List price from `llm-prices` (dated, source-cited rows) for an
+/// Anthropic, OpenAI or Google model the catalog does not carry.
+///
+/// Checked before the catalog's substring match and the hardcoded table
+/// below, because both guess from a family name: `gpt-5.5` and `gpt-5-mini`
+/// contain the catalog key `gpt-5` and were billed at its $1.25/$10 rate
+/// (list: $5/$30 and $0.25/$2), and every `claude-opus-4*` id the catalog
+/// lacks fell through to the Opus 4.0 rate of $15/$75 (Opus 4.5 and later
+/// list at $5/$25). Other providers keep the existing behaviour: DeepSeek,
+/// for one, is deliberately priced at its off-peak rate here.
+fn list_pricing(model_id: &str) -> Option<ModelPricing> {
+    let row = llm_prices::lookup(model_id)?;
+    if !matches!(row.provider, "anthropic" | "openai" | "google") {
+        return None;
+    }
+    Some(ModelPricing {
+        input_per_million: row.input?,
+        output_per_million: row.output?,
+    })
+}
+
 fn catalog_pricing(model_id: &str) -> Option<ModelPricing> {
     let guard = PRICING_CATALOG.read().ok()?;
     let map = guard.as_ref()?;
@@ -346,10 +375,20 @@ impl ModelPricing {
     }
 }
 
-/// Look up pricing for a model. Checks the runtime catalog first,
-/// falls back to hardcoded defaults for models not in the catalog.
+/// Look up pricing for a model. Checks the runtime catalog first, then the
+/// provider list price for Anthropic, OpenAI and Google ids the catalog does
+/// not carry, then falls back to hardcoded defaults.
 pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
-    // Check runtime catalog first (populated from model_catalog.json)
+    // An exact catalog entry (populated from model_catalog.json) always wins.
+    if let Some(pricing) = catalog_exact(model_id) {
+        return Some(pricing);
+    }
+    // A listed first-party model the catalog lacks: its own list price, not a
+    // family guess.
+    if let Some(pricing) = list_pricing(model_id) {
+        return Some(pricing);
+    }
+    // Catalog substring/family match
     if let Some(pricing) = catalog_pricing(model_id) {
         return Some(pricing);
     }
@@ -562,6 +601,40 @@ pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rates(model: &str) -> (f64, f64) {
+        let p = model_pricing(model).unwrap_or_else(|| panic!("no price for {model}"));
+        (p.input_per_million, p.output_per_million)
+    }
+
+    #[test]
+    fn should_price_uncatalogued_first_party_models_at_list_price() {
+        // Contain the `gpt-5` family key, but are priced differently.
+        assert_eq!(rates("gpt-5.5"), (5.0, 30.0));
+        assert_eq!(rates("gpt-5-mini"), (0.25, 2.0));
+        assert_eq!(rates("gpt-5.4"), (2.5, 15.0));
+        // Opus 4.5+ list at $5/$25, not the Opus 4.0 rate of $15/$75.
+        assert_eq!(rates("claude-opus-4-8"), (5.0, 25.0));
+        assert_eq!(rates("claude-opus-4-1-20250805"), (15.0, 75.0));
+        // Haiku 4.5 is $1/$5, not the Haiku 3.5 rate.
+        assert_eq!(rates("claude-haiku-4-5-20251001"), (1.0, 5.0));
+        // o3 and o4-mini were both billed at $10/$40.
+        assert_eq!(rates("o3"), (2.0, 8.0));
+        assert_eq!(rates("o4-mini"), (1.1, 4.4));
+        // Gemini 2.5 Pro was billed at the Gemini 1.5 Flash rate.
+        assert_eq!(rates("gemini-2.5-pro"), (1.25, 10.0));
+    }
+
+    #[test]
+    fn should_leave_resellers_and_other_providers_to_existing_rules() {
+        // Re-hosted lanes have their own rates: never the maker's list price.
+        assert!(list_pricing("openrouter/anthropic/claude-opus-4.8").is_none());
+        assert!(list_pricing("us.anthropic.claude-sonnet-4-6").is_none());
+        // DeepSeek keeps its off-peak rate from the hardcoded table.
+        assert!(list_pricing("deepseek-flash").is_none());
+        assert_eq!(rates("deepseek-flash"), (0.15, 0.60));
+        assert!(list_pricing("not-a-model").is_none());
+    }
 
     #[test]
     fn should_price_unknown_provider_cache_reads_at_full_input_rate_and_writes_never_free() {
