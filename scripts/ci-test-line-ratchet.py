@@ -198,10 +198,17 @@ def review_approved(
             if len(batch) < 100:
                 break
             page += 1
+    # A review COMMENT does not supersede an approval — GitHub's own
+    # approval accounting treats COMMENTED (and PENDING) reviews as
+    # non-decisions, and alan0x routinely leaves a plain comment after
+    # approving. Skip them when picking each maintainer's latest review
+    # so the ratchet and the merge gate read the same verdict.
     latest: dict[str, dict] = {}
     for review in reviews:
         login = review.get("user", {}).get("login")
         if login not in MAINTAINERS:
+            continue
+        if review.get("state") in ("COMMENTED", "PENDING"):
             continue
         latest[login] = review  # the list is chronological; last wins
     # Any ONE maintainer approving the current head exempts — check all of
@@ -490,6 +497,17 @@ def self_test(repo_root: Path) -> None:
         out = run_case("review-two", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
         assert "BH3GEI approved the current head" in out, out
+
+        # Claude ruling 2026-11-20: a plain review COMMENT after approving
+        # the current head does not revoke the approval.
+        repo, base, head = fixture_repo(root / "review-commented", 2)
+        fixture = reviews_fixture(root / "commented.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": head},
+            {"user": {"login": "alan0x"}, "state": "COMMENTED", "commit_id": head},
+        )
+        out = run_case("review-commented", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--reviews-json", fixture, expect=0)
+        assert "alan0x approved the current head" in out, out
 
         # Label still exempts without any approval (original behavior).
         label_only = root / "label-only.json"
