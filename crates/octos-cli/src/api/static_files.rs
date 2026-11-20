@@ -441,10 +441,11 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
 
 /// RFC #3262 step 1 (T-0608): serve the octos-web SPA index with a static
 /// deprecation banner injected before `</body>`, announcing that `/app` is
-/// deprecated and octoscode-web is the replacement. Text-only injection —
-/// no scripts — so the page's own scripts are untouched and the change is
-/// removable in step 2 by deleting the submodule. A full document (no
-/// `</body>`) is served unmodified rather than mangled.
+/// deprecated and octoscode-web is the replacement. The banner is a plain
+/// text-and-anchors div — no scripts, no dismiss handler (step 1 does not
+/// require dismissing) — so the page's own scripts are untouched and the
+/// change is removable in step 2 by deleting the submodule. A full document
+/// (no `</body>`) is served unmodified rather than mangled.
 fn serve_html_with_deprecation_banner(path: &str, data: &[u8]) -> Response {
     const BANNER: &str = concat!(
         r#"<div id="octos-app-deprecation" role="status" "#,
@@ -454,9 +455,7 @@ fn serve_html_with_deprecation_banner(path: &str, data: &[u8]) -> Response {
         r#"<strong>Deprecation:</strong> the /app web client (octos-web) is deprecated and will "#,
         r#"be removed in a future release. Use "#,
         r#"<a href="https://github.com/octos-org/octoscode-web" style="color:#fde68a;">"#,
-        r#"octoscode-web</a> instead. — <a href='#' "#,
-        r#"onclick="this.parentElement.remove();return false;" "#,
-        r#"style="color:#fde68a;">dismiss</a></div>"#
+        r#"octoscode-web</a> instead.</div>"#
     );
     let body = match std::str::from_utf8(data) {
         Ok(text) if text.contains("</body>") => text
@@ -470,50 +469,64 @@ fn serve_html_with_deprecation_banner(path: &str, data: &[u8]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::AppState;
 
-    /// RFC #3262 step 1 (T-0608): the /app index document carries the
-    /// deprecation banner exactly once; asset files (hashed JS/CSS) pass
-    /// through byte-identical.
-    #[test]
-    fn should_inject_the_deprecation_banner_into_the_app_index_only() {
+    /// In-memory asset store standing in for the embedded bundles.
+    struct MapStore(std::collections::HashMap<String, Vec<u8>>);
+    impl AssetStore for MapStore {
+        fn get(&self, path: &str) -> Option<Vec<u8>> {
+            self.0.get(path).cloned()
+        }
+    }
+
+    /// RFC #3262 step 1 (T-0608) via the REAL route: a request for `/app/`
+    /// (the SPA index) returns the deprecation banner injected before
+    /// </body>, while a content-hashed asset under `/app/assets/` passes
+    /// through byte-identical. Exercising `serve_with` means a routing
+    /// mistake that bannered the assets too would fail here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_inject_the_deprecation_banner_into_the_app_index_only() {
         let index = b"<html><head></head><body><div id=\"root\"></div></body></html>".to_vec();
-        let response = serve_html_with_deprecation_banner(WEB_INDEX, &index);
-        let body = response_body(response);
-        let text = String::from_utf8(body).unwrap();
+        let asset = b"const x=1; /* no html */".to_vec();
+        let store = MapStore(std::collections::HashMap::from([
+            (WEB_INDEX.to_string(), index.clone()),
+            ("web/assets/index-abc123.js".to_string(), asset.clone()),
+        ]));
+        let state = AppState::empty_for_tests();
+
+        let index_response = serve_with(&store, &state, "app/").await;
+        let index_body = axum::body::to_bytes(index_response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect index body");
+        let text = String::from_utf8(index_body.to_vec()).expect("index is utf-8");
         assert_eq!(text.matches("octos-app-deprecation").count(), 1, "{text}");
         assert!(
             text.contains(r#"href="https://github.com/octos-org/octoscode-web""#),
             "banner points at octoscode-web: {text}"
         );
-        assert!(
-            text.matches("</body>").count() == 1 && text.contains("</div></body>"),
-            "{text}"
-        );
+        assert_eq!(text.matches("</body>").count(), 1, "{text}");
+        assert!(text.contains("</div></body>"), "{text}");
 
-        // Assets (content-hashed names) stay byte-identical.
-        let asset = b"const x=1; /* no html */".to_vec();
-        let response = serve_html_with_deprecation_banner("web/assets/index-abc123.js", &asset);
-        let body = response_body(response);
-        assert_eq!(body, asset, "asset bytes are untouched");
+        let asset_response = serve_with(&store, &state, "app/assets/index-abc123.js").await;
+        let asset_body = axum::body::to_bytes(asset_response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect asset body");
+        assert_eq!(
+            asset_body.to_vec(),
+            asset,
+            "content-hashed asset bytes are untouched by the real route"
+        );
     }
 
     /// #3262: an index without a closing </body> is served unmodified rather
     /// than mangled.
-    #[test]
-    fn should_serve_a_body_less_index_unmodified() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_serve_a_body_less_index_unmodified() {
         let index = b"<html><head></head></html>".to_vec();
         let response = serve_html_with_deprecation_banner(WEB_INDEX, &index);
-        assert_eq!(response_body(response), index, "no </body> → no injection");
-    }
-
-    fn response_body(response: Response) -> Vec<u8> {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async move {
-                axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
-                    .await
-                    .expect("collect body")
-                    .to_vec()
-            })
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect body");
+        assert_eq!(body.to_vec(), index, "no </body> → no injection");
     }
 }
