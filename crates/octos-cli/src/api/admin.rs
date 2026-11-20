@@ -4012,18 +4012,10 @@ pub async fn list_cron_jobs(
         .jobs
         .iter()
         .map(|j| {
-            let next_in = j.state.next_run_at_ms.map(|t| {
-                let secs = (t - now_ms) / 1000;
-                if secs < 0 {
-                    "overdue".to_string()
-                } else if secs < 60 {
-                    format!("{secs}s")
-                } else if secs < 3600 {
-                    format!("{}m", secs / 60)
-                } else {
-                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-                }
-            });
+            let next_in = j
+                .state
+                .next_run_at_ms
+                .map(|t| super::cron_panel::format_next_in(t, now_ms));
             let last_run = j.state.last_run_at_ms.map(|t| {
                 chrono::DateTime::from_timestamp_millis(t)
                     .map(|dt| dt.to_rfc3339())

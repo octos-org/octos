@@ -98,10 +98,17 @@ impl CronService {
 
         {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut invalid = false;
             for job in &mut store.jobs {
+                let was_enabled = job.enabled;
                 if job.enabled && job.state.next_run_at_ms.is_none() {
                     job.compute_next_run(now_ms);
                 }
+                invalid |= job.disable_invalid_timestamps() || (was_enabled && !job.enabled);
+            }
+            if invalid && let Err(error) = persist_store_locked(&self.store_path, &store) {
+                // Keep quarantined work disabled in memory even when disk is unavailable.
+                warn!(%error, "failed to persist invalid cron timestamps; restart will retry quarantine");
             }
         }
 
@@ -210,6 +217,12 @@ impl CronService {
         origin: CronOrigin,
     ) -> Result<CronJob> {
         let now_ms = Utc::now().timestamp_millis();
+        if let CronSchedule::At { at_ms } = schedule {
+            eyre::ensure!(
+                crate::cron_types::is_supported_cron_run_at_ms(at_ms),
+                "invalid At timestamp: expected a representable UTC instant before 2100"
+            );
+        }
         let id = short_id();
 
         let delete_after_run = matches!(schedule, CronSchedule::At { .. });
@@ -446,7 +459,15 @@ impl CronService {
         }
 
         let earliest_ms = {
-            let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+            // A reconciling toggle may have loaded other, invalid persisted jobs.
+            let mut invalid = false;
+            for job in &mut store.jobs {
+                invalid |= job.disable_invalid_timestamps();
+            }
+            if invalid && let Err(error) = persist_store_locked(&self.store_path, &store) {
+                warn!(%error, "failed to persist invalid cron timestamps; restart will retry quarantine");
+            }
             store
                 .jobs
                 .iter()
@@ -460,7 +481,7 @@ impl CronService {
         };
 
         let now_ms = Utc::now().timestamp_millis();
-        let delay_ms = (target_ms - now_ms).max(0) as u64;
+        let delay_ms = target_ms.saturating_sub(now_ms).max(0) as u64;
 
         let this = std::sync::Arc::clone(self);
 
@@ -645,6 +666,7 @@ impl CronService {
                     if reserve.delivery.is_none() {
                         stored_job.state.last_run_at_ms = Some(now_ms);
                         stored_job.state.last_status = Some("ok".into());
+                        stored_job.state.last_error = None;
 
                         if stored_job.delete_after_run {
                             to_delete.push(stored_job.id.clone());
@@ -1034,6 +1056,152 @@ mod tests {
 
     fn every_minute() -> CronSchedule {
         CronSchedule::Every { every_ms: 60_000 }
+    }
+
+    #[tokio::test]
+    async fn should_isolate_invalid_timestamps_and_recover_repaired_jobs() {
+        // A wrapped deadline or invalid At must neither panic nor starve the
+        // real 500ms neighbour, and saturating to zero must not execute bad work.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let (tx, mut rx) = mpsc::channel(32);
+        let seed = std::sync::Arc::new(CronService::new(&path, tx.clone()));
+        let normal = seed
+            .add_job(
+                "normal".into(),
+                CronSchedule::Every { every_ms: 500 },
+                payload("normal", Default::default()),
+            )
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        let mut jobs = vec![normal.clone()];
+        for (id, schedule, next) in [
+            ("wrapped", every_minute(), Some(now.wrapping_add(i64::MAX))),
+            ("at-min", CronSchedule::At { at_ms: i64::MIN }, None),
+            ("at-cached", CronSchedule::At { at_ms: i64::MIN }, Some(now)),
+            (
+                "at-max",
+                CronSchedule::At { at_ms: i64::MAX },
+                Some(i64::MAX),
+            ),
+            (
+                "overdue",
+                CronSchedule::At { at_ms: now - 1000 },
+                Some(now - 1000),
+            ),
+        ] {
+            let mut job = normal.clone();
+            job.id = id.into();
+            job.payload.message = id.into();
+            job.schedule = schedule;
+            job.state.next_run_at_ms = next;
+            jobs.push(job);
+        }
+        persist_store_locked(&path, &CronStore { version: 1, jobs }).unwrap();
+        drop(seed);
+        let service = std::sync::Arc::new(CronService::new(&path, tx.clone()));
+        service.start();
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(2500), async {
+            let (mut normal_fires, mut overdue_fires) = (0, 0);
+            while normal_fires < 3 || overdue_fires < 1 {
+                match rx.recv().await.unwrap().content.as_str() {
+                    "normal" => normal_fires += 1,
+                    "overdue" => overdue_fires += 1,
+                    other => panic!("invalid job fired: {other}"),
+                }
+                assert!(overdue_fires <= 1);
+            }
+        })
+        .await;
+        observed.expect("invalid persisted timestamp starved the healthy 500ms job");
+        // A live reconciliation also isolates invalid rows loaded from disk.
+        let mut imported: CronStore =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut bad = normal.clone();
+        bad.id = "reloaded".into();
+        bad.state.next_run_at_ms = Some(i64::MIN);
+        imported.jobs.push(bad);
+        persist_store_locked(&path, &imported).unwrap();
+        service
+            .toggle_job_reconciling(&normal.id, true)
+            .unwrap()
+            .unwrap();
+        service.stop().await;
+        let mut stored: CronStore = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for id in ["wrapped", "at-min", "at-cached", "at-max", "reloaded"] {
+            let job = stored
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .expect("invalid job retained for repair");
+            assert!(!job.enabled, "{}", job.id);
+            assert_eq!(job.state.next_run_at_ms, None);
+            assert_eq!(job.state.last_status.as_deref(), Some("error"));
+            assert!(
+                job.state
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("timestamp")
+            );
+        }
+        // Repair the schedule on disk, then reconcile+enable in the same service.
+        let repaired = stored.jobs.iter_mut().find(|j| j.id == "at-min").unwrap();
+        repaired.schedule = CronSchedule::At {
+            at_ms: Utc::now().timestamp_millis() + 50,
+        };
+        persist_store_locked(&path, &stored).unwrap();
+        assert!(
+            service
+                .toggle_job_reconciling("at-min", true)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        drop(service);
+        // Restart proves quarantine was durable and repaired work can execute.
+        let restarted = std::sync::Arc::new(CronService::new(&path, tx));
+        restarted.start();
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let msg = rx.recv().await.unwrap();
+                if msg.content == "at-min" {
+                    break;
+                }
+                assert_eq!(msg.content, "normal");
+            }
+        })
+        .await;
+        restarted.stop().await;
+        recovered.expect("repaired At job did not resume");
+        let recovered_job = restarted
+            .list_all_jobs()
+            .into_iter()
+            .find(|j| j.id == "at-min")
+            .unwrap();
+        assert_eq!(recovered_job.state.last_status.as_deref(), Some("ok"));
+        assert_eq!(recovered_job.state.last_error, None);
+    }
+
+    #[test]
+    fn should_reject_invalid_at_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let (tx, _rx) = mpsc::channel(1);
+        let service = std::sync::Arc::new(CronService::new(&path, tx));
+        for at_ms in [i64::MIN, i64::MAX] {
+            assert!(
+                service
+                    .add_job(
+                        "bad".into(),
+                        CronSchedule::At { at_ms },
+                        payload("bad", Default::default())
+                    )
+                    .is_err()
+            );
+            assert!(!path.exists());
+            assert!(service.list_all_jobs().is_empty());
+        }
     }
 
     #[test]

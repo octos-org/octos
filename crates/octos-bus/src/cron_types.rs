@@ -250,14 +250,15 @@ pub fn is_valid_cron_timezone(timezone: &str) -> bool {
     timezone.parse::<chrono_tz::Tz>().is_ok()
 }
 
-/// Whether a run timestamp is within the product's 2099-12-31 boundary.
+/// Whether a run timestamp is representable and before the product's 2100 boundary.
 pub fn is_supported_cron_run_at_ms(run_at_ms: i64) -> bool {
     use chrono::TimeZone;
 
-    chrono::Utc
-        .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
-        .single()
-        .is_some_and(|end| run_at_ms < end.timestamp_millis())
+    chrono::DateTime::from_timestamp_millis(run_at_ms).is_some()
+        && chrono::Utc
+            .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+            .single()
+            .is_some_and(|end| run_at_ms < end.timestamp_millis())
 }
 
 /// Compute an Every deadline without overflowing or exceeding the product's
@@ -311,6 +312,35 @@ impl CronJob {
                 }
             }
         }
+        self.disable_invalid_timestamps();
+    }
+
+    /// Quarantine only this job when persisted timing cannot denote a UTC instant.
+    /// Keep its schedule for repair; a later explicit enable recomputes the deadline.
+    /// Representable overdue and legacy post-2099 schedules retain their semantics.
+    pub(crate) fn disable_invalid_timestamps(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let invalid_at = match self.schedule {
+            CronSchedule::At { at_ms } => chrono::DateTime::from_timestamp_millis(at_ms).is_none(),
+            _ => false,
+        };
+        let invalid_next = self
+            .state
+            .next_run_at_ms
+            .is_some_and(|at_ms| chrono::DateTime::from_timestamp_millis(at_ms).is_none());
+        if !invalid_at && !invalid_next {
+            return false;
+        }
+        let reason = "invalid timestamp: repair the schedule and re-enable this job";
+        tracing::warn!(job_id = %self.id, next_run_at_ms = ?self.state.next_run_at_ms,
+            invalid_at, "{reason}");
+        self.enabled = false;
+        self.state.next_run_at_ms = None;
+        self.state.last_status = Some("error".into());
+        self.state.last_error = Some(reason.into());
+        true
     }
 
     /// Returns true if this job is due to run.
@@ -391,6 +421,9 @@ mod tests {
         assert_eq!(next_every_run_at_ms(now, 60_000), Some(now + 60_000));
         // At run times share the same 2099 boundary.
         assert!(is_supported_cron_run_at_ms(now));
+        assert!(!is_supported_cron_run_at_ms(i64::MIN));
+        assert!(!is_supported_cron_run_at_ms(i64::MAX));
+        assert!(is_supported_cron_run_at_ms(-1)); // A valid overdue instant.
         let end = chrono::DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
             .unwrap()
             .timestamp_millis();
