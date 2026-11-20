@@ -116,13 +116,55 @@ fn load_store(path: &std::path::Path) -> CronStore {
         .unwrap_or_default()
 }
 
-fn save_store(path: &std::path::Path, store: &CronStore) -> Result<()> {
+fn save_store(path: &std::path::Path, store: &impl serde::Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent).wrap_err("failed to create cron store directory")?;
     }
     let json = serde_json::to_string_pretty(store).wrap_err("failed to serialize cron store")?;
-    std::fs::write(path, json).wrap_err("failed to write cron store")?;
-    Ok(())
+    octos_bus::write_cron_json_atomic(path, &json).wrap_err("failed to write cron store")
+}
+
+/// Add/remove preserve untouched job bytes, including omitted defaults and
+/// fields written by newer versions. Only an absent store starts empty.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct EditableCronStore {
+    version: u32,
+    jobs: Vec<Box<serde_json::value::RawValue>>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl EditableCronStore {
+    fn load(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str(&content).wrap_err("failed to parse cron store"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                version: CronStore::default().version,
+                jobs: Vec::new(),
+                extra: Default::default(),
+            }),
+            Err(error) => Err(error).wrap_err("failed to read cron store"),
+        }
+    }
+
+    fn job_ids(&self) -> Result<Vec<String>> {
+        self.jobs
+            .iter()
+            .map(|raw| {
+                serde_json::from_str::<CronJob>(raw.get())
+                    .map(|job| job.id)
+                    .wrap_err("failed to parse stored cron job")
+            })
+            .collect()
+    }
+}
+
+fn unused_id(store: &EditableCronStore, mut candidate: String) -> Result<String> {
+    let occupied: std::collections::HashSet<_> = store.job_ids()?.into_iter().collect();
+    while occupied.contains(&candidate) {
+        candidate = short_id();
+    }
+    Ok(candidate)
 }
 
 fn format_schedule(schedule: &CronSchedule) -> String {
@@ -239,7 +281,8 @@ fn cmd_add(
     };
 
     let delete_after_run = matches!(schedule, CronSchedule::At { .. });
-    let id = short_id();
+    let mut store = EditableCronStore::load(store_path)?;
+    let id = unused_id(&store, short_id())?;
 
     let mut job = CronJob {
         id: id.clone(),
@@ -263,8 +306,7 @@ fn cmd_add(
     };
     job.compute_next_run(now_ms);
 
-    let mut store = load_store(store_path);
-    store.jobs.push(job);
+    store.jobs.push(serde_json::value::to_raw_value(&job)?);
     save_store(store_path, &store)?;
 
     println!("{} Added job '{}' ({})", "OK".green(), name, id.cyan());
@@ -272,20 +314,29 @@ fn cmd_add(
 }
 
 fn cmd_remove(store_path: &std::path::Path, job_id: &str) -> Result<()> {
-    let mut store = load_store(store_path);
-    let before = store.jobs.len();
-    store.jobs.retain(|j| j.id != job_id);
-
-    if store.jobs.len() < before {
-        save_store(store_path, &store)?;
-        println!("{} Removed job {}", "OK".green(), job_id.cyan());
-        Ok(())
-    } else {
-        eyre::bail!(
+    let mut store = EditableCronStore::load(store_path)?;
+    let ids = store.job_ids()?;
+    let matches: Vec<_> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| *id == job_id)
+        .collect();
+    let index = match matches.as_slice() {
+        [(index, _)] => *index,
+        [] => eyre::bail!(
             "No cron job with id '{job_id}'. Run 'octos cron list' for active ids \
              ('--all' includes disabled ones)."
-        );
-    }
+        ),
+        _ => eyre::bail!(
+            "ambiguous cron job id '{job_id}': {} stored jobs match; resolve duplicate ids in {} before removing a job (nothing changed)",
+            matches.len(),
+            store_path.display()
+        ),
+    };
+    store.jobs.remove(index);
+    save_store(store_path, &store)?;
+    println!("{} Removed job {}", "OK".green(), job_id.cyan());
+    Ok(())
 }
 
 fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Result<()> {
@@ -320,8 +371,8 @@ fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Resu
 }
 
 fn short_id() -> String {
-    let id = uuid::Uuid::now_v7();
-    format!("{:x}", id.as_u128())[..8].to_string()
+    // A v7 prefix is only a timestamp. Use random bits, then check the store.
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -330,5 +381,114 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let end: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{end}...")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY: &str = r#"{ "id":"legacy", "name":"old", "enabled":true,
+      "schedule":{"kind":"Cron","expr":"0 0 9 * * 2"},
+      "payload":{"message":"keep me","channel":null,"chat_id":null},
+      "state":{"next_run_at_ms":1800000000000,"last_run_at_ms":null,"last_status":null},
+      "created_at_ms":1,"delete_after_run":false,"future_field":{"keep":[1, 2]} }"#;
+
+    fn add(path: &std::path::Path, name: &str) {
+        cmd_add(
+            path,
+            name.into(),
+            name.into(),
+            Some(60),
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn should_create_distinct_ids_and_remove_only_one_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        for name in ["first", "second", "third", "fourth"] {
+            add(&path, name);
+        }
+        let before = load_store(&path);
+        let ids: std::collections::HashSet<_> = before.jobs.iter().map(|j| &j.id).collect();
+        assert_eq!(ids.len(), 4, "consecutive creations must not share an id");
+        cmd_remove(&path, &before.jobs[1].id).unwrap();
+        let after = load_store(&path);
+        let kept: Vec<_> = before
+            .jobs
+            .into_iter()
+            .filter(|j| j.name != "second")
+            .collect();
+        assert_eq!(
+            serde_json::to_value(after.jobs).unwrap(),
+            serde_json::to_value(kept).unwrap()
+        );
+    }
+
+    #[test]
+    fn should_refuse_ambiguous_historical_ids_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let contents = format!("{{\"version\":1,\"jobs\":[{LEGACY},{LEGACY}]}}");
+        std::fs::write(&path, &contents).unwrap();
+        let error = cmd_remove(&path, "legacy").unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        assert!(cmd_remove(&path, "missing").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn should_preserve_other_jobs_raw_bytes_across_add_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        std::fs::write(&path, format!("{{\"version\":1,\"jobs\":[{LEGACY}]}}")).unwrap();
+        add(&path, "new");
+        let after_add = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_add.contains(LEGACY),
+            "add rewrote an unrelated legacy job"
+        );
+        let new_id = load_store(&path).jobs[1].id.clone();
+        cmd_remove(&path, &new_id).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(LEGACY));
+        assert_eq!(load_store(&path).jobs.len(), 1);
+    }
+
+    #[test]
+    fn should_retry_an_occupied_id_and_refuse_unreadable_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let bytes = format!("{{\"version\":1,\"jobs\":[{LEGACY}]}}");
+        std::fs::write(&path, &bytes).unwrap();
+        let store = EditableCronStore::load(&path).unwrap();
+        let chosen = unused_id(&store, "legacy".into()).unwrap();
+        assert_ne!(chosen, "legacy", "occupied candidate must be regenerated");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(
+            cmd_add(
+                &path,
+                "new".into(),
+                "new".into(),
+                Some(60),
+                None,
+                None,
+                false,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(cmd_remove(&path, "legacy").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        assert!(EditableCronStore::load(dir.path()).is_err());
     }
 }

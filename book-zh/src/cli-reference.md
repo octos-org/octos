@@ -234,6 +234,11 @@ octos cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00
 
 Cron 表达式使用标准语法。任务支持可选的 `timezone` 字段，使用 IANA 时区名称（如 `"America/New_York"`、`"Asia/Shanghai"`）。未指定时默认使用 UTC。
 
+CLI 创建任务时选择存储中尚未占用的随机 ID。添加和删除保留其他任务的原始 JSON
+及调度。若待删除 ID 匹配多个历史任务，操作会报错且不写盘；请先解决
+`.octos/cron.json` 中的重复 ID 再重试。CLI 不会自动改名旧任务，也不负责与运行中
+gateway 的同时写入协调。
+
 ---
 
 ## `octos channels`
