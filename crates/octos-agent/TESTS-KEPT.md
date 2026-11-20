@@ -6,7 +6,7 @@
 
 ## T-0581 第二轮：同链路合并与共享 setup
 
-当前静态清单 **119 = 97 lib + 22 integration**（含 #1796 新增的 5 个 lib）；Linux 实际 118（唯一缺席为 Windows validator），macOS 实际 118（缺席 Linux real-bwrap），Windows 实际 114（另缺席 real-bwrap、两个 Unix spawn 及 Unix backend 构造）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
+当前静态清单 **122 = 100 lib + 22 integration**（含 #1796 新增的 5 个 lib 与 #3326 新增的 3 个隐藏目录 fail-closed 回归）；Linux 实际 121（唯一缺席为 Windows validator），macOS 实际 121（缺席 Linux real-bwrap），Windows 实际 117（另缺席 real-bwrap、两个 Unix spawn 及 Unix backend 构造）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
 
 | 合并前 | 合并后 | 保留的完整性质 |
 |---|---|---|
@@ -92,7 +92,10 @@
 | sandbox::tests::should_degrade_loudly_not_refuse_when_auto_finds_no_backend | 3 | 无后端时响亮降级而非拒绝 |
 | sandbox::tests::should_never_refuse_a_default_config_on_any_host | 3 | 默认配置在任何主机上不拒绝 |
 | sandbox::tests::refusing_sandbox_command_refuses_and_never_runs_the_original | 3 | 拒绝沙箱命令绝不执行原命令 |
+| sandbox::tests::should_refuse_when_a_non_hiding_backend_cannot_resolve_hidden_folder | 3 | 非隐藏后端遇到不可解析的隐藏目录时拒绝命令，不把缺失当安全 |
 | sandbox::bwrap::tests::test_bwrap_sandbox_env_sanitization | 3 | bwrap 环境变量脱敏 |
+| sandbox::bwrap::tests::should_refuse_when_hidden_folder_was_renamed | 3 | bwrap 隐藏目录启动前被改名时 fail closed，不静默跳过遮蔽 |
+| sandbox::macos::tests::should_refuse_rules_when_hidden_folder_was_deleted | 3 | macOS 隐藏目录规则生成失败时拒绝命令，不发只针对旧路径的策略 |
 | tools::shell::tests::bash_file_writes_deny_refuses_write_command | 3 | bash 文件写 deny 拒绝写命令 |
 | tools::shell::tests::shell_safe_policy_still_denies_with_scope_present | 3 | 有 scope 时安全策略仍拒绝 |
 | tools::ssrf::tests::test_check_ssrf_blocks_ipv4_mapped_ipv6_private | 3 | SSRF 拦截 IPv4 映射 IPv6 私网 |

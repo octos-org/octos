@@ -127,19 +127,47 @@ fn server_profile_root(profile_id: &str) -> Option<PathBuf> {
 fn server_profile_roots(data_dir: &Path, profile_id: &str) -> Vec<PathBuf> {
     let profile_dir = canonical_dir(data_dir);
     let mut roots = Vec::new();
-    let layout = layout_read();
-    if let Some(root) = layout.profile_server_roots.get(&profile_dir) {
+    if let Some(root) = layout_read().profile_server_roots.get(&profile_dir) {
         roots.push(root.clone());
     }
-    if let Some(root) = layout
-        .server_root
-        .as_ref()
-        .map(|root| root.join(profile_folder_name(profile_id)))
+    if let Some(root) = server_profile_root(profile_id)
         && !roots.contains(&root)
     {
         roots.push(root);
     }
     roots
+}
+
+/// Validate the one server-level root. A workspace may be an ancestor of the
+/// root (standard installs use `$HOME` as cwd while state lives under it); the
+/// root is hidden inside that workspace. It must not be the root's child,
+/// because that would grant a Code session a workspace inside Chat storage.
+fn validate_server_root(
+    root: &Path,
+    profile_data_dirs: &[PathBuf],
+    workspace_roots: &[PathBuf],
+) -> std::io::Result<()> {
+    for profile_dir in profile_data_dirs {
+        let profile_dir = canonical_dir(profile_dir);
+        if overlaps_path(root, &profile_dir) {
+            return Err(std::io::Error::other(format!(
+                "server chats root {} overlaps profile data directory {}",
+                root.display(),
+                profile_dir.display()
+            )));
+        }
+    }
+    for workspace in workspace_roots {
+        let workspace = canonical_dir(workspace);
+        if workspace.starts_with(root) {
+            return Err(std::io::Error::other(format!(
+                "allowed workspace {} is inside server chats root {}",
+                workspace.display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Create and reserve the one server-level root. Its stable address is known
@@ -151,26 +179,7 @@ pub(crate) fn configure_server_root(
     workspace_roots: &[PathBuf],
 ) -> std::io::Result<PathBuf> {
     let root = canonical_dir(&data_dir.join(CHATS_DIR));
-    for profile_dir in profile_data_dirs {
-        let profile_dir = canonical_dir(profile_dir);
-        if overlaps_path(&root, &profile_dir) {
-            return Err(std::io::Error::other(format!(
-                "server chats root {} overlaps profile data directory {}",
-                root.display(),
-                profile_dir.display()
-            )));
-        }
-    }
-    for workspace in workspace_roots {
-        let workspace = canonical_dir(workspace);
-        if overlaps_path(&root, &workspace) {
-            return Err(std::io::Error::other(format!(
-                "server chats root {} overlaps an allowed workspace {}",
-                root.display(),
-                workspace.display()
-            )));
-        }
-    }
+    validate_server_root(&root, profile_data_dirs, workspace_roots)?;
     private_dir(&root, true)?;
     reserved_folders()
         .add(root.clone())
@@ -179,14 +188,30 @@ pub(crate) fn configure_server_root(
     Ok(root)
 }
 
-/// Whether `path` is, contains, or is contained by the fixed server-level
-/// chats root. Workspace registration uses this so a workspace cannot be
-/// added later over the root that startup validated.
-pub(crate) fn overlaps_server_root(path: &Path) -> bool {
+/// A workspace inside the fixed server-level chats root is invalid. A larger
+/// ancestor workspace (commonly `$HOME` for a standard install) is valid: the
+/// root itself is already in the process-wide hidden set before any command
+/// starts, matching the pre-existing per-profile chat hiding.
+#[cfg(feature = "api")]
+pub(crate) fn workspace_inside_server_root(path: &Path) -> bool {
     let Some(root) = server_root() else {
         return false;
     };
-    overlaps_path(&canonical_dir(&root), &canonical_dir(path))
+    canonical_dir(path).starts_with(canonical_dir(&root))
+}
+
+/// Stop hiding a deleted legacy profile's chats root. Runtime-created
+/// profiles share the stable server root, which remains registered for the
+/// other profiles.
+#[cfg(feature = "api")]
+pub(crate) fn unregister_profile(data_dir: &Path) {
+    let profile_dir = canonical_dir(data_dir);
+    let mut layout = layout_write();
+    layout.profile_server_roots.remove(&profile_dir);
+    if layout.legacy_profiles.remove(&profile_dir).is_some() {
+        drop(layout);
+        reserved_folders().remove(&chats_root(&profile_dir));
+    }
 }
 
 /// A runtime-created profile must never move the server-level chats root into
@@ -212,11 +237,13 @@ pub(crate) fn ensure_profile_data_dir_safe(data_dir: &Path) -> std::io::Result<(
 /// `default` topic as the bare id, and storage that folds case (as most macOS
 /// and Windows volumes do) makes ids that differ only in ASCII case one
 /// transcript. Where storage tells case apart, those stay separate sessions.
-/// [`lookup`] refuses every spelling but the chat's own.
-fn folder_name_under(root: &Path, session_id: &SessionKey) -> String {
+/// [`lookup`] refuses every spelling but the chat's own. Normalization follows
+/// the profile's transcript store (`data_dir`), even when the chat folder is
+/// under the server-level root on another volume.
+fn folder_name(data_dir: &Path, session_id: &SessionKey) -> String {
     use sha2::{Digest, Sha256};
     let base = session_id.base_key();
-    let base = if folds_case(root) {
+    let base = if folds_case(data_dir) {
         base.to_ascii_lowercase()
     } else {
         base.to_owned()
@@ -225,17 +252,24 @@ fn folder_name_under(root: &Path, session_id: &SessionKey) -> String {
     digest[..32].to_owned()
 }
 
-/// Whether the storage holding `root`'s chats folds ASCII case: `CHATS`
-/// names the `chats` folder itself. Without a chats folder there is no chat
-/// to name, and [`create`] makes the folder before naming one.
-fn folds_case(root: &Path) -> bool {
-    let parent = root.parent().unwrap_or(root);
-    let chats = std::fs::metadata(root);
-    let folded = std::fs::metadata(parent.join(CHATS_DIR.to_ascii_uppercase()));
-    match (chats, folded) {
-        (Ok(chats), Ok(folded)) => same_entry(&chats, &folded),
-        _ => false,
+/// Whether the profile's transcript storage folds ASCII case. `sessions` is
+/// the authoritative runtime store directory; `chats` is the fallback for a
+/// legacy-only data directory that has not initialized sessions yet.
+fn folds_case(data_dir: &Path) -> bool {
+    for (lower, upper) in [
+        (data_dir.join("sessions"), data_dir.join("SESSIONS")),
+        (
+            chats_root(data_dir),
+            data_dir.join(CHATS_DIR.to_ascii_uppercase()),
+        ),
+    ] {
+        if let (Ok(lower), Ok(upper)) = (std::fs::metadata(lower), std::fs::metadata(upper))
+            && same_entry(&lower, &upper)
+        {
+            return true;
+        }
     }
+    false
 }
 
 #[cfg(unix)]
@@ -270,7 +304,7 @@ fn record_candidates(data_dir: &Path, session_id: &SessionKey) -> Vec<(PathBuf, 
     roots
         .into_iter()
         .map(|root| {
-            let name = folder_name_under(&root, session_id);
+            let name = folder_name(data_dir, session_id);
             (root.clone(), root.join(format!("{name}.json")))
         })
         .collect()
@@ -289,7 +323,7 @@ pub(crate) fn lookup(
     let Some((record, root)) = read_record(data_dir, session_id)? else {
         return Ok(None);
     };
-    let folder = root.join(folder_name_under(&root, session_id));
+    let folder = root.join(folder_name(data_dir, session_id));
     if !std::fs::symlink_metadata(&folder)?.is_dir() {
         return Err(unusable("its folder is not a directory"));
     }
@@ -336,6 +370,7 @@ fn unusable(why: &str) -> std::io::Error {
     )
 }
 
+#[cfg(feature = "api")]
 fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> {
     let profile_dir = canonical_dir(data_dir);
     if layout_read().legacy_profiles.contains_key(&profile_dir) {
@@ -349,6 +384,12 @@ fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> 
             .profile_server_roots
             .insert(profile_dir, root.clone());
         return Ok(root);
+    }
+    if cfg!(test) {
+        // Existing inline fixtures exercise the legacy layout without a serve
+        // startup. Production servers always configure the root or fail to
+        // start, so this branch is not a runtime escape hatch.
+        return Ok(chats_root(data_dir));
     }
     Err(std::io::Error::other(
         "server chats root is not configured for a runtime-created profile",
@@ -375,7 +416,7 @@ pub(crate) fn create(
     } else {
         private_dir(&root, true)?;
     }
-    let name = folder_name_under(&root, session_id);
+    let name = folder_name(data_dir, session_id);
     private_dir(&root.join(&name), false)?;
     let record = serde_json::to_vec(&ChatRecord {
         session_id: session_id.0.clone(),
@@ -410,7 +451,7 @@ pub(crate) fn restore_folder(data_dir: &Path, session_id: &SessionKey) -> std::i
     if lookup(data_dir, session_id).is_ok() {
         return Ok(());
     }
-    let folder = root.join(folder_name_under(&root, session_id));
+    let folder = root.join(folder_name(data_dir, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if !meta.is_dir() => std::fs::remove_file(&folder)?,
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
@@ -482,14 +523,8 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let holds = path.starts_with(&data_dir) && chats_root(&data_dir).starts_with(&path);
-    let server_holds = server_root().is_some_and(|root| {
-        let root = canonical_dir(&root);
-        let boundary = root
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.clone());
-        path.starts_with(&boundary) && root.starts_with(&path)
-    });
+    let server_holds =
+        server_root().is_some_and(|root| overlaps_path(&canonical_dir(&root), &path));
     holds || server_holds || is_in_chat_folder(&data_dir, &path)
 }
 
@@ -526,16 +561,13 @@ pub(crate) fn register_profile(data_dir: &Path) {
 
 /// A profile that existed when the server started keeps its pre-upgrade
 /// chats root. Runtime-created profiles are deliberately not marked here.
-pub(crate) fn register_existing_profile(data_dir: &Path) {
+pub(crate) fn register_existing_profile(data_dir: &Path) -> std::io::Result<()> {
     let profile_dir = canonical_dir(data_dir);
-    match reserve_profile(&profile_dir) {
-        Ok(()) => {
-            layout_write()
-                .legacy_profiles
-                .insert(profile_dir.clone(), chats_root(&profile_dir));
-        }
-        Err(error) => tracing::warn!(%error, "cannot reserve this profile's chats"),
-    }
+    reserve_profile(&profile_dir)?;
+    layout_write()
+        .legacy_profiles
+        .insert(profile_dir.clone(), chats_root(&profile_dir));
+    Ok(())
 }
 
 /// [`register_profile`], by the folder the data directory resolves to: a
@@ -629,7 +661,7 @@ pub(crate) fn remove_folder(data_dir: &Path, session_id: &SessionKey) -> std::io
     if FAIL_FOLDER_REMOVAL.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("injected folder removal failure"));
     }
-    let folder = root.join(folder_name_under(&root, session_id));
+    let folder = root.join(folder_name(data_dir, session_id));
     match std::fs::symlink_metadata(&folder) {
         Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&folder),
         Ok(_) => std::fs::remove_file(&folder),
@@ -699,27 +731,72 @@ mod server_root_tests {
             )
             .is_err()
         );
-        assert!(configure_server_root(&server, &[], std::slice::from_ref(&server)).is_err());
+        let home = temp.path().join("home");
+        let server_root = canonical_dir(&home.join("state").join(CHATS_DIR));
+        validate_server_root(&server_root, &[], std::slice::from_ref(&home))
+            .expect("standard install home workspace may contain the hidden root");
+        assert!(
+            validate_server_root(&server_root, &[], std::slice::from_ref(&server_root)).is_err()
+        );
+        assert!(
+            validate_server_root(
+                &server_root,
+                &[],
+                std::slice::from_ref(&server_root.join("workspace"))
+            )
+            .is_err()
+        );
+        let profile_file = temp.path().join("profile-file");
+        std::fs::write(&profile_file, b"not a directory").unwrap();
+        assert!(register_existing_profile(&profile_file).is_err());
+    }
+
+    #[tokio::test]
+    async fn should_unreserve_deleted_legacy_profile_root() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let root_dir = temp.path().to_path_buf();
+        std::mem::forget(temp);
+        let state_home = root_dir.join("state");
+        let profile = root_dir.join("profiles/deleted/data");
+        std::fs::create_dir_all(&profile).unwrap();
+        configure_server_root(&state_home, std::slice::from_ref(&profile), &[])
+            .expect("configure server root");
+        register_existing_profile(&profile).expect("legacy profile root");
+        let legacy_root = canonical_dir(&chats_root(&profile));
+        let reserved = reserved_folders();
+        assert!(reserved.folders().contains(&legacy_root));
+
+        std::fs::remove_dir_all(&profile).unwrap();
+        unregister_profile(&profile);
+        assert!(!reserved.folders().contains(&legacy_root));
     }
 
     async fn new_profile_command_stays_fenced(mode: octos_agent::SandboxMode) {
         let _guard = LAYOUT_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        let server_data = temp.path().join("server");
-        let workspace = temp.path().join("workspace");
-        let old_profile = temp.path().join("profiles/old/data");
-        std::fs::create_dir_all(&workspace).unwrap();
+        // The layout registry and hidden-folder list are process-global. Keep
+        // this root alive for the test process so a concurrently running test
+        // never follows a deleted registered path.
+        let root_dir = temp.path().to_path_buf();
+        std::mem::forget(temp);
+        let state_home = root_dir.join("state");
+        let runtime_data = root_dir.join("runtime");
+        let old_profile = root_dir.join("profiles/old/data");
         std::fs::create_dir_all(&old_profile).unwrap();
-        let server_root = configure_server_root(
-            &server_data,
-            std::slice::from_ref(&old_profile),
-            std::slice::from_ref(&workspace),
-        )
-        .expect("configure server root");
-        assert_eq!(server_root, canonical_dir(&server_data.join(CHATS_DIR)));
+        // The command's cwd deliberately contains the shared state root and
+        // the separate runtime profile root, matching a standard `$HOME`
+        // workspace; the fixed root itself is what must be hidden.
+        let server_root =
+            configure_server_root(&state_home, std::slice::from_ref(&old_profile), &[])
+                .expect("configure server root");
+        assert_eq!(server_root, canonical_dir(&state_home.join(CHATS_DIR)));
+        assert!(!workspace_inside_server_root(&root_dir));
+        assert!(workspace_inside_server_root(&server_root));
+        assert!(overlaps_chat_folders(&old_profile, &root_dir));
+        assert!(ensure_profile_data_dir_safe(&server_root).is_err());
         let profile_store =
-            crate::profiles::ProfileStore::open(&temp.path().join("state"), &server_data)
-                .expect("profile store");
+            crate::profiles::ProfileStore::open(&state_home, &runtime_data).expect("profile store");
         let bad_profile = crate::profiles::UserProfile {
             id: "bad".to_owned(),
             name: "Bad".to_owned(),
@@ -732,11 +809,15 @@ mod server_root_tests {
             updated_at: Utc::now(),
         };
         assert!(profile_store.save(&bad_profile).is_err());
-        register_existing_profile(&old_profile);
+        register_existing_profile(&old_profile).expect("legacy profile root");
 
         let old_id = SessionKey::with_profile("old", "api", "old-chat");
         let old_chat = create(&old_profile, "old", &old_id).expect("legacy chat");
-        assert!(old_chat.root.starts_with(chats_root(&old_profile)));
+        assert!(
+            old_chat
+                .root
+                .starts_with(canonical_dir(&chats_root(&old_profile)))
+        );
 
         let new_record = crate::profiles::UserProfile {
             id: "new".to_owned(),
@@ -749,13 +830,31 @@ mod server_root_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        profile_store.save(&new_record).expect("runtime profile");
         let new_profile = profile_store.resolve_data_dir(&new_record);
         let new_id = SessionKey::with_profile("new", "api", "late-chat");
         let new_root = server_profile_root("new").expect("server profile root");
-        let name = folder_name_under(&new_root, &new_id);
+        let name = folder_name(&new_profile, &new_id);
         let secret = new_root.join(&name).join("secret.txt");
-        let command = format!("sleep 1; cat \"{}\"", secret.display());
+        let marker = root_dir.join("command-started");
+        let command = if cfg!(windows) {
+            // NoSandbox on Windows must refuse before this ever runs; success
+            // would prove the static hidden-root fence was missing.
+            "exit 0".to_owned()
+        } else {
+            format!(
+                "printf started > \"{}\"; i=0; while [ $i -lt 100 ]; do \
+                 cat \"{}\" && exit 0; i=$((i+1)); sleep 0.02; done; exit 2",
+                marker.display(),
+                secret.display()
+            )
+        };
+        // Other tests may have dropped their TempDirs after registering
+        // fixture roots in this process-global list. Remove stale fixture
+        // entries here; the roots under test are created by production calls.
+        let reserved = reserved_folders();
+        for root in reserved.folders().into_iter().filter(|root| !root.exists()) {
+            reserved.remove(&root);
+        }
         let sandbox = octos_agent::create_sandbox(&octos_agent::SandboxConfig {
             mode,
             hidden_folders: Some(reserved_folders()),
@@ -765,29 +864,54 @@ mod server_root_tests {
             println!("{} unavailable on this host", sandbox.backend_name());
             return;
         }
-        let child = sandbox
-            .wrap_command(&command, &workspace)
+        let mut command = sandbox.wrap_command(&command, &root_dir);
+        command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn long command");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            .stderr(std::process::Stdio::piped());
+        let child = command.spawn().expect("spawn long command");
+        if !sandbox.is_noop() {
+            for _ in 0..100 {
+                if marker.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(marker.exists(), "sandbox command did not start");
+        }
+        profile_store.save(&new_record).expect("runtime profile");
         register_profile(&new_profile);
         assert!(!chats_root(&new_profile).exists());
         let new_chat = create(&new_profile, "new", &new_id).expect("new chat");
-        assert!(new_chat.root.starts_with(&new_root));
+        assert!(new_chat.root.starts_with(canonical_dir(&new_root)));
         std::fs::write(new_chat.root.join("secret.txt"), "late-chat-secret").unwrap();
         let output = child.wait_with_output().await.expect("wait for command");
         let said = String::from_utf8_lossy(&[output.stdout, output.stderr].concat()).into_owned();
         assert!(!said.contains("late-chat-secret"), "{said}");
+        assert!(!output.status.success(), "{said}");
         if sandbox.is_noop() {
-            assert!(!output.status.success(), "{said}");
             assert!(said.contains("cannot hide chat folders"), "{said}");
         }
         remove(&new_profile, &new_id).expect("remove server-root chat");
         assert!(!new_chat.root.exists());
         let new_chat = create(&new_profile, "new", &new_id).expect("recreate chat");
-        assert!(new_chat.root.starts_with(&new_root));
+        assert!(new_chat.root.starts_with(canonical_dir(&new_root)));
+
+        #[cfg(unix)]
+        {
+            // Simulate the transcript store's case-folding behavior. A
+            // case-only spelling of the same transcript must be refused, not
+            // normalized by the server-root filesystem.
+            let sessions = new_profile.join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            std::os::unix::fs::symlink(&sessions, new_profile.join("SESSIONS")).unwrap();
+            assert!(folds_case(&new_profile));
+            let variant = SessionKey::with_profile("new", "api", "LATE-CHAT");
+            let error = lookup(&new_profile, &variant).expect_err("case variant is not the chat");
+            assert!(
+                error.to_string().contains("names another session"),
+                "{error}"
+            );
+        }
 
         // Reverse-mutation guard: a same-session record in the legacy root
         // makes lookup fail closed; implementation must never pick one root.
@@ -795,13 +919,13 @@ mod server_root_tests {
         private_dir(&legacy_root, true).unwrap();
         private_dir(
             legacy_root
-                .join(folder_name_under(&legacy_root, &new_id))
+                .join(folder_name(&new_profile, &new_id))
                 .as_path(),
             false,
         )
         .unwrap();
         std::fs::write(
-            legacy_root.join(format!("{}.json", folder_name_under(&legacy_root, &new_id))),
+            legacy_root.join(format!("{}.json", folder_name(&new_profile, &new_id))),
             serde_json::to_vec(&ChatRecord {
                 session_id: new_id.0.clone(),
                 profile_id: "new".to_owned(),

@@ -1180,6 +1180,12 @@ impl ProfileRuntime {
             config.hooks.clear();
             config.mcp_servers.clear();
         }
+        super::chat_workspace::ensure_profile_data_dir_safe(data_dir).wrap_err_with(|| {
+            format!(
+                "profile '{}' data directory overlaps the server chats root",
+                profile.id
+            )
+        })?;
         ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
             format!(
                 "failed to initialize runtime directories for profile '{}'",

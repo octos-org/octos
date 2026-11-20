@@ -211,7 +211,7 @@ fn canonical_allowed_roots(state: &AppState) -> Vec<PathBuf> {
 }
 
 fn workspace_allowed(state: &AppState, path: &Path) -> bool {
-    if crate::runtime::chat_workspace::overlaps_server_root(path) {
+    if crate::runtime::chat_workspace::workspace_inside_server_root(path) {
         return false;
     }
     canonical_allowed_roots(state)

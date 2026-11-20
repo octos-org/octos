@@ -6,6 +6,9 @@ use tokio::process::Command;
 
 use super::{BLOCKED_ENV_VARS, Sandbox};
 
+type HiddenMounts = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
+type HiddenMountsResult = std::io::Result<HiddenMounts>;
+
 /// Linux sandbox using bubblewrap (bwrap).
 pub struct BwrapSandbox {
     pub(crate) allow_network: bool,
@@ -46,14 +49,20 @@ fn hidden_mounts(
     cwd: &Path,
     view_root: Option<&Path>,
     cwd_writable: bool,
-) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+) -> HiddenMountsResult {
     let mut covers = std::collections::BTreeSet::new();
     let mut pins = std::collections::BTreeSet::new();
     let bound = std::iter::once(cwd).chain(view_root);
     let bound: Vec<(&Path, PathBuf)> = bound
         .filter_map(|path| Some((path, std::fs::canonicalize(path).ok()?)))
         .collect();
-    for folder in hidden.iter().filter_map(|f| std::fs::canonicalize(f).ok()) {
+    for folder in hidden {
+        let folder = std::fs::canonicalize(folder).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot resolve hidden folder {}: {error}", folder.display()),
+            )
+        })?;
         for (path, real) in &bound {
             if let Ok(below) = folder.strip_prefix(real) {
                 covers.insert(path.join(below));
@@ -69,7 +78,7 @@ fn hidden_mounts(
             }
         }
     }
-    (covers.into_iter().collect(), pins.into_iter().collect())
+    Ok((covers.into_iter().collect(), pins.into_iter().collect()))
 }
 
 impl Sandbox for BwrapSandbox {
@@ -181,8 +190,22 @@ impl Sandbox for BwrapSandbox {
         // leading to it pinned in place.
         if let Some(hidden) = &self.hidden_folders {
             let view_root = self.read_only_view.as_ref().map(|view| view.root.as_path());
-            let (covers, pins) =
-                hidden_mounts(&hidden.folders(), cwd, view_root, self.workspace_write);
+            let (covers, pins) = match hidden_mounts(
+                &hidden.folders(),
+                cwd,
+                view_root,
+                self.workspace_write,
+            ) {
+                Ok(mounts) => mounts,
+                Err(error) => {
+                    return super::refusing_command(
+                        &format!(
+                            "sandbox bwrap: {error}. Refusing to run the command because a hidden folder could not be covered."
+                        ),
+                        cwd,
+                    );
+                }
+            };
             for (source, destination) in pins {
                 cmd.arg("--bind").arg(source).arg(destination);
             }
@@ -240,5 +263,32 @@ mod tests {
                 "bwrap should env_remove {var}"
             );
         }
+    }
+
+    #[test]
+    fn should_refuse_when_hidden_folder_was_renamed() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let hidden_path = temp.path().join("hidden");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&hidden_path).unwrap();
+        std::fs::rename(&hidden_path, temp.path().join("renamed")).unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(hidden_path).unwrap();
+        let sb = BwrapSandbox {
+            read_only_view: None,
+            hidden_folders: Some(hidden),
+            allow_network: false,
+            workspace_write: true,
+            deliverable_root: None,
+            repo_git_write: None,
+        };
+        let cmd = sb.wrap_command("echo must-not-run", &cwd);
+        assert_ne!(cmd.as_std().get_program(), "bwrap");
+        assert!(
+            cmd.as_std()
+                .get_args()
+                .all(|arg| arg != "echo must-not-run")
+        );
     }
 }

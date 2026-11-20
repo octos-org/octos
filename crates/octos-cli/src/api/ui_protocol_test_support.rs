@@ -97,7 +97,8 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
     std::fs::create_dir_all(data_dir).expect("profile data dir");
     // These fixtures model profiles that existed at server startup, so they
     // keep the pre-upgrade per-profile chat root.
-    crate::runtime::chat_workspace::register_existing_profile(data_dir);
+    crate::runtime::chat_workspace::register_existing_profile(data_dir)
+        .expect("existing-profile chat root");
     let memory = Arc::new(
         octos_memory::EpisodeStore::open(data_dir)
             .await
@@ -245,6 +246,14 @@ async fn sandboxed_runtime(
     cwd: &Path,
     sandbox: Option<octos_agent::SandboxConfig>,
 ) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
+    // Earlier tests may have dropped TempDirs after registering their chats
+    // roots in this process-global list. Drop those stale fixture roots so a
+    // parallel test's cleanup cannot race this runtime's fail-closed check;
+    // production registers each live root before use.
+    let reserved = crate::runtime::chat_workspace::reserved_folders();
+    for root in reserved.folders().into_iter().filter(|root| !root.exists()) {
+        reserved.remove(&root);
+    }
     let write = octos_agent::EffectivePermissions::workspace_write();
     let cwd = Some(cwd.to_path_buf());
     crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(

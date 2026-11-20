@@ -1339,7 +1339,7 @@ impl ServeCommand {
             );
         }
         let server_chats_root = crate::runtime::chat_workspace::configure_server_root(
-            &data_dir,
+            &state_home,
             &profile_data_dirs,
             &chats_root_workspace_roots,
         )
@@ -1349,7 +1349,8 @@ impl ServeCommand {
             "reserved server chats root"
         );
         for profile_data_dir in &profile_data_dirs {
-            crate::runtime::chat_workspace::register_existing_profile(profile_data_dir);
+            crate::runtime::chat_workspace::register_existing_profile(profile_data_dir)
+                .wrap_err("failed to reserve an existing profile's legacy chats root")?;
         }
         // Operator goal transitions must serialize with the live
         // orchestrator. The data-dir serve lock tells the CLI whether this

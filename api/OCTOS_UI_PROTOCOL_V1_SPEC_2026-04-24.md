@@ -2315,8 +2315,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   with `work_mode: "chat"`. Profiles that existed before the server started
   keep the original `<profile data dir>/chats/<name>/` layout; a Profile
   registered while the server runs uses the server-level root fixed at
-  startup, under `<server data dir>/chats/`, so every sandbox already knows
-  the root before its profile exists. A client must use the returned
+  startup, under `<shared server data root>/chats/` (the same root for split
+  registry/runtime roots), so every sandbox already knows the root before its
+  profile exists. A client must use the returned
   `workspace_root` and must not derive the path. Creating the same chat again
   returns the same folder. An existing session
   that is not a chat fails with `invalid_params`, `data.kind =

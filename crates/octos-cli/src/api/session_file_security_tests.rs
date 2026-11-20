@@ -27,8 +27,6 @@ async fn session_file_read_rejects_traversal_directories_and_symlinks() {
     std::fs::create_dir(&outside_dir).unwrap();
     std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
     // A web session's workspace, and a chat's own folder (UPCR-2026-R1EFC56A3).
-    // This fixture models a profile that existed before the server started.
-    crate::runtime::chat_workspace::register_existing_profile(data.path());
     let chat = SessionKey("t:api:chat".into());
     let chat_root = crate::runtime::chat_workspace::create(data.path(), "t", &chat).unwrap();
     for (session_id, workspace) in [
