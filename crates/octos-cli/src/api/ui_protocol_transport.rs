@@ -43111,7 +43111,11 @@ async fn run_standalone_turn(
         // against (`agent/execution.rs`), dropping the in-flight pipeline /
         // LLM / web_search future at its next poll. Idempotent: already-
         // terminal tasks return `AlreadyTerminal` and are skipped.
-        cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
+        cancel_session_spawn_only_tasks(
+            state.task_query_store.as_ref(),
+            &tool_registry.supervisor(),
+            &session_id,
+        );
         // #2831: the abort above killed the agent task before its
         // end-of-turn persist loop could run, so the dispatched prompt was
         // never durable and reload discarded its source-less ledger twin.
@@ -44122,12 +44126,33 @@ fn build_turn_session_result_from_done(event: &Value) -> Option<TurnSessionResul
 /// Turns are serialized per session, so the live background tasks belong to
 /// the turn being interrupted. Already-terminal tasks are skipped
 /// (`cancel` would return `AlreadyTerminal`); the call is idempotent.
+///
+/// The current turn's supervisor may be a restored projection of a task whose
+/// producer belongs to an earlier turn. When the session store is available,
+/// route through its execution-owner bridge exactly like explicit `task/cancel`;
+/// cancelling the projection directly while that owner is reachable would fire
+/// only its fresh token while the real producer continued to `Completed`. If
+/// the owner is gone or out of process, the store keeps the same fallback
+/// semantics as explicit `task/cancel`. Without a store the supervisor is the
+/// only available authority, preserving the legacy fallback.
 fn cancel_session_spawn_only_tasks(
+    store: Option<&crate::session_actor::SessionTaskQueryStore>,
     supervisor: &octos_agent::TaskSupervisor,
     session_id: &SessionKey,
 ) {
     for task in supervisor.get_tasks_for_session(&session_id.to_string()) {
-        if !task.status.is_terminal() {
+        if task.status.is_terminal() {
+            continue;
+        }
+        if let Some(store) = store {
+            if let Err(octos_agent::TaskCancelError::NotFound) = store.cancel_task(&task.id) {
+                tracing::debug!(
+                    task_id = %task.id,
+                    session = %session_id,
+                    "spawn_only interrupt found no registered task supervisor"
+                );
+            }
+        } else {
             let _ = supervisor.cancel(&task.id);
         }
     }
