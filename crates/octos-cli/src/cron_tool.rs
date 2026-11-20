@@ -1017,6 +1017,48 @@ mod tests {
     use super::*;
     use chrono::Datelike;
 
+    #[tokio::test]
+    async fn creation_rejects_unschedulable_tool_cron_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let service = Arc::new(CronService::new(&path, tx));
+        let tool = CronTool::new(service.clone());
+        for existing in [false, true] {
+            if existing {
+                assert!(
+                    tool.execute(&serde_json::json!({"action":"add", "message":"valid",
+                    "cron_expr":"0 0 9 * * 1", "timezone":"America/New_York"}))
+                        .await
+                        .unwrap()
+                        .success
+                );
+            }
+            let before = std::fs::read(&path).ok();
+            let count = service.list_all_jobs().len();
+            for (expr, timezone) in [
+                ("nope", "UTC"),
+                ("0 0 0 31 2 * *", "UTC"),
+                ("0 0 0 1 1 * 2000", "UTC"),
+                ("0 0 0 1 1 * 2100", "UTC"),
+                ("0 30 2 8-13 3 SUN", "America/New_York"),
+                ("0 0 9 * * 1", "Not/AZone"),
+            ] {
+                let result = tool
+                    .execute(&serde_json::json!({"action":"add", "message":"invalid",
+                    "cron_expr":expr, "timezone":timezone}))
+                    .await;
+                assert!(
+                    result.is_err() || !result.unwrap().success,
+                    "accepted {expr} {timezone}"
+                );
+                assert_eq!(std::fs::read(&path).ok(), before);
+                assert_eq!(service.list_all_jobs().len(), count);
+            }
+        }
+        service.stop().await;
+    }
+
     // Tool and Matrix schedule creation must agree with human weekday input;
     // assert persisted next-run dates, not just parser output (UPCR-058).
     #[tokio::test]

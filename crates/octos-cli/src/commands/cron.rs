@@ -261,7 +261,7 @@ fn cmd_add(
         // and nothing should ever reap it automatically.
         origin: Default::default(),
     };
-    job.compute_next_run(now_ms);
+    job.compute_first_run(now_ms)?;
 
     let mut store = load_store(store_path);
     store.jobs.push(job);
@@ -323,6 +323,10 @@ fn short_id() -> String {
     let id = uuid::Uuid::now_v7();
     format!("{:x}", id.as_u128())[..8].to_string()
 }
+
+#[cfg(test)]
+#[path = "cron_creation_tests.rs"]
+mod creation_tests;
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
