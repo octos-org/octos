@@ -1,7 +1,7 @@
 # UPCR-2026-RBB8E2A9A — Ledger-only turn runner and external turn entry (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3325
 
 ## Decision record
 
