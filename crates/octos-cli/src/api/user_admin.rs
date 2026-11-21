@@ -423,7 +423,11 @@ async fn delete_profile_record(
                 error = %e,
                 "failed to clean up profile data directory"
             );
+        } else {
+            crate::runtime::chat_workspace::unregister_profile(&data_dir);
         }
+    } else {
+        crate::runtime::chat_workspace::unregister_profile(&data_dir);
     }
 
     profile_store

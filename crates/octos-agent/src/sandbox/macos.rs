@@ -255,7 +255,7 @@ fn hidden_folder_rules(hidden: &[std::path::PathBuf], real_cwd: &Path) -> Option
         Some(())
     };
     for folder in hidden {
-        let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.clone());
+        let real = std::fs::canonicalize(folder).ok()?;
         for path in [folder, &real] {
             deny("file-read* file-write* (subpath", path)?;
         }
@@ -640,11 +640,11 @@ impl Sandbox for MacosSandbox {
                 Some(rules) => rules,
                 None => {
                     tracing::error!(
-                        "hidden folder contains SBPL metacharacters, refusing to execute"
+                        "hidden folder is unavailable or contains SBPL metacharacters, refusing to execute"
                     );
                     let mut cmd = Command::new("sh");
                     cmd.arg("-c").arg(
-                        "echo 'sandbox error: hidden folder path contains invalid characters' >&2; exit 1",
+                        "echo 'sandbox error: hidden folder is unavailable or invalid' >&2; exit 1",
                     );
                     return cmd;
                 }
@@ -692,5 +692,17 @@ impl Sandbox for MacosSandbox {
             .arg(shell_command)
             .current_dir(cwd);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_refuse_rules_when_hidden_folder_was_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("deleted-hidden");
+        assert!(hidden_folder_rules(&[missing], temp.path()).is_none());
     }
 }

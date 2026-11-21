@@ -1211,15 +1211,20 @@ impl HiddenFolderGuard {
             .iter()
             .filter_map(|path| canonical(Path::new(path)))
             .collect();
-        self.hidden
-            .folders()
+        let hidden = self.hidden.folders();
+        if hidden
             .iter()
-            .filter_map(|f| canonical(f))
-            .any(|folder| {
-                cwd.as_ref()
-                    .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(&folder))
-                    || read.iter().any(|path| folder.starts_with(path))
-            })
+            .any(|folder| std::fs::canonicalize(folder).is_err())
+        {
+            // A registered hidden folder that cannot be resolved is not
+            // safely absent; do not let a non-hiding backend run around it.
+            return true;
+        }
+        hidden.iter().filter_map(|f| canonical(f)).any(|folder| {
+            cwd.as_ref()
+                .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(&folder))
+                || read.iter().any(|path| folder.starts_with(path))
+        })
     }
 
     fn refuse(&self, cwd: &Path) -> Command {
@@ -1806,5 +1811,38 @@ mod tests {
         }
         // The inverse stays true: NoSandbox is the one honest no-op.
         assert!(NoSandbox.is_noop());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_when_a_non_hiding_backend_cannot_resolve_hidden_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let hidden_path = temp.path().join("hidden");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&hidden_path).unwrap();
+        std::fs::rename(&hidden_path, temp.path().join("renamed")).unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(hidden_path).unwrap();
+        let guard = HiddenFolderGuard {
+            inner: Box::new(bwrap::BwrapSandbox {
+                allow_network: false,
+                workspace_write: true,
+                deliverable_root: None,
+                repo_git_write: None,
+                read_only_view: None,
+                hidden_folders: None,
+            }),
+            hidden,
+            read_allow_paths: Vec::new(),
+        };
+        let output = guard
+            .wrap_command("echo must-not-run", &cwd)
+            .output()
+            .await
+            .expect("refusal command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains("Refusing to run"), "{stderr}");
+        assert!(!stderr.contains("must-not-run"), "{stderr}");
     }
 }

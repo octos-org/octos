@@ -557,7 +557,11 @@ pub async fn delete_profile(
         if sub_data_dir.exists() {
             if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
                 tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
+            } else {
+                crate::runtime::chat_workspace::unregister_profile(&sub_data_dir);
             }
+        } else {
+            crate::runtime::chat_workspace::unregister_profile(&sub_data_dir);
         }
         let _ = store.delete(&sub.id);
     }
@@ -582,7 +586,11 @@ pub async fn delete_profile(
         if data_dir.exists() {
             if let Err(e) = std::fs::remove_dir_all(&data_dir) {
                 tracing::warn!(profile = %id, dir = %data_dir.display(), error = %e, "failed to clean up data directory");
+            } else {
+                crate::runtime::chat_workspace::unregister_profile(&data_dir);
             }
+        } else {
+            crate::runtime::chat_workspace::unregister_profile(&data_dir);
         }
     }
 

@@ -12,7 +12,10 @@ own folder. The chat reads and writes there and nowhere else. Two chats never
 see each other's files, and reopening a chat finds the same folder.
 `UPCR-2026-R6982BEFC` made a session's Chat / Code mode durable. This record
 adds the folder: who creates it, how a session is bound to it, how the session
-is kept inside it, and when it is deleted.
+is kept inside it, and when it is deleted. Profiles present when a server
+starts keep the original per-profile folder; a Profile registered while the
+server runs uses a server-level chats root fixed before the first sandbox is
+built, so no running command can meet an unreserved future chat root.
 
 The folder and the fence are server state. A client cannot pick a chat's
 folder, move a chat to another folder, or widen what a chat may do. A client
@@ -47,7 +50,9 @@ A connection that does not request it sees byte-identical replies.
     harmless.
   - The session is recorded with `work_mode: "chat"`, as `UPCR-2026-R6982BEFC`
     defines.
-  - `workspace_root` is the folder's canonical path.
+  - `workspace_root` is the folder's canonical path. Clients use this value
+    and never derive it: the folder may be in the profile's legacy `chats/`
+    root or in the server-level root for a runtime-created profile.
   - The method is not available over stdio, like the other methods that need
     an authenticated profile.
 - **`session/open`** of a chat always uses the chat's folder.
@@ -58,19 +63,24 @@ A connection that does not request it sees byte-identical replies.
     confined. A client simply cannot create or list chats.
 - **`session/open`** of any other session with a `cwd` that reaches into a
   chat folder of any profile fails with `permission_denied` and
-  `data.kind = "chat_workspace_reserved"`. That is a chat folder itself, a
-  folder below one, or a folder inside the profile's data directory that
-  holds them: the data directory or its `chats` folder. A folder above the
-  data directory is not refused, because the data directory may sit in a
-  project (`--data-dir`, `OCTOS_HOME`) or in the user's home, and refusing
-  those would refuse the project or the home itself. Such a session still
-  never reaches a chat folder of any profile. One workspace may hold several
-  profiles' data directories (a project above them), so the reserved folders
-  are the `chats` folders of every profile the server stores or has started,
-  not only the session's own, including a profile that starts after the
-  session is already running. Each is reserved by the folder its data
-  directory resolves to, however the profile's `data_dir` is spelled; a
-  profile whose folder cannot be reserved cannot create a chat:
+  `data.kind = "chat_workspace_reserved"`. For a legacy profile root that is a
+  chat folder itself, a folder below one, or a folder inside the profile's data
+  directory that holds them: the data directory or its `chats` folder. A folder
+  above the legacy data directory is not refused by that rule, because the data
+  directory may sit in a project (`--data-dir`, `OCTOS_HOME`) or in the user's
+  home, and refusing those would refuse the project or the home itself. The
+  server-level root follows the legacy ancestor rule: startup still refuses any
+  overlap with a profile data directory, and it refuses a Code workspace at or
+  below the root, but it allows a larger ancestor workspace such as a standard
+  install's `$HOME`; the root itself is in the precomputed hidden set. Such a
+  session still never reaches a chat folder of any profile. One workspace may hold several profiles' data directories (a project
+  above them), so the reserved folders are the legacy `chats` folders of every
+  profile the server stores or has started, plus the server-level root, not only
+  the session's own. The server-level root exists before any sandbox is built,
+  so a Profile registered while the server runs is already covered. Legacy
+  profiles are reserved by the folder their data directory resolves to, however
+  the profile's `data_dir` is spelled; a profile whose folder cannot be reserved
+  cannot create a chat:
   - its file tools: its session scope hides those folders, so a path there,
     by name or through a symlink, is out of scope, and directory walks skip
     them. `diff_edit`, which resolves paths itself, refuses a path the scope
@@ -136,9 +146,14 @@ A connection that does not request it sees byte-identical replies.
 
 ### Folder and lifecycle
 
-- A chat's folder is `<profile data dir>/chats/<name>/`, created with mode
-  `0700`. `<name>` is the first 32 hex digits of SHA-256 of the session id
-  without its topic, in ASCII lowercase where the storage folds case.
+- A chat's folder is either `<profile data dir>/chats/<name>/` for a profile
+  already present when the server starts, or
+  `<shared server data root>/chats/<profile>/<name>/` for a Profile registered
+  while the server runs. `<profile>` and `<name>` are SHA-256-derived path
+  components; the server-level root is created before the first sandbox. Every
+  chat folder is created with mode `0700`.
+  `<name>` is the first 32 hex digits of SHA-256 of the session id without its
+  topic, in ASCII lowercase where the storage folds case.
   - Lookup is therefore a path computation. Every session bootstrap and
     permission read can ask "is this a chat?" cheaply.
   - Every spelling of an id that reaches the chat's transcript finds the
@@ -186,11 +201,14 @@ A connection that does not request it sees byte-identical replies.
   a `send_file` a turn builds later. If the folder resolves anywhere else,
   for example after it is replaced by a symlink before or during a turn,
   they refuse. They do not follow the replacement.
-- The binding is a record beside the folder: `chats/<name>.json` with
+- The binding is a record beside the folder: `chats/<name>.json` in the
+  legacy root, or `<profile>/<name>.json` under the server-level root, with
   `{session_id, profile_id, created_at}`.
   - The record is outside the folder, so nothing the chat writes can change
     whose folder it is.
   - The record is on disk, so the binding survives restarts and reconnects.
+  - Lookup checks the legacy and server-level roots. If the same session
+    resolves in both, the server fails closed instead of choosing one.
 - **Deletion policy.**
   - Deleting the session (`DELETE /api/sessions/{id}`, the web's delete)
     deletes the folder, everything in it, and then the record. There is no
@@ -243,6 +261,10 @@ The file tools resolve every path through the scope:
 
 - Additive and opt-in. Existing sessions are never chats, and nothing about
   them changes.
+- Existing profiles keep their legacy chats root; no folders or records are
+  migrated. A rollback to an older binary cannot see chats stored under the
+  server-level root, but those folders and records remain on disk and become
+  visible again after upgrading.
 - Old clients cannot create or list chats.
 - An old server rejects `session/chat/create` as an unknown method.
 - An old server ignores `work_mode` on `session/list` and returns its ordinary

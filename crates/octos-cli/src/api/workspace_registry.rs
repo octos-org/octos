@@ -44,6 +44,20 @@ fn workspace_path(data_dir: &Path) -> PathBuf {
     data_dir.join("workspaces.json")
 }
 
+/// Workspace roots a Code session may open for this profile, for startup
+/// validation before a shared server-level root is created.
+pub(crate) fn registered_workspace_roots(data_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let file: WorkspaceFile = read_json(&workspace_path(data_dir))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.message))?;
+    Ok(file
+        .workspaces
+        .into_iter()
+        .filter(|workspace| !workspace.archived)
+        .map(|workspace| PathBuf::from(workspace.canonical_path))
+        .filter(|root| root.is_absolute())
+        .collect())
+}
+
 fn session_path(data_dir: &Path) -> PathBuf {
     data_dir.join("session-catalog.json")
 }
@@ -197,6 +211,9 @@ fn canonical_allowed_roots(state: &AppState) -> Vec<PathBuf> {
 }
 
 fn workspace_allowed(state: &AppState, path: &Path) -> bool {
+    if crate::runtime::chat_workspace::workspace_inside_server_root(path) {
+        return false;
+    }
     canonical_allowed_roots(state)
         .iter()
         .any(|root| path == root || path.starts_with(root))

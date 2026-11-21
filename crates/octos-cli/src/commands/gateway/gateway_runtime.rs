@@ -364,10 +364,29 @@ impl GatewayRuntime {
         // Derive octos_home from: --octos-home flag > data_dir (which already
         // resolves --data-dir > $OCTOS_HOME > ~/.octos).
         let effective_octos_home = cmd.octos_home.clone().unwrap_or_else(|| data_dir.clone());
-        let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
+        let profile_store: Option<Arc<crate::profiles::ProfileStore>> = Some(Arc::new(
             crate::profiles::ProfileStore::open_unified(&effective_octos_home)
-                .ok()
-                .map(Arc::new);
+                .wrap_err("failed to open profile store while reserving gateway chats root")?,
+        ));
+        if let Some(store) = profile_store.as_ref() {
+            let profiles = store
+                .list()
+                .wrap_err("failed to list profiles while reserving gateway chats root")?;
+            let profile_data_dirs = profiles
+                .iter()
+                .map(|profile| store.resolve_data_dir(profile))
+                .collect::<Vec<_>>();
+            crate::runtime::chat_workspace::configure_server_root(
+                &effective_octos_home,
+                &profile_data_dirs,
+                std::slice::from_ref(&cwd),
+            )
+            .wrap_err("gateway chats root is unsafe")?;
+            for profile_data_dir in &profile_data_dirs {
+                crate::runtime::chat_workspace::register_existing_profile(profile_data_dir)
+                    .wrap_err("failed to reserve an existing profile's legacy chats root")?;
+            }
+        }
 
         // FIX 2 (single shared runtime-profile resolver): in profile-mode,
         // resolve the profile ONCE up front — parent/sub-account inheritance

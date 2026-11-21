@@ -469,6 +469,15 @@ impl HiddenFolders {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Stop hiding `folder`. Tests use this to drop fixture roots whose
+    /// TempDir another test has already removed.
+    pub fn remove(&self, folder: &Path) -> bool {
+        let mut folders = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let before = folders.len();
+        folders.retain(|registered| registered != folder);
+        folders.len() != before
+    }
+
     fn any(&self, hides: impl FnMut(&PathBuf) -> bool) -> bool {
         self.0
             .read()

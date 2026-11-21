@@ -89,11 +89,14 @@ pub async fn purge_by_profile_id(
                     "purge: failed to remove sub-account data dir"
                 );
             } else {
+                crate::runtime::chat_workspace::unregister_profile(&sub_data_dir);
                 report.bytes_freed += bytes;
                 report
                     .files_removed
                     .push(sub_data_dir.display().to_string());
             }
+        } else {
+            crate::runtime::chat_workspace::unregister_profile(&sub_data_dir);
         }
         let _ = profile_store.delete(&sub.id);
         report
@@ -108,9 +111,12 @@ pub async fn purge_by_profile_id(
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
             tracing::warn!(profile = %profile_id, dir = %data_dir.display(), error = %e, "purge: failed to remove data dir");
         } else {
+            crate::runtime::chat_workspace::unregister_profile(&data_dir);
             report.bytes_freed += bytes;
             report.files_removed.push(data_dir.display().to_string());
         }
+    } else {
+        crate::runtime::chat_workspace::unregister_profile(&data_dir);
     }
     let _ = profile_store.delete(profile_id);
     report
