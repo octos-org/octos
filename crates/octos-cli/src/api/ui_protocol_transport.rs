@@ -27974,6 +27974,11 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
                     reason = %err,
                     "background activity dropped: human sink queue full or closed"
                 );
+                // #2021 — a drop must leave a VISIBLE, DURABLE gap. The producer
+                // only increments an in-memory counter (no IO); the DRAIN
+                // persists it below, so slow storage never stalls the emitter
+                // and drops noted before the ledger exists are still counted.
+                crate::autonomy::human_events::note_human_sink_drop(err.into_inner());
             }
         },
     ));
@@ -27986,9 +27991,33 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
         let ws = WsConnection::new(writer_tx);
         let ledger = event_ledger(&state).await;
         info!("background activity human sink started (#2019)");
-        while let Some(event) = rx.recv().await {
-            let _ =
-                send_notification_durable(&ws, &ledger, UiNotification::BackgroundActivity(event));
+        // Persist buffered drop markers after every drained event AND on a
+        // timer (a fully idle stream still gets its gap recorded). A session's
+        // count is cleared only after its marker append succeeded.
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(event) => {
+                            let _ = send_notification_durable(
+                                &ws,
+                                &ledger,
+                                UiNotification::BackgroundActivity(event),
+                            );
+                        }
+                        None => {
+                            crate::autonomy::human_events::flush_human_sink_drops(&ledger, std::time::Instant::now());
+                            return;
+                        }
+                    }
+                }
+                _ = flush_tick.tick() => {}
+            }
+            crate::autonomy::human_events::flush_human_sink_drops(
+                &ledger,
+                std::time::Instant::now(),
+            );
         }
     });
 }

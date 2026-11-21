@@ -64,6 +64,16 @@ pub(crate) fn child_completion_review_instruction() -> &'static str {
     "A terminal child status means execution finished, not acceptance. Review actual outputs and evidence against the current user request. If gaps remain, continue authorized remaining work or send focused feedback to the responsible worker; do not merely list known defects and stop. Do not repeat already verified work or expand scope. Respect stop/pause instructions, approvals and budgets; report genuine blockers. Give a concise final answer when the requested work is verified complete."
 }
 
+/// #2021 — uniform provenance/authority stamp for autonomous system wakes.
+/// A wake is an AUTOMATED EVENT, never a user message, and it confers NO
+/// authority: in particular it is not an approval, confirmation, or consent
+/// for anything pending. Every wake that can move a master (peer awaiting
+/// input, fleet synthesis) ends with this sentence so a master parked on
+/// "shall I proceed?" cannot read the wake itself as the go-ahead; the
+/// wake channel and the authority channel stay distinct.
+pub(crate) const SYSTEM_EVENT_AUTHORITY_NOTICE: &str = "This is an automated system event, not a message from the user, and it is \
+     NOT an approval or confirmation of anything pending.";
+
 pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
     // #1697 — the objective is rendered separately (escaped, fenced) in the
     // GoalContinue arm; keep it out of the raw metadata list there so the
@@ -261,7 +271,7 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
                 .map(String::as_str)
                 .unwrap_or("");
             format!(
-                "[system-internal]\nA peer you staged is awaiting your input — peer \"{slug}\" ({park_kind}): \"{prompt}\". Call the `peer_list` tool to see EVERY peer awaiting input, then use `peer_respond` to answer them. Answer only what is genuinely blocked; if `peer_list` shows nothing awaiting input, that block was already handled — just end the turn."
+                "[system-internal]\nA peer you staged is awaiting your input — peer \"{slug}\" ({park_kind}): \"{prompt}\". Call the `peer_list` tool to see EVERY peer awaiting input, then use `peer_respond` to answer them. Answer only what is genuinely blocked; if `peer_list` shows nothing awaiting input, that block was already handled — just end the turn. {SYSTEM_EVENT_AUTHORITY_NOTICE}"
             )
         }
         // Fleet-keeper WAKE (#1857 PR 4a) — a fleet this session controls made
