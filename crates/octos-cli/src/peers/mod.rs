@@ -4357,7 +4357,7 @@ pub(crate) fn reopen_closed_peer(
         peers_root,
         origin_session,
         &slug,
-        count_peer_result_versions(&peer_dir),
+        &peer_dir,
     )?;
     #[cfg(not(feature = "api"))]
     let _ = (peers_root, origin_session, &slug);
@@ -4568,6 +4568,33 @@ mod reopen_fork_tests {
         // authority, so reopening an OPEN peer is refused (no state flip).
         let err = reopen_closed_peer(&peers, "researcher", MASTER).unwrap_err();
         assert!(err.contains("not closed"), "{err}");
+    }
+
+    /// alan0x review — a LEGACY peer whose only committed result is the bare
+    /// `result.md` (no numbered `result-<n>.md`) delivers round 1 by the fleet
+    /// reader's calculation, so reopening it after the last-peer close reset
+    /// must stamp that round too, or the old result re-fires synthesis.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_stamp_a_legacy_bare_result_peer_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let peers = root.path().join("peers");
+        let slug = stage(&peers, "legacy", "old assignment");
+        let dir = peers.join(&slug);
+        peer_io::write_peer_file_atomic(&dir, "result.md", "legacy findings").unwrap();
+        peer_io::write_peer_file_atomic(&dir, "closed", MASTER).unwrap();
+        assert_eq!(count_peer_result_versions(&dir), 0, "no numbered versions");
+
+        reopen_closed_peer(&peers, "legacy", MASTER).unwrap();
+        let stamp = peers.join(format!(
+            ".synthesized-{}",
+            octos_core::safe_filename(MASTER)
+        ));
+        let body = std::fs::read_to_string(&stamp).expect("legacy result is stamped too");
+        assert!(
+            body.contains("1 legacy"),
+            "the bare result.md counts as delivered round 1: {body}"
+        );
     }
 
     #[test]

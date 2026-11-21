@@ -19950,8 +19950,19 @@ pub(crate) fn mark_reopened_peer_synthesized_through(
     peers_root: &Path,
     master: &str,
     slug: &str,
-    round: u32,
+    peer_dir: &Path,
 ) -> Result<(), String> {
+    // alan0x review: use the FLEET READER's delivered-round calculation, not
+    // just the numbered-version count — a legacy peer with only the bare
+    // `result.md` delivers round 1 even though it has no `result-<n>.md`.
+    let has_result = peer_io::peer_regular_file_exists(peer_dir, "result.md");
+    let round = if has_result {
+        current_peer_result(peers_root, slug)
+            .map(|result| result.round)
+            .unwrap_or_else(|| crate::peers::count_peer_result_versions(peer_dir).max(1))
+    } else {
+        0
+    };
     if round == 0 {
         return Ok(());
     }
