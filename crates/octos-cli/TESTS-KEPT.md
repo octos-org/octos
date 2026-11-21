@@ -343,6 +343,13 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 
 ## Standard cron weekdays (T-0263 / UPCR-058)
 
+Creation admission also retains these persistence regressions (T-0323):
+
+| Category | Test | Contract |
+| --- | --- | --- |
+| 4 | `commands::cron::creation_tests::creation_rejects_unschedulable_cli_cron_without_writing` | Rejected CLI expressions leave empty/existing stores byte-identical; spaced fields, shorthand and valid explicit years remain supported. |
+| 4 | `cron_tool::tests::creation_rejects_unschedulable_tool_cron_without_writing` | Actual tool creation rejects impossible dates, exhausted years, DST gaps and invalid zones without changing disk or live job count. |
+
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 1 | `cron_tool::tests::cron_tool_and_natural_requests_keep_the_requested_weekday` | Raw tool (including internally spaced fields) and Matrix natural-language input persist the requested dates; invalid weekday leaves disk unchanged. |

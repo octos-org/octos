@@ -221,6 +221,13 @@ octos completions bash --dynamic skills     # skills in ./.octos/skills
 
 Manage scheduled jobs.
 
+New cron expressions must parse and have a next occurrence on or before
+2099-12-31 in the selected timezone (UTC for the CLI). Invalid dates, expired
+years and schedules that never run fail before writing `cron.json`; the agent
+cron tool uses the same check. Existing stored schedules keep their semantics.
+CLI/tool expressions may include an optional year and spaces inside fields;
+OUP `cron/create` retains its stricter six-field contract.
+
 ```bash
 octos cron list [--all]                  # List active jobs (--all includes disabled)
 octos cron add [OPTIONS]                 # Add a cron job

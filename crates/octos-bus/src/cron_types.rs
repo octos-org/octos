@@ -1,5 +1,6 @@
 //! Cron job data types.
 
+use eyre::{WrapErr, ensure};
 use serde::{Deserialize, Serialize};
 
 /// How a cron job is scheduled.
@@ -233,16 +234,36 @@ pub fn is_valid_cron_expression(expr: &str, timezone: Option<&str>) -> bool {
     let Ok(schedule) = expr.parse::<cron::Schedule>() else {
         return false;
     };
-    let Ok(timezone) = timezone.unwrap_or("UTC").parse::<chrono_tz::Tz>() else {
-        return false;
-    };
     schedule.years().is_all()
-        && schedule.upcoming(timezone).next().is_some_and(|next| {
-            use chrono::Datelike;
-            // Product boundary: every timezone supports runs through 2099 only.
-            // A later or uncomputable result is not a schedulable new job.
-            next.year() <= 2099
-        })
+        && next_new_cron_run_at_ms(&schedule, timezone, chrono::Utc::now().timestamp_millis())
+            .is_ok()
+}
+
+/// Creation-only calendar check, shared by OUP admission and persisted first runs.
+/// CLI/tool optional years and field-internal spaces remain parser-supported;
+/// the OUP six-field restriction stays at its input boundary.
+fn next_new_cron_run_at_ms(
+    schedule: &cron::Schedule,
+    timezone: Option<&str>,
+    now_ms: i64,
+) -> eyre::Result<i64> {
+    use chrono::Datelike;
+
+    let timezone = timezone
+        .unwrap_or("UTC")
+        .parse::<chrono_tz::Tz>()
+        .wrap_err("invalid cron timezone")?;
+    let now = chrono::DateTime::from_timestamp_millis(now_ms)
+        .ok_or_else(|| eyre::eyre!("invalid cron creation timestamp"))?;
+    let next = schedule
+        .after(&now.with_timezone(&timezone))
+        .next()
+        .ok_or_else(|| eyre::eyre!("cron expression has no future occurrence in {timezone}"))?;
+    ensure!(
+        next.year() <= 2099,
+        "cron next occurrence is beyond 2099-12-31 in {timezone}"
+    );
+    Ok(next.timestamp_millis())
 }
 
 /// Validate a newly submitted IANA timezone without silently falling back to UTC.
@@ -272,6 +293,24 @@ pub fn next_every_run_at_ms(base_ms: i64, every_ms: i64) -> Option<i64> {
 }
 
 impl CronJob {
+    /// Compute a new job's first run, rejecting unschedulable cron expressions
+    /// before callers mutate their stores. Existing jobs retain `compute_next_run`.
+    pub fn compute_first_run(&mut self, now_ms: i64) -> eyre::Result<()> {
+        if let CronSchedule::Cron { expr } = &self.schedule {
+            let schedule = expr
+                .parse::<cron::Schedule>()
+                .wrap_err("invalid cron expression")?;
+            self.state.next_run_at_ms = Some(next_new_cron_run_at_ms(
+                &schedule,
+                self.timezone.as_deref(),
+                now_ms,
+            )?);
+        } else {
+            self.compute_next_run(now_ms);
+        }
+        Ok(())
+    }
+
     /// Compute the next run time based on schedule and current state.
     pub fn compute_next_run(&mut self, now_ms: i64) {
         match &self.schedule {
@@ -357,6 +396,19 @@ impl CronJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_cron_occurrence_honors_creation_clock_at_horizon() {
+        let schedule = "59 59 23 31 12 * 2099".parse::<cron::Schedule>().unwrap();
+        let last = 4_102_444_799_000;
+        assert_eq!(
+            next_new_cron_run_at_ms(&schedule, Some("UTC"), last - 1).unwrap(),
+            last
+        );
+        for now in [last, last + 999, i64::MIN, i64::MAX] {
+            assert!(next_new_cron_run_at_ms(&schedule, Some("UTC"), now).is_err());
+        }
+    }
 
     #[test]
     fn cron_expression_upcoming_check_uses_requested_timezone() {

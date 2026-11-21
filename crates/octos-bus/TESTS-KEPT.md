@@ -96,6 +96,7 @@ These five review pointers make the security boundaries explicit before category
 | 4 | `coalesce::tests::test_truncation_on_massive_input` | Massive output is capped at 50 chunks plus an explicit truncation marker. |
 | 4 | `cron_service::tests::concurrent_adds_and_reconciling_toggles_lose_nothing` | Racing additions and reload-based toggles lose no jobs and remain consistent with disk. |
 | 4 | `cron_service::tests::corrupt_cron_store_is_quarantined_not_silently_discarded` | Corrupt cron bytes are quarantined rather than silently destroyed. |
+| 4 | `cron_service::tests::creation_rejects_unschedulable_cron_without_writing` | Invalid, impossible, expired and out-of-horizon Cron creation leaves both memory and empty/existing stores unchanged. |
 | 4 | `cron_service::tests::serve_delivery_failure_retains_then_disables_after_five_attempts` | Failed delivery retains retry state and disables only after five attempts. |
 | 4 | `cron_service::tests::should_deliver_reserved_fire_when_rearm_aborts_timer_mid_tick` | A committed firing is delivered even when schedule mutation aborts the timer mid-tick. |
 | 4 | `cron_service::tests::should_fire_due_job_exactly_once_when_rearm_races_mid_fire` | Re-arming during delivery cannot duplicate a due job. |
@@ -130,6 +131,7 @@ These five review pointers make the security boundaries explicit before category
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `cron_types::tests::cron_expression_upcoming_check_uses_requested_timezone` | Schedulability uses the requested timezone across DST gaps and the intentional [2099 product boundary](src/cron_types.rs#L195-L223). |
+| 3 | `cron_types::tests::first_cron_occurrence_honors_creation_clock_at_horizon` | The same creation timestamp drives the accepted deadline; expired final occurrences and unrepresentable clocks are rejected. |
 | 5 | `matrix_user_channel::tests::should_fail_open_when_membership_probe_hangs` | A hung membership probe intentionally [fails open after `DM_PROBE_TIMEOUT`](src/matrix_user_channel.rs#L2254-L2256) instead of indefinitely stalling delivery. |
 
 ## Explicit chat → profile routing (#1506)

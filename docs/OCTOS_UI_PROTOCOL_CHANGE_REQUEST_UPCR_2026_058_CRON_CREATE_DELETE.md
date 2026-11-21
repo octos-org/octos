@@ -44,6 +44,14 @@ PR1's acknowledged delivery remains the commit point: one-shot deletion and `ok`
 
 Jobs are persisted by `CronService`, so live serve runtimes, gateway ownership checks, and file-backed stores share the same semantics. No new external management capability is exposed.
 
+New CLI and agent-tool Cron jobs share OUP's timezone-aware first-occurrence
+calculation and 2099 horizon. They fail before persistence if syntax, timezone
+or the next occurrence is invalid, rather than reporting Added/Created with
+`next_run:null`. CLI/tool optional years, shorthand and field-internal spaces
+remain supported; OUP keeps its six-field input restriction. Creation uses the
+captured creation clock for the persisted first run. Stored jobs still use their
+historical scheduler computation without migration.
+
 ## Weekday numbering correction
 
 New OUP creates, CLI `--cron`, and the agent cron tool accept standard

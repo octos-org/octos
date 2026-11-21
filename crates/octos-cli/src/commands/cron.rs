@@ -304,7 +304,7 @@ fn cmd_add(
         // and nothing should ever reap it automatically.
         origin: Default::default(),
     };
-    job.compute_next_run(now_ms);
+    job.compute_first_run(now_ms)?;
 
     store.jobs.push(serde_json::value::to_raw_value(&job)?);
     save_store(store_path, &store)?;
@@ -374,6 +374,10 @@ fn short_id() -> String {
     // A v7 prefix is only a timestamp. Use random bits, then check the store.
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
+
+#[cfg(test)]
+#[path = "cron_creation_tests.rs"]
+mod creation_tests;
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

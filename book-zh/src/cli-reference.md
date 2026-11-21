@@ -214,6 +214,11 @@ octos completions bash --dynamic skills     # ./.octos/skills 中的技能
 
 ## `octos cron`
 
+新建 Cron 表达式必须语法合法，并在所选时区（CLI 使用 UTC）中至少有一次
+不晚于 2099-12-31 的未来执行。无效日期、已过期年份和永不执行的表达式会在
+写入 `cron.json` 前失败；agent cron 工具使用同一校验，已有存量调度语义不变。
+CLI/工具仍允许可选年份和字段内部空格；OUP `cron/create` 仍只接受严格六字段。
+
 管理定时任务。
 
 ```bash

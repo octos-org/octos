@@ -239,7 +239,7 @@ impl CronService {
             timezone,
             origin,
         };
-        job.compute_next_run(now_ms);
+        job.compute_first_run(now_ms)?;
 
         let result = job.clone();
 
@@ -1201,6 +1201,48 @@ mod tests {
             );
             assert!(!path.exists());
             assert!(service.list_all_jobs().is_empty());
+        }
+    }
+
+    #[test]
+    fn creation_rejects_unschedulable_cron_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron.json");
+        let (tx, _rx) = mpsc::channel(1);
+        let service = std::sync::Arc::new(CronService::new(&path, tx));
+        for existing in [false, true] {
+            if existing {
+                service
+                    .add_job(
+                        "legacy".into(),
+                        CronSchedule::Cron {
+                            expr: "0 0 9 * * 1 *".into(),
+                        },
+                        payload("keep Sunday numbering", Default::default()),
+                    )
+                    .unwrap();
+            }
+            let before = std::fs::read(&path).ok();
+            let count = service.list_all_jobs().len();
+            for expr in [
+                "nope",
+                "0 0 0 31 2 * *",
+                "0 0 0 1 1 * 2000",
+                "0 0 0 1 1 * 2100",
+            ] {
+                assert!(
+                    service
+                        .add_job(
+                            "bad".into(),
+                            CronSchedule::Cron { expr: expr.into() },
+                            payload("bad", Default::default())
+                        )
+                        .is_err(),
+                    "accepted {expr}"
+                );
+                assert_eq!(std::fs::read(&path).ok(), before);
+                assert_eq!(service.list_all_jobs().len(), count);
+            }
         }
     }
 
