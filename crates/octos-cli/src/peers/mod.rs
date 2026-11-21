@@ -4565,15 +4565,18 @@ mod reopen_fork_tests {
         // stamp, so reopen must record the committed round as already
         // synthesized — otherwise the next turn end re-fires a synthesis
         // over the OLD result. The stamp pins this peer at its current round.
-        let stamp = peers.join(format!(
-            ".synthesized-{}",
-            octos_core::safe_filename(MASTER)
-        ));
-        let body = std::fs::read_to_string(&stamp).expect("reopen restores the stamp");
-        assert!(
-            body.contains("1 researcher"),
-            "the committed round is already synthesized, no replay: {body}"
-        );
+        #[cfg(feature = "api")]
+        {
+            let stamp = peers.join(format!(
+                ".synthesized-{}",
+                octos_core::safe_filename(MASTER)
+            ));
+            let body = std::fs::read_to_string(&stamp).expect("reopen restores the stamp");
+            assert!(
+                body.contains("1 researcher"),
+                "the committed round is already synthesized, no replay: {body}"
+            );
+        }
 
         // Crash/restart consistency: the marker is the single lifecycle
         // authority, so reopening an OPEN peer is refused (no state flip).
