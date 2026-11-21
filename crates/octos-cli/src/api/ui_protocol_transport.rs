@@ -19938,6 +19938,50 @@ fn write_peer_fleet_synthesis_marks(
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+/// octos#2026 review (BH3GEI) — when a peer is REOPENED, record its current
+/// round as already-synthesized for its master, so the fleet gate does NOT
+/// fire a fresh autonomous synthesis over results that were committed BEFORE
+/// the close (closing the last peer resets the stamp). Existing records are
+/// kept and never downgraded; a `Legacy` stamp already covers every peer at
+/// its current round, so it is left alone. Called BEFORE the close marker is
+/// cleared: a failed stamp write fails the reopen fail-closed rather than
+/// letting the old results re-fire.
+pub(crate) fn mark_reopened_peer_synthesized_through(
+    peers_root: &Path,
+    master: &str,
+    slug: &str,
+    peer_dir: &Path,
+) -> Result<(), String> {
+    // alan0x review: use the FLEET READER's delivered-round calculation, not
+    // just the numbered-version count — a legacy peer with only the bare
+    // `result.md` delivers round 1 even though it has no `result-<n>.md`.
+    let has_result = peer_io::peer_regular_file_exists(peer_dir, "result.md");
+    let round = if has_result {
+        current_peer_result(peers_root, slug)
+            .map(|result| result.round)
+            .unwrap_or_else(|| crate::peers::count_peer_result_versions(peer_dir).max(1))
+    } else {
+        0
+    };
+    if round == 0 {
+        return Ok(());
+    }
+    match read_peer_fleet_synthesis_marks(peers_root, master) {
+        FleetSynthesisMarks::Legacy => Ok(()),
+        FleetSynthesisMarks::None | FleetSynthesisMarks::Rounds(_) => {
+            let mut marks = match read_peer_fleet_synthesis_marks(peers_root, master) {
+                FleetSynthesisMarks::Rounds(rounds) => rounds,
+                _ => HashMap::new(),
+            };
+            let entry = marks.entry(slug.to_owned()).or_insert(0);
+            *entry = (*entry).max(round);
+            let ordered: Vec<(String, u32)> = marks.into_iter().collect();
+            write_peer_fleet_synthesis_marks(peers_root, master, &ordered)
+                .map_err(|err| format!("failed to preserve synthesis marks on reopen: {err}"))
+        }
+    }
+}
+
 /// Remove the per-master `.synthesized` marker (best-effort). Absent is not an
 /// error. Used to RESET a fully-cleared fleet so a fresh one can fire once.
 fn remove_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) {
@@ -40115,6 +40159,34 @@ async fn run_standalone_turn(
                 emit_cancelled,
             );
             tool_registry.register(octos_agent::PeerCloseTool::new(close));
+
+            // octos#2026 (T-0411) — native peer REOPEN / FORK. Same depth-1
+            // gate as peer_close (this whole block is peer-handoff-gated, so
+            // peer sessions never see these tools); the callbacks enforce
+            // originator-only authorization and the host-app lifetime fence.
+            let reopen_peers_root = session_runtime.profile.data_dir.join("peers");
+            let reopen_origin_session = session_id.to_string();
+            tool_registry.register(octos_agent::PeerReopenTool::new(Arc::new(
+                move |ident: String| {
+                    crate::peers::reopen_closed_peer(
+                        &reopen_peers_root,
+                        &ident,
+                        &reopen_origin_session,
+                    )
+                },
+            )));
+            let fork_peers_root = session_runtime.profile.data_dir.join("peers");
+            let fork_origin_session = session_id.to_string();
+            tool_registry.register(octos_agent::PeerForkTool::new(Arc::new(
+                move |ident: String, name: Option<String>| {
+                    crate::peers::fork_staged_peer(
+                        &fork_peers_root,
+                        &ident,
+                        &fork_origin_session,
+                        name.as_deref(),
+                    )
+                },
+            )));
 
             // #peer-respond — answer a peer BLOCKED on an interactive prompt
             // (tool-approval or clarifying question) so the master acts as its
