@@ -4351,6 +4351,11 @@ pub(crate) fn reopen_closed_peer(
              peer_reopen cannot reopen it (the app resumes it by its binding)"
         ));
     }
+    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug) {
+        return Err(format!(
+            "peer '{slug}' has {reason} — peer_reopen cannot revive a purged peer's residue"
+        ));
+    }
     let Some(peer_dir) = staged_peer_dir(peers_root, &slug) else {
         return Err(format!(
             "peer '{slug}' no longer exists (its staged directory was removed)"
@@ -4410,6 +4415,11 @@ pub(crate) fn fork_staged_peer(
         return Err(format!(
             "peer '{slug}' belongs to its host app, which owns its lifetime; \
              peer_fork cannot fork it"
+        ));
+    }
+    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug) {
+        return Err(format!(
+            "peer '{slug}' has {reason} — peer_fork cannot inherit a purged peer's residue"
         ));
     }
     let Some(source_dir) = staged_peer_dir(peers_root, &slug) else {
@@ -4735,6 +4745,57 @@ mod reopen_fork_tests {
             count, 3,
             "source + two forks only, no half-staged dir: {count}"
         );
+    }
+
+    /// #2026 review (BH3GEI) — a purge tombstone (finalized or not) or a
+    /// live purge intent / recovery must block BOTH reopen and fork: reopen
+    /// would delete the purge's close marker and revive a purged peer, fork
+    /// would copy the residue brief into a fresh slug.
+    #[test]
+    fn should_refuse_reopen_and_fork_when_the_source_is_purge_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let peers = root.path().join("peers");
+        let slug = stage(&peers, "researcher", "investigate the cache regression");
+        let dir = peers.join(&slug);
+        peer_io::write_peer_file_atomic(&dir, "closed", MASTER).unwrap();
+
+        // Unfinalized tombstone (a torn erase): both refused, marker intact.
+        purge::write_slug_tombstone(&peers, &slug, "2026-11-21T00:00:00Z").unwrap();
+        let err = reopen_closed_peer(&peers, "researcher", MASTER).unwrap_err();
+        assert!(err.contains("tombstone"), "{err}");
+        assert!(
+            peer_is_closed(&peers, &slug),
+            "the purge's close marker survives"
+        );
+        let err = fork_staged_peer(&peers, "researcher", MASTER, None).unwrap_err();
+        assert!(err.contains("tombstone"), "{err}");
+        assert!(!peers.join("researcher-fork").exists());
+        // Finalized tombstone: still refused (a purge owns the slug's residue).
+        purge::finalize_slug_tombstone(&peers, &slug, "2026-11-21T00:00:00Z").unwrap();
+        assert!(reopen_closed_peer(&peers, "researcher", MASTER).is_err());
+        assert!(fork_staged_peer(&peers, "researcher", MASTER, None).is_err());
+
+        // A live purge intent / recovery in progress: also refused.
+        let clean = stage(&peers, "analyst", "compare the two cache designs");
+        let clean_dir = peers.join(&clean);
+        peer_io::write_peer_file_atomic(&clean_dir, "closed", MASTER).unwrap();
+        let intent = purge::PurgeIntent::new(
+            clean.clone(),
+            Some("analyst".into()),
+            MASTER.to_owned(),
+            app_binding::PeerHostBinding {
+                version: 1,
+                cwd: clean_dir.clone(),
+                memory_namespace: "app/analyst/acct-1".into(),
+                token_sha256: String::new(),
+            },
+            Vec::new(),
+        );
+        purge::write_purge_intent(&peers, &intent).unwrap();
+        let err = reopen_closed_peer(&peers, "analyst", MASTER).unwrap_err();
+        assert!(err.contains("purge intent"), "{err}");
+        let err = fork_staged_peer(&peers, "analyst", MASTER, None).unwrap_err();
+        assert!(err.contains("purge intent"), "{err}");
     }
 
     #[test]

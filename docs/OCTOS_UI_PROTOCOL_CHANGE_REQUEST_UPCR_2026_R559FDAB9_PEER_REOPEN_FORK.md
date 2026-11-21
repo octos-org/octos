@@ -1,7 +1,7 @@
 # UPCR-2026-R559FDAB9 — Native peer reopen and fork (octos#2026)
 
 Status: proposed
-PR: TBD
+PR: #3333
 
 ## Decision record
 

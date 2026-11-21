@@ -586,3 +586,20 @@ mod tests {
         assert!(read_purge_intent(&peers_root, "mail").is_none());
     }
 }
+
+/// #2026 review (BH3GEI) — why a slug must NOT be reopened or forked right
+/// now: a purge tombstone (finalized OR not) means the erase owns the slug's
+/// residue, and a live (unexpired) purge intent means a purge / its recovery
+/// is still in progress. `peer_reopen` would otherwise delete the purge's
+/// close marker and revive a purged peer, and `peer_fork` would copy the
+/// residue brief into a fresh slug. The #3332 fence on `reserve_*` guards
+/// only the NEW slug; this guard covers the SOURCE.
+pub(crate) fn purge_blocks_peer_reuse(peers_root: &Path, slug: &str) -> Option<&'static str> {
+    if slug_tombstone_exists(peers_root, slug) {
+        return Some("a purge tombstone");
+    }
+    if find_purge_intent(peers_root, slug).is_some_and(|intent| !intent.expired()) {
+        return Some("a pending purge intent / recovery in progress");
+    }
+    None
+}
