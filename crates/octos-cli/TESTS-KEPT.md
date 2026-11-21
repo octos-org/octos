@@ -359,3 +359,10 @@ Creation admission also retains these persistence regressions (T-0323):
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
+
+## Agent/peer profile-scoped delivery (#2081, UPCR-2026-R8C3A1D2E)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::ui_protocol_transport::tests::should_drop_cross_profile_agent_and_peer_frames_when_connection_scopes_another_profile` | A profile-scoped connection never replays nor live-receives another profile's `agent/updated`, `peer/staged` or `peer/closed` on a shared session key, while its own profile's frames still arrive on both paths (#2081). |
+| 3 | `api::ui_protocol_transport::tests::should_deliver_agent_and_peer_frames_to_an_unscoped_connection` | The unauthenticated/stdio boundary is preserved: an unpinned connection receives every profile's agent/peer frames on replay and live, so the routed-header deployment mode cannot starve its own producer (#2081). |
