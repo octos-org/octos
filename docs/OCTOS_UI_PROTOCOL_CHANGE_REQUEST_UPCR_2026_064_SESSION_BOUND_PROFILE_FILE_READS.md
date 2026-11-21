@@ -167,8 +167,19 @@ closes every topic and revokes each corresponding actor key, including idle
 canonical and flat transcripts. Enumeration failures remain retryable errors. This ends
 the original SSE response without fabricating a model result or adding a wire
 event. Independent topics have separate streams; same-topic overflow keeps the
-existing queued acknowledgment and stream. Only threads admitted to that stream
-can deliver to it, so late output from a deleted request cannot close or write
+existing queued acknowledgment and stream. A startup rejection completes only
+its rejected thread and removes only that thread from the pending stream; the
+shared sender and earlier admitted threads remain available for their responses.
+Rejection delivery uses a nonblocking dispatcher handoff when the outbound bus is
+full. Every inbound owns one of 2,048 global pre-inbox/terminal-delivery permits
+(the existing maximum Starting-queue population)
+until actor-inbox acceptance or terminal-send resolution; a full-bus fallback
+carries that permit into its single task, so blocked tasks/messages/senders are
+bounded. At capacity the gateway stops only new inbound receives while deletion,
+construction completion, and shutdown continue. Existing bounded inbound queues
+apply admission backpressure; accepted requests are delayed, never silently
+shed. Only threads admitted to that stream can deliver to it, so late output from
+a deleted request cannot close or write
 into a fresh thread's stream. API actor replies/completions retain their exact topic and thread and bypass
 the shared-chat visible-topic buffer; otherwise a freshly opened topic request
 would wait for a `/s` command even after the model completed. Non-API transports
@@ -188,6 +199,12 @@ A base deletion invalidates all earlier topic admissions; an exact topic delete
 preserves unrelated topic admissions. New requests after successful deletion
 can explicitly start a new incarnation. Repeated deletion and concurrent
 completion remain idempotent; caller disconnect does not abandon deletion.
+Construction registration uses a nonblocking deletion-fence read attempt. While
+cleanup owns or awaits the write fence, new construction returns the existing
+retryable deletion response immediately instead of parking the single gateway
+dispatcher or becoming admitted after cleanup. A registration that wins the
+read fence first remains visible to deletion's generation cancellation;
+unrelated sessions continue dispatch and construction throughout cleanup.
 
 When canonical and flat files already coexist without a migration marker,
 opening a canonical writer preserves the flat file. Coexistence cannot prove a

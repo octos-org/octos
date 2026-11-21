@@ -273,6 +273,8 @@ async fn setup_actor_with_mode(
     adaptive_router: Option<Arc<AdaptiveRouter>>,
     pre_seed_baseline: bool,
     dir: &tempfile::TempDir,
+    start: Option<oneshot::Receiver<()>>,
+    startup: Option<(ActorPublish, Arc<ConstructionTicket>, Arc<Semaphore>)>,
 ) -> (
     mpsc::Sender<ActorMessage>,
     mpsc::Receiver<OutboundMessage>,
@@ -303,7 +305,16 @@ async fn setup_actor_with_mode(
         }
     }
 
+    let (publish, ticket, construction_semaphore) = match startup {
+        Some((publish, ticket, semaphore)) => (Some(publish), Some(ticket), Some(semaphore)),
+        None => (None, None, None),
+    };
     let actor = SessionActor {
+        start,
+        publish,
+        startup_complete: Arc::new(AtomicBool::new(false)),
+        ticket,
+        construction_semaphore,
         session_key: test_session_key(dir.path()),
         channel: "cli".to_string(),
         chat_id: "test".to_string(),
@@ -386,6 +397,8 @@ async fn setup_speculative_actor(
         Some(router),
         true,
         dir,
+        None,
+        None,
     )
     .await
 }
@@ -596,8 +609,16 @@ async fn late_background_result_persists_with_originating_thread_id_not_derived_
     // Spawn the actor — its `SessionHandle::open` will load the three
     // pre-seeded users so the actor's in-memory mirror agrees with disk.
     let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
-    let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+    let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+        agent_llm,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        None,
+        None,
+    )
+    .await;
 
     // Drive the late background result. `originating_thread_id` is Q1 —
     // pre-fix, derivation in `add_message_with_seq` would pick Q3
@@ -682,8 +703,16 @@ async fn test_agent_error_persists_to_history() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_llm = Arc::new(ErrorMockProvider::new("agent", "scripted failure"));
 
-    let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+    let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+        agent_llm,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        None,
+        None,
+    )
+    .await;
 
     tx.send(make_inbound("cause failure")).await.unwrap();
 
@@ -993,8 +1022,16 @@ async fn supervisor_failure_signal_generates_recovery_continuation_end_to_end() 
         "agent",
         vec![(Duration::from_millis(50), make_response("recovery-handled"))],
     ));
-    let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+    let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+        agent_llm,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        None,
+        None,
+    )
+    .await;
 
     let session_key = test_session_key(dir.path());
     let supervisor = wire_supervisor_to_continuation_queue(&session_key);
@@ -1060,8 +1097,16 @@ async fn recovery_turn_preserves_originating_client_message_id_from_failure_sign
             make_response("recovery-handled-738"),
         )],
     ));
-    let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+    let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+        agent_llm,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        None,
+        None,
+    )
+    .await;
 
     let session_key = test_session_key(dir.path());
     let supervisor = wire_supervisor_to_continuation_queue(&session_key);
@@ -1161,8 +1206,16 @@ async fn background_failure_recovery_capped_at_max_retries() {
             ),
         ],
     ));
-    let (tx, mut rx, handle, _session_mgr) =
-        setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+    let (tx, mut rx, handle, _session_mgr) = setup_actor_with_mode(
+        agent_llm,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        None,
+        None,
+    )
+    .await;
 
     let supervisor = wire_supervisor_to_continuation_queue(&test_session_key(dir.path()));
 
@@ -1471,4 +1524,1154 @@ fn walkdir_find_session_jsonl(users_dir: &std::path::Path) -> Option<std::path::
         None
     }
     visit(users_dir)
+}
+
+// ── T-0296: bounded dispatcher-owned actor construction ──────────────────
+
+enum FakeBehavior {
+    Ready,
+    Block(std::sync::mpsc::Receiver<()>),
+    Panic,
+    Cancelled,
+}
+
+#[derive(Clone, Default)]
+struct FakeFactory {
+    behaviors: Arc<StdMutex<HashMap<String, VecDeque<FakeBehavior>>>>,
+    entered: Arc<StdMutex<Vec<String>>>,
+    inboxes: Arc<StdMutex<HashMap<String, Vec<mpsc::Receiver<ActorMessage>>>>>,
+    gates: Arc<StdMutex<HashMap<String, Vec<oneshot::Receiver<()>>>>>,
+    events: Arc<StdMutex<Vec<String>>>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl FakeFactory {
+    fn queue(&self, key: &SessionKey, behavior: FakeBehavior) {
+        self.behaviors
+            .lock()
+            .unwrap()
+            .entry(key.0.clone())
+            .or_default()
+            .push_back(behavior);
+    }
+
+    fn entered(&self) -> usize {
+        self.entered.lock().unwrap().len()
+    }
+
+    fn take_inbox(&self, key: &SessionKey, incarnation: usize) -> mpsc::Receiver<ActorMessage> {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get_mut(&key.0)
+            .and_then(|inboxes| (incarnation < inboxes.len()).then(|| inboxes.remove(incarnation)))
+            .expect("fake actor incarnation inbox")
+    }
+
+    fn take_gate(&self, key: &SessionKey, incarnation: usize) -> oneshot::Receiver<()> {
+        self.gates
+            .lock()
+            .unwrap()
+            .get_mut(&key.0)
+            .and_then(|gates| (incarnation < gates.len()).then(|| gates.remove(incarnation)))
+            .expect("fake actor incarnation gate")
+    }
+}
+
+struct ActiveFactory(Arc<AtomicUsize>);
+impl Drop for ActiveFactory {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ActorSpawnFactory for FakeFactory {
+    fn spawn(&self, params: SpawnParams<'_>) -> ActorParts {
+        self.entered
+            .lock()
+            .unwrap()
+            .push(params.session_key.0.clone());
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        let _active = ActiveFactory(self.active.clone());
+        let behavior = self
+            .behaviors
+            .lock()
+            .unwrap()
+            .get_mut(&params.session_key.0)
+            .and_then(|behaviors| behaviors.pop_front())
+            .unwrap_or(FakeBehavior::Ready);
+        match behavior {
+            FakeBehavior::Ready => {}
+            FakeBehavior::Block(receiver) => receiver.recv().unwrap(),
+            FakeBehavior::Panic => panic!("injected actor factory panic"),
+            FakeBehavior::Cancelled => return ActorParts::cancelled(),
+        }
+        let (tx, rx) = mpsc::channel(ACTOR_INBOX_SIZE);
+        let (start_tx, start_rx) = oneshot::channel();
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(params.session_key.0.clone())
+            .or_default()
+            .push(start_rx);
+        self.inboxes
+            .lock()
+            .unwrap()
+            .entry(params.session_key.0)
+            .or_default()
+            .push(rx);
+        ActorParts {
+            tx,
+            cancelled: false,
+            actor: None,
+            forwarder: None,
+            start: Some(start_tx),
+            test_events: Some(self.events.clone()),
+        }
+    }
+}
+
+fn fake_registry(factory: &FakeFactory) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
+    fake_registry_with_capacity(factory, 256)
+}
+
+fn fake_registry_with_capacity(
+    factory: &FakeFactory,
+    outbound_capacity: usize,
+) -> (ActorRegistry, mpsc::Receiver<OutboundMessage>) {
+    let (out_tx, out_rx) = mpsc::channel(outbound_capacity);
+    (
+        ActorRegistry::new_with_factory(
+            factory.clone(),
+            Arc::new(Semaphore::new(128)),
+            out_tx,
+            PendingMessages::default(),
+        ),
+        out_rx,
+    )
+}
+
+fn fake_params(key: &SessionKey, content: &str) -> DispatchParams<'static> {
+    let ActorMessage::Inbound {
+        message,
+        image_media,
+        attachment_media,
+        attachment_prompt,
+    } = make_inbound(content)
+    else {
+        unreachable!()
+    };
+    DispatchParams {
+        message,
+        image_media,
+        attachment_media,
+        attachment_prompt,
+        session_key: key.clone(),
+        reply_channel: "cli",
+        reply_chat_id: "test",
+        status_indicator: None,
+        profile_id: None,
+        tenant_id: None,
+        system_prompt_override: None,
+        sender_user_id: None,
+    }
+}
+
+#[cfg(feature = "api")]
+fn real_api_params<'a>(
+    inbound: &'a octos_core::InboundMessage,
+    key: &SessionKey,
+) -> DispatchParams<'a> {
+    DispatchParams {
+        message: inbound.clone(),
+        image_media: vec![],
+        attachment_media: vec![],
+        attachment_prompt: None,
+        session_key: key.clone(),
+        reply_channel: "api",
+        reply_chat_id: &inbound.chat_id,
+        status_indicator: None,
+        profile_id: Some("test-profile"),
+        tenant_id: None,
+        system_prompt_override: None,
+        sender_user_id: None,
+    }
+}
+
+async fn finish_one(registry: &mut ActorRegistry) {
+    let done = tokio::time::timeout(
+        waiting_budget(Duration::from_secs(10)),
+        registry.next_construction_done(),
+    )
+    .await
+    .expect("construction result arrives")
+    .expect("construction channel remains open");
+    registry.finish_construction(done).await;
+}
+
+async fn next_outbound(rx: &mut mpsc::Receiver<OutboundMessage>) -> OutboundMessage {
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), rx.recv())
+        .await
+        .expect("outbound error arrives")
+        .expect("outbound channel remains open")
+}
+
+fn actor_text(message: ActorMessage) -> String {
+    let ActorMessage::Inbound { message, .. } = message else {
+        panic!("expected inbound message")
+    };
+    message.content
+}
+
+async fn wait_for_factory_entries(factory: &FakeFactory, count: usize) {
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while factory.entered() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("factory entries reach the expected count");
+}
+
+#[tokio::test]
+async fn starting_delete_fails_queue_and_ignores_late_construction() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:starting-delete".into());
+    let (release, blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(blocked));
+    registry.dispatch(fake_params(&key, "old")).await;
+    wait_for_factory_entries(&factory, 1).await;
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(10)),
+        registry.remove_session(&key.0),
+    )
+    .await
+    .expect("Starting deletion is not blocked by factory");
+    assert!(next_outbound(&mut out_rx).await.content.contains("deleted"));
+    release.send(()).unwrap();
+    factory.queue(&key, FakeBehavior::Ready);
+    finish_one(&mut registry).await;
+    let mut old_inbox = factory.take_inbox(&key, 0);
+    assert!(matches!(
+        old_inbox.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    registry.dispatch(fake_params(&key, "new")).await;
+    finish_one(&mut registry).await;
+    registry.dispatch(fake_params(&key, "after")).await;
+    let mut inbox = factory.take_inbox(&key, 0);
+    assert_eq!(actor_text(inbox.recv().await.unwrap()), "new");
+    assert_eq!(actor_text(inbox.recv().await.unwrap()), "after");
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn starting_dispatch_releases_api_admission_for_delete() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (deleted_tx, mut deleted_rx) = mpsc::unbounded_channel();
+    let channel = Arc::new(
+        octos_bus::ApiChannel::new(
+            port,
+            None,
+            shutdown.clone(),
+            sessions,
+            Some("test-profile".into()),
+        )
+        .with_on_session_deleted(move |key| {
+            let _ = deleted_tx.send(key.to_owned());
+        }),
+    );
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let server = {
+        let channel = channel.clone();
+        tokio::spawn(async move { octos_bus::Channel::start(&*channel, inbound_tx).await })
+    };
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let _chat = client
+        .post(format!("http://127.0.0.1:{port}/chat"))
+        .json(&serde_json::json!({"message":"start", "session_id":"starting-delete", "thread_id":"t"}))
+        .send()
+        .await
+        .unwrap();
+    let inbound = tokio::time::timeout(waiting_budget(Duration::from_secs(10)), inbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let key = SessionKey::with_profile("test-profile", "api", "starting-delete");
+    let admission = octos_bus::Channel::admit_dispatch(&*channel, &inbound, &key)
+        .await
+        .unwrap();
+    let (release, blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(blocked));
+    registry
+        .dispatch_admitted(fake_params(&key, "start"), Some(admission))
+        .await;
+    let response = tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        client
+            .delete(format!("http://127.0.0.1:{port}/sessions/starting-delete"))
+            .send(),
+    )
+    .await
+    .expect("Starting construction must not hold the API deletion read lease")
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let deleted = tokio::time::timeout(waiting_budget(Duration::from_secs(2)), deleted_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    registry.remove_session(&deleted).await;
+    assert!(next_outbound(&mut out_rx).await.content.contains("deleted"));
+    release.send(()).unwrap();
+    finish_one(&mut registry).await;
+    assert_eq!(registry.len(), 0);
+    let mut inbox = factory.take_inbox(&key, 0);
+    assert!(matches!(
+        inbox.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    shutdown.store(true, Ordering::Release);
+    server.abort();
+}
+
+#[cfg(feature = "api")]
+#[tokio::test]
+async fn startup_rejection_preserves_shared_api_stream_for_earlier_thread() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = Arc::new(Mutex::new(SessionManager::open(dir.path()).unwrap()));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let channel = Arc::new(octos_bus::ApiChannel::new(
+        port,
+        None,
+        shutdown.clone(),
+        sessions,
+        Some("test-profile".into()),
+    ));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let server = {
+        let channel = channel.clone();
+        tokio::spawn(async move { octos_bus::Channel::start(&*channel, inbound_tx).await })
+    };
+    let forwarder = {
+        let channel = channel.clone();
+        tokio::spawn(async move {
+            while let Some(message) = out_rx.recv().await {
+                let _ = octos_bus::Channel::send(&*channel, &message).await;
+            }
+        })
+    };
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let chat = format!("http://127.0.0.1:{port}/chat");
+    let mut stream = client
+        .post(&chat)
+        .json(&serde_json::json!({"message":"early", "session_id":"shared-stream", "thread_id":"early"}))
+        .send()
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(waiting_budget(Duration::from_secs(10)), inbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let key = SessionKey::with_profile("test-profile", "api", "shared-stream");
+    let admission = octos_bus::Channel::admit_dispatch(&*channel, &early, &key)
+        .await
+        .unwrap();
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    registry.actors.insert(
+        ActorRegistry::actor_key(&key, Some("test-profile")),
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+    registry
+        .dispatch_admitted(real_api_params(&early, &key), Some(admission))
+        .await;
+
+    let queued = client
+        .post(&chat)
+        .json(&serde_json::json!({"message":"overflow", "session_id":"shared-stream", "thread_id":"overflow"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), reqwest::StatusCode::OK);
+    let overflow = tokio::time::timeout(waiting_budget(Duration::from_secs(10)), inbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let admission = octos_bus::Channel::admit_dispatch(&*channel, &overflow, &key)
+        .await
+        .unwrap();
+    registry
+        .dispatch_admitted(real_api_params(&overflow, &key), Some(admission))
+        .await;
+
+    let mut received = String::new();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while !received.contains("session_actor_starting") || !received.contains("overflow") {
+            let chunk = stream
+                .chunk()
+                .await
+                .unwrap()
+                .expect("SSE ended before overflow error");
+            received.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap();
+    octos_bus::Channel::send(
+        &*channel,
+        &OutboundMessage {
+            channel: "api".into(),
+            chat_id: "shared-stream".into(),
+            content: "early-response".into(),
+            reply_to: early.message_id.clone(),
+            media: vec![],
+            metadata: serde_json::json!({"thread_id":"early"}),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while !received.contains("early-response") {
+            let chunk = stream
+                .chunk()
+                .await
+                .unwrap()
+                .expect("shared SSE closed before the earlier thread responded");
+            received.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.store(true, Ordering::Release);
+    forwarder.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn construction_replays_fifo_before_actor_start_and_bounds_queue() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:construction-fifo#peer-test".into());
+    let (release, blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(blocked));
+    for i in 0..ACTOR_INBOX_SIZE {
+        registry
+            .dispatch(fake_params(&key, &format!("message-{i}")))
+            .await;
+    }
+    registry.dispatch(fake_params(&key, "overflow")).await;
+    let busy = next_outbound(&mut out_rx).await;
+    assert!(busy.content.contains("retry"));
+    assert_eq!(busy.metadata["retryable"], true);
+    release.send(()).unwrap();
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(10)),
+        finish_one(&mut registry),
+    )
+    .await
+    .expect("a full Starting queue replays without a closed-gate deadlock");
+    let mut inbox = factory.take_inbox(&key, 0);
+    for i in 0..ACTOR_INBOX_SIZE {
+        assert_eq!(
+            actor_text(inbox.recv().await.unwrap()),
+            format!("message-{i}")
+        );
+    }
+    let events = factory.events.lock().unwrap();
+    let observed = events.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut expected = vec!["actor_start"];
+    expected.extend(std::iter::repeat_n("queued", ACTOR_INBOX_SIZE));
+    expected.extend(["gate_open", "peer_registered"]);
+    assert_eq!(observed, expected);
+    drop(events);
+    let peer_key = peer_inbox_key(MAIN_PROFILE_ID, "test");
+    assert!(
+        peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .contains_key(&peer_key)
+    );
+    peer_inbox_registry().lock().unwrap().remove(&peer_key);
+}
+
+#[tokio::test]
+async fn actor_run_waits_for_start_gate_before_inbox() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(DelayedMockProvider::new(
+        "gated",
+        vec![(Duration::from_millis(0), make_response("gated response"))],
+    ));
+    let (start_tx, start_rx) = oneshot::channel();
+    let (inbox_tx, _out_rx, handle, _session_mgr) = setup_actor_with_mode(
+        provider.clone(),
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        Some(start_rx),
+        None,
+    )
+    .await;
+    inbox_tx
+        .send(make_inbound("queued user message"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    start_tx.send(()).unwrap();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        while provider.call_count.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the queued message reaches the model only after the gate opens");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn publish_panic_fails_queued_turn_retryable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let key = test_session_key(dir.path());
+    let ticket = ConstructionTicket::register(&key).await.unwrap();
+    let provider = Arc::new(DelayedMockProvider::new("publish-panic", vec![]));
+    let (start_tx, start_rx) = oneshot::channel();
+    let publish: ActorPublish = Box::new(|| panic!("injected publish panic"));
+    let (inbox_tx, mut out_rx, handle, _session_mgr) = setup_actor_with_mode(
+        provider.clone(),
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        Some(start_rx),
+        Some((publish, ticket, Arc::new(Semaphore::new(1)))),
+    )
+    .await;
+    inbox_tx
+        .send(make_inbound("queued during publish"))
+        .await
+        .unwrap();
+    start_tx.send(()).unwrap();
+    let error = next_outbound(&mut out_rx).await;
+    assert_eq!(error.metadata["error_code"], "session_actor_starting");
+    assert_eq!(error.metadata["retryable"], true);
+    assert_eq!(error.metadata["truncated"], true);
+    assert!(error.content.contains("failed to start"));
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn delete_during_publish_cancels_before_model_and_allows_replacement() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let key = test_session_key(dir.path());
+    let ticket = ConstructionTicket::register(&key).await.unwrap();
+    let old_ticket = ticket.clone();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let publish_phase = phase.clone();
+    let publish: ActorPublish = Box::new(move || {
+        publish_phase.store(1, Ordering::Release);
+        while publish_phase.load(Ordering::Acquire) != 2 {
+            std::thread::yield_now();
+        }
+    });
+    let provider = Arc::new(DelayedMockProvider::new("publish-delete", vec![]));
+    let (start_tx, start_rx) = oneshot::channel();
+    let (inbox_tx, mut out_rx, handle, _session_mgr) = setup_actor_with_mode(
+        provider.clone(),
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        Some(start_rx),
+        Some((publish, ticket, Arc::new(Semaphore::new(1)))),
+    )
+    .await;
+    inbox_tx
+        .send(make_inbound("queued during delete"))
+        .await
+        .unwrap();
+    start_tx.send(()).unwrap();
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), async {
+        while phase.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let deleting = {
+        let key = key.clone();
+        tokio::spawn(
+            async move { octos_bus::construction_fence::begin_session_deletion(&key).await },
+        )
+    };
+    tokio::task::yield_now().await;
+    phase.store(2, Ordering::Release);
+    let deletion = tokio::time::timeout(waiting_budget(Duration::from_secs(2)), deleting)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = next_outbound(&mut out_rx).await;
+    assert_eq!(error.metadata["retryable"], true);
+    assert_eq!(error.metadata["truncated"], true);
+    assert!(error.content.contains("deleted"));
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(deletion);
+    assert!(old_ticket.is_cancelled());
+    let replacement = ConstructionTicket::register(&key).await.unwrap();
+    assert!(!replacement.is_cancelled());
+}
+
+#[tokio::test]
+async fn publish_and_factory_share_construction_permits() {
+    let factory = FakeFactory::default();
+    let (mut registry, _out_rx) = fake_registry(&factory);
+    let mut releases = Vec::new();
+    for i in 0..MAX_CONCURRENT_FACTORIES {
+        let key = SessionKey(format!("cli:shared-permit-{i}"));
+        let (release, blocked) = std::sync::mpsc::channel();
+        factory.queue(&key, FakeBehavior::Block(blocked));
+        registry.dispatch(fake_params(&key, "first")).await;
+        releases.push(release);
+    }
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES).await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let key = test_session_key(dir.path());
+    let ticket = ConstructionTicket::register(&key).await.unwrap();
+    let phase = Arc::new(AtomicUsize::new(0));
+    let publish_phase = phase.clone();
+    let publish: ActorPublish = Box::new(move || {
+        publish_phase.store(1, Ordering::Release);
+        while publish_phase.load(Ordering::Acquire) != 2 {
+            std::thread::yield_now();
+        }
+    });
+    let provider = Arc::new(DelayedMockProvider::new("shared-permit", vec![]));
+    let (start_tx, start_rx) = oneshot::channel();
+    let (_inbox_tx, _actor_out_rx, handle, _session_mgr) = setup_actor_with_mode(
+        provider,
+        QueueMode::Followup,
+        None,
+        false,
+        &dir,
+        Some(start_rx),
+        Some((publish, ticket, registry.factory_semaphore.clone())),
+    )
+    .await;
+    start_tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(phase.load(Ordering::Acquire), 0);
+    releases[0].send(()).unwrap();
+    finish_one(&mut registry).await;
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), async {
+        while phase.load(Ordering::Acquire) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let extra = SessionKey("cli:shared-permit-extra".into());
+    let (extra_release, extra_blocked) = std::sync::mpsc::channel();
+    factory.queue(&extra, FakeBehavior::Block(extra_blocked));
+    registry.dispatch(fake_params(&extra, "extra")).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(factory.entered(), MAX_CONCURRENT_FACTORIES);
+    phase.store(2, Ordering::Release);
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES + 1).await;
+    handle.abort();
+    for release in releases.iter().skip(1) {
+        release.send(()).unwrap();
+    }
+    extra_release.send(()).unwrap();
+    for _ in 0..MAX_CONCURRENT_FACTORIES {
+        finish_one(&mut registry).await;
+    }
+}
+
+#[tokio::test]
+async fn sixty_fifth_start_is_busy_and_only_eight_factories_run() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let mut keys = Vec::new();
+    let mut releases = Vec::new();
+    for i in 0..MAX_STARTING_ACTORS {
+        let key = SessionKey(format!("cli:capacity-{i}"));
+        let (release, blocked) = std::sync::mpsc::channel();
+        factory.queue(&key, FakeBehavior::Block(blocked));
+        registry.dispatch(fake_params(&key, "first")).await;
+        keys.push(key);
+        releases.push(release);
+    }
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES).await;
+    assert_eq!(
+        factory.max_active.load(Ordering::SeqCst),
+        MAX_CONCURRENT_FACTORIES
+    );
+    // A deleted Starting slot no longer appears in the map, but its
+    // outstanding factory still consumes global capacity.
+    registry.remove_session(&keys[0].0).await;
+    assert!(next_outbound(&mut out_rx).await.content.contains("deleted"));
+    let overflow = SessionKey("cli:capacity-overflow".into());
+    registry.dispatch(fake_params(&overflow, "busy")).await;
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("too many")
+    );
+    releases[0].send(()).unwrap();
+    finish_one(&mut registry).await;
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES + 1).await;
+    for release in releases.iter().skip(1) {
+        release.send(()).unwrap();
+        finish_one(&mut registry).await;
+    }
+    assert_eq!(
+        factory.max_active.load(Ordering::SeqCst),
+        MAX_CONCURRENT_FACTORIES
+    );
+}
+
+#[tokio::test]
+async fn closed_respawn_respects_outstanding_capacity() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let running = SessionKey("cli:closed-respawn".into());
+    registry.dispatch(fake_params(&running, "running")).await;
+    finish_one(&mut registry).await;
+    drop(factory.take_inbox(&running, 0));
+    let mut releases = Vec::new();
+    for i in 0..MAX_STARTING_ACTORS {
+        let key = SessionKey(format!("cli:respawn-capacity-{i}"));
+        let (release, blocked) = std::sync::mpsc::channel();
+        factory.queue(&key, FakeBehavior::Block(blocked));
+        registry.dispatch(fake_params(&key, "first")).await;
+        releases.push(release);
+    }
+    wait_for_factory_entries(&factory, MAX_CONCURRENT_FACTORIES + 1).await;
+    let entered_before_respawn = factory.entered();
+    registry.dispatch(fake_params(&running, "respawn")).await;
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("too many")
+    );
+    assert_eq!(factory.entered(), entered_before_respawn);
+    for release in releases {
+        release.send(()).unwrap();
+        finish_one(&mut registry).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelled_parts_fail_queue_and_allow_retry() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:cancelled-parts".into());
+    factory.queue(&key, FakeBehavior::Cancelled);
+    registry.dispatch(fake_params(&key, "cancelled")).await;
+    finish_one(&mut registry).await;
+    let error = next_outbound(&mut out_rx).await;
+    assert!(error.content.contains("cancelled"));
+    assert_eq!(error.metadata["retryable"], true);
+    assert_eq!(registry.len(), 0);
+    registry.dispatch(fake_params(&key, "retry")).await;
+    finish_one(&mut registry).await;
+    assert_eq!(registry.len(), 1);
+    assert_eq!(
+        actor_text(factory.take_inbox(&key, 0).recv().await.unwrap()),
+        "retry"
+    );
+}
+
+#[tokio::test]
+async fn deleting_session_rejects_without_parking_unrelated_dispatch() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let deleted = SessionKey("cli:deletion-fence-dispatch".into());
+    let other = SessionKey("cli:deletion-fence-other".into());
+    let deletion = octos_bus::construction_fence::begin_session_deletion(&deleted).await;
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&deleted, "during-delete")),
+    )
+    .await
+    .expect("deletion cleanup must not park the gateway dispatcher");
+    let rejected = next_outbound(&mut out_rx).await;
+    assert!(rejected.content.contains("deleted"));
+    assert_eq!(rejected.metadata["retryable"], true);
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "other")),
+    )
+    .await
+    .expect("an unrelated session must still dispatch");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "other"
+    );
+    drop(deletion);
+}
+
+#[tokio::test]
+async fn saturated_starting_actor_rejects_without_blocking_other_sessions() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    let blocked = SessionKey("cli:publishing-full".into());
+    let other = SessionKey("cli:publishing-other".into());
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    tx.try_send(make_inbound("already full")).unwrap();
+    let key = ActorRegistry::actor_key(&blocked, None);
+    registry.actors.insert(
+        key,
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&blocked, "overflow")),
+    )
+    .await
+    .expect("startup publication and a full outbound bus must not block dispatch");
+
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "other")),
+    )
+    .await
+    .expect("an unrelated session must still dispatch");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "other"
+    );
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    let rejected = next_outbound(&mut out_rx).await;
+    assert!(rejected.content.contains("starting"));
+    assert_eq!(rejected.metadata["retryable"], true);
+}
+
+#[tokio::test]
+async fn stalled_outbound_bounds_rejection_delivery_and_backpressures_admission() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry.delivery_slots = Arc::new(Semaphore::new(64));
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    let blocked = SessionKey("cli:publishing-saturated".into());
+    let (tx, _inbox_rx) = mpsc::channel(1);
+    tx.try_send(make_inbound("already full")).unwrap();
+    registry.actors.insert(
+        ActorRegistry::actor_key(&blocked, None),
+        ActorSlot::Running(ActorHandle {
+            tx,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            created_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending()),
+            forwarder_join_handle: tokio::spawn(std::future::pending()),
+            retired_forwarders: vec![],
+            system_prompt_override: None,
+            sender_user_id: None,
+            factory_profile_id: None,
+        }),
+    );
+    for index in 0..64 {
+        registry
+            .dispatch(fake_params(&blocked, &format!("overflow-{index}")))
+            .await;
+    }
+    for index in 0..3 {
+        let admitted = tokio::time::timeout(
+            Duration::from_millis(50),
+            registry.dispatch(fake_params(&blocked, &format!("beyond-capacity-{index}"))),
+        )
+        .await;
+        assert!(
+            admitted.is_err(),
+            "delivery capacity must apply admission backpressure, not spawn another detached sender"
+        );
+    }
+
+    assert_eq!(
+        registry.out_tx.strong_count(),
+        65,
+        "only the registry and the 64 permitted fallback deliveries may retain senders"
+    );
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    for _ in 0..64 {
+        assert!(
+            next_outbound(&mut out_rx)
+                .await
+                .content
+                .contains("starting")
+        );
+    }
+    let other = SessionKey("cli:publishing-recovered".into());
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(2)),
+        registry.dispatch(fake_params(&other, "recovered")),
+    )
+    .await
+    .expect("draining rejection delivery must release admission capacity");
+    finish_one(&mut registry).await;
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "recovered"
+    );
+}
+
+#[tokio::test]
+async fn factory_panic_fails_queue_and_dispatcher_recovers() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:factory-panic".into());
+    let other = SessionKey("cli:factory-survivor".into());
+    factory.queue(&key, FakeBehavior::Panic);
+    registry.dispatch(fake_params(&key, "panic")).await;
+    finish_one(&mut registry).await;
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("failed to start")
+    );
+    assert_eq!(registry.len(), 0);
+    registry.dispatch(fake_params(&key, "retry")).await;
+    registry.dispatch(fake_params(&other, "other")).await;
+    finish_one(&mut registry).await;
+    finish_one(&mut registry).await;
+    assert_eq!(registry.len(), 2);
+    assert_eq!(
+        actor_text(factory.take_inbox(&key, 0).recv().await.unwrap()),
+        "retry"
+    );
+    assert_eq!(
+        actor_text(factory.take_inbox(&other, 0).recv().await.unwrap()),
+        "other"
+    );
+}
+
+#[tokio::test]
+async fn factory_panic_holds_delivery_permit_until_outbound_drains() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry_with_capacity(&factory, 1);
+    registry.delivery_slots = Arc::new(Semaphore::new(64));
+    registry
+        .out_tx
+        .try_send(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "occupied".into(),
+            content: "occupied-outbound".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+    let key = SessionKey("cli:factory-panic-backpressure".into());
+    factory.queue(&key, FakeBehavior::Panic);
+    registry.dispatch(fake_params(&key, "panic")).await;
+    finish_one(&mut registry).await;
+    assert_eq!(registry.delivery_slots.available_permits(), 63);
+    assert_eq!(registry.out_tx.strong_count(), 2);
+    assert_eq!(
+        next_outbound(&mut out_rx).await.content,
+        "occupied-outbound"
+    );
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("failed to start")
+    );
+    tokio::time::timeout(waiting_budget(Duration::from_secs(2)), async {
+        while registry.delivery_slots.available_permits() != 64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finishing the fallback send must release the construction permit");
+}
+
+#[tokio::test]
+async fn factory_panic_returns_correlated_api_completion() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("api:factory-panic".into());
+    factory.queue(&key, FakeBehavior::Panic);
+    let mut params = fake_params(&key, "panic");
+    params.reply_channel = "api";
+    params.reply_chat_id = "chat-startup";
+    params.message.metadata["client_message_id"] = "thread-startup".into();
+    params.message.message_id = Some("message-startup".into());
+    registry.dispatch(params).await;
+    finish_one(&mut registry).await;
+
+    let completion = next_outbound(&mut out_rx).await;
+    assert_eq!(completion.channel, "api");
+    assert_eq!(completion.chat_id, "chat-startup");
+    assert_eq!(completion.reply_to.as_deref(), Some("message-startup"));
+    assert!(completion.content.is_empty());
+    assert_eq!(completion.metadata["_completion"], true);
+    assert_eq!(completion.metadata["thread_id"], "thread-startup");
+    assert_eq!(completion.metadata["outcome"], "incomplete");
+    assert_eq!(completion.metadata["truncated"], true);
+    assert_eq!(completion.metadata["retryable"], true);
+    assert_eq!(completion.metadata["error_code"], "session_actor_starting");
+    assert_eq!(completion.metadata["_history_persisted"], false);
+}
+
+#[tokio::test]
+async fn shutdown_fails_starting_queue_and_discards_late_parts() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:starting-shutdown".into());
+    let (release, blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(blocked));
+    registry.dispatch(fake_params(&key, "pending")).await;
+    wait_for_factory_entries(&factory, 1).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+    });
+    tokio::time::timeout(
+        waiting_budget(Duration::from_secs(10)),
+        registry.shutdown_all(),
+    )
+    .await
+    .expect("shutdown drains the in-flight construction");
+    assert!(
+        next_outbound(&mut out_rx)
+            .await
+            .content
+            .contains("shutting down")
+    );
+    let gate = factory.take_gate(&key, 0);
+    assert!(
+        tokio::time::timeout(waiting_budget(Duration::from_secs(2)), gate)
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn stale_generation_never_consumes_replacement_queue() {
+    let factory = FakeFactory::default();
+    let (mut registry, mut out_rx) = fake_registry(&factory);
+    let key = SessionKey("cli:stale-generation".into());
+    let (release_old, old_blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(old_blocked));
+    registry.dispatch(fake_params(&key, "old")).await;
+    wait_for_factory_entries(&factory, 1).await;
+    registry.remove_session(&key.0).await;
+    next_outbound(&mut out_rx).await;
+    let (release_new, new_blocked) = std::sync::mpsc::channel();
+    factory.queue(&key, FakeBehavior::Block(new_blocked));
+    registry.dispatch(fake_params(&key, "new")).await;
+    wait_for_factory_entries(&factory, 2).await;
+    release_old.send(()).unwrap();
+    finish_one(&mut registry).await;
+    let mut old_inbox = factory.take_inbox(&key, 0);
+    assert!(matches!(
+        old_inbox.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    registry.dispatch(fake_params(&key, "after")).await;
+    release_new.send(()).unwrap();
+    finish_one(&mut registry).await;
+    let mut inbox = factory.take_inbox(&key, 0);
+    assert_eq!(actor_text(inbox.recv().await.unwrap()), "new");
+    assert_eq!(actor_text(inbox.recv().await.unwrap()), "after");
 }
