@@ -48,7 +48,7 @@ dirs = { workspace = true }
 # breaks downstream tools (git treats it as a URL). Same use as octos-agent.
 dunce = "1"
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 colored = { workspace = true }
 chrono = { workspace = true }
 iana-time-zone = { workspace = true }

@@ -239,6 +239,12 @@ octos cron add --name "once" --message "Run migration" --at "2025-03-01T09:00:00
 
 Cron expressions use standard syntax. Jobs support an optional `timezone` field with IANA timezone names (e.g., `"America/New_York"`, `"Asia/Shanghai"`). When omitted, UTC is used.
 
+CLI creation chooses a random job ID that is not already in the store. Add and
+remove preserve other jobs' original JSON and schedules. Removing an ID that
+matches multiple historical jobs fails without writing; resolve those duplicate
+IDs in `.octos/cron.json` before retrying. The CLI does not automatically rename
+old jobs or coordinate simultaneous writers with a running gateway.
+
 When Matrix is fronted by a BotFather-style management bot, the same cron runtime is also available through natural-language chat commands:
 
 ```text

@@ -290,6 +290,15 @@ The earlier 28-item grouping had five OUP entries: four are direct memory RPC te
 | 3 | `tests/serve_host_scoped.rs::should_reject_host_scope_without_network_fence_or_independent_instance` | The real stdio server requires no-network and a separate canonical instance directory. |
 | 3 | `tests/serve_host_scoped.rs::should_confine_real_stdio_sessions_to_the_host_profile_and_workspace` | Real session dispatch pins the profile, installs confined read/list/write tools, rejects ancestor symlinks, and refuses network-widened bootstrap while ordinary workspace I/O succeeds. |
 
+## CLI cron identity (T-0303)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `commands::cron::tests::should_create_distinct_ids_and_remove_only_one_job` | Sequential creations have distinct IDs and removing one keeps all other schedules/state. |
+| 4 | `commands::cron::tests::should_refuse_ambiguous_historical_ids_without_writing` | Duplicate historical IDs and missing targets fail before any write. |
+| 4 | `commands::cron::tests::should_preserve_other_jobs_raw_bytes_across_add_and_remove` | Add/remove preserve unrelated legacy job bytes, omitted defaults and unknown fields. |
+| 4 | `commands::cron::tests::should_retry_an_occupied_id_and_refuse_unreadable_snapshots` | An occupied candidate is regenerated, while corrupt/unreadable snapshots cannot be treated as an empty ID namespace. |
+
 ## Explicit chat → profile routing (#1506)
 
 | Cat. | Exact test | Guard |
