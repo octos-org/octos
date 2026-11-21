@@ -95,6 +95,17 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 4 | `api::ui_protocol_transport::external_turns::tests::after_a_restart_each_recorded_turn_is_settled_by_its_exact_id` | After a restart, a recorded turn that never started may run, one cut off mid-turn is orphaned and never rerun, an ended one is reported once and forgotten. |
 | 3 | `api::ui_protocol_transport::external_turns::tests::the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope` | The entry cannot answer another connection's approval or interrupt another connection's turn; its own approval is answered without recording the requested session scope. |
 
+## IM bridge core (T-0653, `docs/IM_REMOTE_CONTROL.md` §14)
+
+`ServeImBridge` runs a bound direct chat's messages as external turns against a real serve runtime and an existing chat, with a scripted model and a fake channel.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `api::ui_protocol_transport::im_bridge::tests::a_bound_message_runs_once_and_its_result_goes_back_to_its_chat` | A bound message's text alone reaches the model, its reply goes back to its message, and a redelivery runs and sends nothing; `/status` and `/stop` act on the bridge's own turn. |
+| 3 | `api::ui_protocol_transport::im_bridge::tests::the_bridge_refuses_in_the_chat_what_it_cannot_tie_to_its_one_person` | Bindings with no allowed senders, an unlisted or shared sender, another channel, or a doubled chat or session are refused; an unknown chat, a group, a sender who is not the bound person, no message id, no platform time, a stale platform time, an attachment, empty text, an unknown command and a deleted chat are each answered in the chat and run nothing. |
+| 3 | `api::ui_protocol_transport::im_bridge::tests::a_revoked_chat_gets_no_result` | A turn whose chat is revoked while it runs sends nothing, and the chat's next message is refused. |
+| 4 | `api::ui_protocol_transport::im_bridge::tests::after_a_restart_a_redelivered_message_runs_nothing_again` | After a restart, a redelivered message whose turn completed or was cut off runs nothing; a result the platform did not take is not resent and stays recorded. |
+
 ## Peer host tools and shared history
 
 | Cat. | Exact test | Guard |

@@ -91,6 +91,10 @@ impl BoundChat {
     pub(crate) fn session_id(&self) -> &SessionKey {
         &self.session_id
     }
+
+    pub(crate) fn profile(&self) -> &BoundProfile {
+        &self.profile
+    }
 }
 
 /// What became of a turn, by its exact id.
@@ -236,7 +240,7 @@ impl ExternalTurns {
         })?;
         let params = TurnStartParams {
             session_id: chat.session_id.clone(),
-            turn_id,
+            turn_id: turn_id.clone(),
             input: vec![InputItem::Text { text: text.into() }],
             media: Vec::new(),
             topic: None,
@@ -265,8 +269,79 @@ impl ExternalTurns {
                 admitted.start();
                 Ok(Started::Now)
             }
-            Err(Refused::Scope(error) | Refused::Error(error)) => Err(error),
+            Err(Refused::Scope(error) | Refused::Error(error)) => {
+                // Refused, it never ran: nothing is left to reconcile.
+                let _ = std::fs::remove_file(dispatch_path(
+                    &chat.profile.data_dir,
+                    &chat.session_id,
+                    &turn_id,
+                ));
+                Err(error)
+            }
         }
+    }
+
+    /// Follow `chat`'s ledger, so a turn started after this call can be
+    /// [awaited](Self::ended).
+    pub(crate) fn subscribe(
+        &self,
+        chat: &BoundChat,
+    ) -> tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent> {
+        self.ledger.subscribe(&chat.session_id)
+    }
+
+    /// Wait on `events`, subscribed before `turn_id` started, until it ends;
+    /// then what became of it and the last reply it persisted.
+    pub(crate) async fn ended(
+        &self,
+        chat: &BoundChat,
+        turn_id: &TurnId,
+        mut events: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
+    ) -> Result<(TurnRecord, Option<String>), RpcError> {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            match events.recv().await {
+                Ok(event) => match event.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(ended))
+                        if ended.turn_id == *turn_id => {}
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnError(ended))
+                        if ended.turn_id == *turn_id => {}
+                    _ => continue,
+                },
+                // Its end may be among the events missed.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {
+                    return Err(RpcError::internal_error(
+                        "the session's ledger closed before the turn ended",
+                    ));
+                }
+            }
+            // The ledger has the end before the turn registry may.
+            match ledger_record(&self.ledger, &chat.session_id, turn_id)? {
+                TurnRecord::NotStarted | TurnRecord::Running => continue,
+                ended => break Ok((ended, self.reply(chat, turn_id)?)),
+            }
+        }
+    }
+
+    fn reply(&self, chat: &BoundChat, turn_id: &TurnId) -> Result<Option<String>, RpcError> {
+        let thread = turn_id.0.to_string();
+        let mut reply = None;
+        for event in self
+            .ledger
+            .snapshot_events_for_turn(&chat.session_id, turn_id)?
+        {
+            if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+                event.event
+            {
+                if let PayloadV2::AssistantPersisted { text, .. } = envelope.envelope.payload {
+                    if envelope.envelope.thread_id == thread && !text.trim().is_empty() {
+                        reply = Some(text);
+                    }
+                }
+            }
+        }
+        Ok(reply)
     }
 
     /// The turns `profile` recorded, each with what became of it or why that
@@ -469,4 +544,4 @@ impl TurnRunner for ExternalRunner {
 
 #[cfg(test)]
 #[path = "ui_protocol_external_turns_tests.rs"]
-mod tests;
+pub(super) mod tests;
