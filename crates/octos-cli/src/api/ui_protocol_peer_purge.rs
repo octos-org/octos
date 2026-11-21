@@ -358,11 +358,6 @@ async fn execute_peer_purge(
         ));
     }
     let _in_flight = InFlight(in_flight_key);
-    // Before any destructive step, durably retain the already-authorized
-    // owner and complete erase scope. The record alone never authorizes work.
-    write_purge_intent(&peers_root, &intent).map_err(|error| {
-        RpcError::internal_error(format!("failed to record purge intent: {error}"))
-    })?;
     let peer_dir = peers_root.join(&slug);
     if std::fs::symlink_metadata(&peer_dir).is_ok()
         && purge_residue_dir(&peers_root, &slug).is_none()
@@ -372,6 +367,11 @@ async fn execute_peer_purge(
             format!("peer '{slug}' residue is not a real non-symlink directory"),
         ));
     }
+    // Before any destructive step, durably retain the already-authorized
+    // owner and complete erase scope. The record alone never authorizes work.
+    write_purge_intent(&peers_root, &intent).map_err(|error| {
+        RpcError::internal_error(format!("failed to record purge intent: {error}"))
+    })?;
     let name = intent.name.clone();
     let originator = SessionKey(intent.originator.clone());
     let peer_session = SessionKey(format!("{}#peer-{slug}", originator.base_key()));

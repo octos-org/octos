@@ -165,10 +165,19 @@ fn read_purge_intent(peers_root: &Path, slug: &str) -> Option<PurgeIntent> {
     (intent.version == 1 && intent.slug == slug).then_some(intent)
 }
 
-fn find_purge_intent(peers_root: &Path, ident: &str) -> Option<PurgeIntent> {
+fn find_purge_intent(
+    peers_root: &Path,
+    ident: &str,
+    originator: &str,
+    host_token: Option<&str>,
+) -> Option<PurgeIntent> {
+    let authorized = |intent: &PurgeIntent| {
+        intent.originator == originator && host_token_matches(&intent.binding, host_token)
+    };
     if super::peer_slug_is_safe(ident)
         && let Some(intent) = read_purge_intent(peers_root, ident)
         && intent.names(ident)
+        && authorized(&intent)
     {
         return Some(intent);
     }
@@ -180,6 +189,7 @@ fn find_purge_intent(peers_root: &Path, ident: &str) -> Option<PurgeIntent> {
         };
         if let Some(intent) = read_purge_intent(peers_root, slug)
             && intent.names(ident)
+            && authorized(&intent)
         {
             return Some(intent);
         }
@@ -197,7 +207,7 @@ pub(crate) fn purge_intent_for_retry(
     originator: &str,
     host_token: Option<&str>,
 ) -> Option<PurgeIntent> {
-    let intent = find_purge_intent(peers_root, ident)?;
+    let intent = find_purge_intent(peers_root, ident, originator, host_token)?;
     if intent.expired() {
         let _ = remove_purge_intent(peers_root, &intent.slug);
         return None;
@@ -205,9 +215,16 @@ pub(crate) fn purge_intent_for_retry(
     if intent.originator != originator || !host_token_matches(&intent.binding, host_token) {
         return None;
     }
-    let same_staged_generation =
-        super::app_binding::read_peer_host_binding(peers_root, &intent.slug)
-            .is_some_and(|binding| binding == intent.binding);
+    let staged_binding = super::app_binding::read_peer_host_binding(peers_root, &intent.slug);
+    if staged_binding
+        .as_ref()
+        .is_some_and(|binding| binding != &intent.binding)
+    {
+        // An unfinalized slug alone must never override a newer staged
+        // generation. Its own binding is the generation fence.
+        return None;
+    }
+    let same_staged_generation = staged_binding.is_some();
     let unfinished_residue = slug_tombstone_exists(peers_root, &intent.slug)
         && !slug_tombstone_is_finalized(peers_root, &intent.slug);
     (same_staged_generation || unfinished_residue).then_some(intent)
@@ -222,7 +239,12 @@ pub(crate) fn finish_purge_metadata_after_token_tombstone(
     tombstone: &PurgeTombstone,
     host_token: Option<&str>,
 ) -> std::io::Result<bool> {
-    let Some(intent) = find_purge_intent(peers_root, &tombstone.slug) else {
+    let Some(intent) = find_purge_intent(
+        peers_root,
+        &tombstone.slug,
+        &tombstone.originator,
+        host_token,
+    ) else {
         return Ok(false);
     };
     if intent.originator != tombstone.originator || !host_token_matches(&intent.binding, host_token)
@@ -513,6 +535,29 @@ mod tests {
         assert!(
             purge_intent_for_retry(&peers_root, "mail", "api:owner", Some("owner-token")).is_none(),
             "an old intent must never erase a later finalized generation"
+        );
+    }
+
+    #[test]
+    fn display_name_retry_skips_another_owners_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers_root = dir.path().join("peers");
+        std::fs::create_dir_all(peers_root.join("mail-a")).unwrap();
+        std::fs::create_dir_all(peers_root.join("mail-b")).unwrap();
+        let mut shadow = fixture_intent();
+        shadow.slug = "mail-a".into();
+        shadow.originator = "api:other".into();
+        shadow.binding.token_sha256 = token_digest("other-token");
+        let mut authorized = fixture_intent();
+        authorized.slug = "mail-b".into();
+        write_purge_intent(&peers_root, &shadow).unwrap();
+        write_purge_intent(&peers_root, &authorized).unwrap();
+        write_slug_tombstone(&peers_root, "mail-a", "2026-11-20T00:00:00Z").unwrap();
+        write_slug_tombstone(&peers_root, "mail-b", "2026-11-20T00:00:00Z").unwrap();
+
+        assert_eq!(
+            purge_intent_for_retry(&peers_root, "Mail", "api:owner", Some("owner-token")),
+            Some(authorized)
         );
     }
 
