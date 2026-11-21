@@ -4352,12 +4352,15 @@ pub(crate) fn reopen_closed_peer(
     // committed results would re-fire an autonomous synthesis. Record the
     // peer's current round as already-synthesized BEFORE clearing the close
     // marker, fail-closed on a stamp-write error.
+    #[cfg(feature = "api")]
     crate::api::ui_protocol_transport::mark_reopened_peer_synthesized_through(
         peers_root,
         origin_session,
         &slug,
         count_peer_result_versions(&peer_dir),
     )?;
+    #[cfg(not(feature = "api"))]
+    let _ = (peers_root, origin_session, &slug);
     // The marker is the ONLY thing removed: briefs, dated result versions,
     // parked rows and the originator/workspace records all stay exactly as
     // they were, so the peer resumes its unfinished work instead of starting
