@@ -1,7 +1,7 @@
 # UPCR-2026-REF9D0516 — IM bridge core on external turns (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3334
 
 ## Decision record
 
