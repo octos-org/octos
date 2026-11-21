@@ -86,7 +86,7 @@ serde_norway = "0.9"
 toml = "0.8"
 base64 = "0.22"
 # Dated, source-cited provider list prices (zero dependencies); see octos-llm pricing.rs
-llm-prices = "1.8"
+llm-prices = "=1.8.0"
 # Crypto
 ed25519-dalek = "2.2.0"
 md-5 = "0.10"

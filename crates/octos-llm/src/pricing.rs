@@ -378,6 +378,11 @@ impl ModelPricing {
 /// Look up pricing for a model. Checks the runtime catalog first, then the
 /// provider list price for Anthropic, OpenAI and Google ids the catalog does
 /// not carry, then falls back to hardcoded defaults.
+///
+/// Only exact catalog entries beat list price. A catalog entry matched by
+/// family substring (e.g. `gpt-5` for `gpt-5-2025-08-07`) loses to the list
+/// price, so seed the exact id to keep a negotiated rate. List prices are the
+/// base tier (long-context surcharges are not applied).
 pub fn model_pricing(model_id: &str) -> Option<ModelPricing> {
     // An exact catalog entry (populated from model_catalog.json) always wins.
     if let Some(pricing) = catalog_exact(model_id) {
