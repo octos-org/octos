@@ -1866,6 +1866,10 @@ Clients must use that method list to enable or disable slash commands.
 
 - returns runtime status for the selected profile/session plus a runtime policy
   stamp containing provider/model/profile/tool/sandbox-visible state
+- requires an existing session in the authenticated canonical scope; empty,
+  unknown, and deleted IDs return `unknown_session`, and an authenticated
+  cross-profile call returns the `session/open` scope-mismatch error. See
+  UPCR-2026-RC81B9296.
 - when `context.lifecycle.v1` is advertised, also returns compact context
   inspection fields:
   - `context_state`: active model-visible context generation, transcript hash,
@@ -1960,6 +1964,15 @@ Clients must use that method list to enable or disable slash commands.
 `permission/profile/list`:
 
 - request includes `session_id`
+- requires an existing session in the authenticated canonical scope; it never
+  creates an implicit default for an empty, unknown, or deleted ID
+  (UPCR-2026-RC81B9296)
+- legacy no-runtime raw IDs use a durable owner marker only for genuinely new
+  canonical storage identities; existing unowned transcripts in any raw/default,
+  active, or segmented layout cannot be claimed in either bare-first or alias-first
+  order. Base/`#default` aliases share
+  the marker, long IDs use bounded hash-suffixed
+  filenames, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
   must omit it or reject attempts to select it
@@ -1967,6 +1980,9 @@ Clients must use that method list to enable or disable slash commands.
 `permission/profile/set`:
 
 - request includes `session_id` and partial `update`
+- validates authenticated session ownership and real existence before changing
+  state; cross-scope calls make no mutation, while empty, unknown, and deleted
+  IDs return `unknown_session` (UPCR-2026-RC81B9296)
 - accepted `mode` values are `read_only`, `workspace_write`, and
   `danger_full_access`
 - accepted `update.approval_policy` values are `on-request`, `on_request`,

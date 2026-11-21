@@ -20,6 +20,9 @@ fn state_with_work_secret_store(dir: &TempDir) -> (Arc<AppState>, Arc<WorkSecret
     let store = Arc::new(WorkSecretGrantStore::new(dir.path()));
     let state = Arc::new(AppState {
         work_secret_store: store.clone(),
+        sessions: Some(Arc::new(tokio::sync::Mutex::new(
+            octos_bus::SessionManager::open(dir.path()).unwrap(),
+        ))),
         ..AppState::empty_for_tests()
     });
     (state, store)
@@ -256,4 +259,52 @@ async fn work_secret_ws_rejects_malformed_wrong_session_and_expiry() {
     }
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn work_secret_permission_methods_require_an_existing_exact_session() {
+    let dir = TempDir::new().unwrap();
+    let (state, store) = state_with_work_secret_store(&dir);
+    let session = octos_core::SessionKey("local:work-secret".into());
+    state
+        .sessions
+        .as_ref()
+        .unwrap()
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await;
+    {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        assert!(!sessions.session_was_deleted(&session).await.unwrap());
+        assert!(sessions.session_known(&session));
+    }
+    issue_work_secret(&store, &session.0, "guest-token");
+    let (server, mut ws) = connect_work_secret(state.clone(), &session.0, "guest-token").await;
+    let listed = json_rpc(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":"list","method":"permission/profile/list","params":{"session_id":session}}),
+        "own permission list",
+    )
+    .await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let updated = json_rpc(
+        &mut ws,
+        json!({"jsonrpc":"2.0","id":"set","method":"permission/profile/set","params":{"session_id":session,"update":{"mode":"read_only","network":"deny"}}}),
+        "own permission set",
+    )
+    .await;
+    assert_eq!(updated["result"]["applied"], true, "{updated}");
+    server.abort();
+
+    issue_work_secret(&store, "local:missing", "missing-token");
+    let (server, mut missing) = connect_work_secret(state, "local:missing", "missing-token").await;
+    let unknown = json_rpc(
+        &mut missing,
+        json!({"jsonrpc":"2.0","id":"missing","method":"permission/profile/list","params":{"session_id":"local:missing"}}),
+        "unknown permission list",
+    )
+    .await;
+    assert_eq!(unknown["error"]["data"]["kind"], "unknown_session");
+    server.abort();
 }

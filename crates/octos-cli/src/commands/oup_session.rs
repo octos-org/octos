@@ -117,26 +117,11 @@ impl OupSession {
                 }),
             )
             .await?;
-        // Permission selection uses the same solo gate and narrowing checks
-        // as every other OUP client. Set it before open can build a runtime.
         let mode = match permissions.permission_profile {
             octos_agent::PermissionProfile::ReadOnly => "read_only",
             octos_agent::PermissionProfile::WorkspaceWrite => "workspace_write",
             octos_agent::PermissionProfile::DangerFullAccess => "danger_full_access",
         };
-        client.request(methods::PERMISSION_PROFILE_SET, json!({
-            "session_id": session_id,
-            "update": {
-                "mode": mode,
-                "network": match permissions.network {
-                    octos_agent::NetworkPolicy::Allowed => Some("allow"),
-                    octos_agent::NetworkPolicy::Inherit => None,
-                },
-                "approval_policy": if permissions.approval_policy == octos_agent::ApprovalPolicy::Never {
-                    "never"
-                } else { "ask" },
-            },
-        })).await?;
         let events = client.subscribe();
         let opened: SessionOpenResult = serde_json::from_value(
             client
@@ -150,6 +135,21 @@ impl OupSession {
                 )
                 .await?,
         )?;
+        // Open creates the real session record. SET then applies the same solo
+        // gate and invalidates that runtime before this client can start a turn.
+        client.request(methods::PERMISSION_PROFILE_SET, json!({
+            "session_id": session_id,
+            "update": {
+                "mode": mode,
+                "network": match permissions.network {
+                    octos_agent::NetworkPolicy::Allowed => Some("allow"),
+                    octos_agent::NetworkPolicy::Inherit => None,
+                },
+                "approval_policy": if permissions.approval_policy == octos_agent::ApprovalPolicy::Never {
+                    "never"
+                } else { "ask" },
+            },
+        })).await?;
         Ok(Self {
             client,
             session_id: opened.opened.session_id,

@@ -12,7 +12,7 @@
 //! eviction.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -447,6 +447,44 @@ impl SessionRuntimeCache {
             permissions_epoch,
         )
         .await
+    }
+
+    /// Return only an already-bootstrapped runtime for this exact profile,
+    /// session and sessions root. Follow-up authorization uses this to avoid
+    /// creating workspaces or policy markers for an unknown session.
+    pub async fn get_cached_with_hint(
+        &self,
+        profile: &Arc<ProfileRuntime>,
+        session_key: SessionKey,
+        workspace_hint: Option<PathBuf>,
+    ) -> Option<Arc<SessionRuntime>> {
+        let key_root = super::session::resolve_sessions_root_from_hint(
+            profile,
+            workspace_hint.as_deref(),
+            self.sessions_in_cwd,
+        );
+        let key = (profile.profile_id.clone(), session_key, key_root);
+        let mut guard = self.inner.write().await;
+        let entry = guard.get_mut(&key)?;
+        if !Arc::ptr_eq(&entry.runtime.profile, profile) || !entry.runtime.app_binding_is_current()
+        {
+            return None;
+        }
+        entry.last_used = Instant::now();
+        Some(Arc::clone(&entry.runtime))
+    }
+
+    /// The exact root used by both cached lookup and runtime bootstrap.
+    pub fn sessions_root_for_hint(
+        &self,
+        profile: &Arc<ProfileRuntime>,
+        workspace_hint: Option<&Path>,
+    ) -> PathBuf {
+        super::session::resolve_sessions_root_from_hint(
+            profile,
+            workspace_hint,
+            self.sessions_in_cwd,
+        )
     }
 
     /// Look up or build a session runtime using explicit effective
