@@ -594,11 +594,19 @@ mod tests {
 /// close marker and revive a purged peer, and `peer_fork` would copy the
 /// residue brief into a fresh slug. The #3332 fence on `reserve_*` guards
 /// only the NEW slug; this guard covers the SOURCE.
-pub(crate) fn purge_blocks_peer_reuse(peers_root: &Path, slug: &str) -> Option<&'static str> {
+pub(crate) fn purge_blocks_peer_reuse(
+    peers_root: &Path,
+    slug: &str,
+    _originator: &str,
+) -> Option<&'static str> {
     if slug_tombstone_exists(peers_root, slug) {
         return Some("a purge tombstone");
     }
-    if find_purge_intent(peers_root, slug).is_some_and(|intent| !intent.expired()) {
+    // Existence, not an authorized retry: ANY live intent for this slug
+    // means a purge / its recovery is in progress, regardless of who would
+    // be allowed to resume it. `find_purge_intent` filters by originator +
+    // host token, which is the wrong lens here.
+    if read_purge_intent(peers_root, slug).is_some_and(|intent| !intent.expired()) {
         return Some("a pending purge intent / recovery in progress");
     }
     None

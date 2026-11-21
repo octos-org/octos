@@ -4351,7 +4351,7 @@ pub(crate) fn reopen_closed_peer(
              peer_reopen cannot reopen it (the app resumes it by its binding)"
         ));
     }
-    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug) {
+    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug, origin_session) {
         return Err(format!(
             "peer '{slug}' has {reason} — peer_reopen cannot revive a purged peer's residue"
         ));
@@ -4417,7 +4417,7 @@ pub(crate) fn fork_staged_peer(
              peer_fork cannot fork it"
         ));
     }
-    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug) {
+    if let Some(reason) = purge::purge_blocks_peer_reuse(peers_root, &slug, origin_session) {
         return Err(format!(
             "peer '{slug}' has {reason} — peer_fork cannot inherit a purged peer's residue"
         ));
