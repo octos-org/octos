@@ -205,9 +205,11 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // wasn't embedded. The app is same-origin (`API_BASE=""`) so it talks to
     // this server's API/WS with no CORS.
     if path == "app" || path.starts_with("app/") {
-        // Bare `/app` (no trailing slash) must redirect to `/app/`: the SPA's
-        // `BrowserRouter basename="/app/"` does not match the pathname `/app`,
-        // so serving index.html directly renders blank. 307 preserves method.
+        // RFC #3262 step 1 (T-0608): `/app` (octos-web) is DEPRECATED —
+        // octoscode-web is the replacement web client. Zero-build injection:
+        // only the SPA index gets a deprecation banner; asset files
+        // (JS/CSS/assets) are byte-identical and hashed-bundle-friendly.
+        // This is removed with the submodule in step 2.
         if path == "app" {
             return (
                 StatusCode::TEMPORARY_REDIRECT,
@@ -218,10 +220,15 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         }
         let web_path = format!("web/{}", path.trim_start_matches("app/"));
         if let Some(data) = assets.get(&web_path) {
+            // Only the index document carries the banner; assets must stay
+            // byte-identical (their names are content-hashed).
+            if web_path == WEB_INDEX || web_path == "web/index.html" {
+                return serve_html_with_deprecation_banner(&web_path, &data);
+            }
             return serve_file(&web_path, &data);
         }
         if let Some(data) = assets.get(WEB_INDEX) {
-            return serve_file(WEB_INDEX, &data);
+            return serve_html_with_deprecation_banner(WEB_INDEX, &data);
         }
         let body = serde_json::json!({
             "error": "web_bundle_missing",
@@ -430,4 +437,96 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
         data.to_vec(),
     )
         .into_response()
+}
+
+/// RFC #3262 step 1 (T-0608): serve the octos-web SPA index with a static
+/// deprecation banner injected before `</body>`, announcing that `/app` is
+/// deprecated and octoscode-web is the replacement. The banner is a plain
+/// text-and-anchors div — no scripts, no dismiss handler (step 1 does not
+/// require dismissing) — so the page's own scripts are untouched and the
+/// change is removable in step 2 by deleting the submodule. A full document
+/// (no `</body>`) is served unmodified rather than mangled.
+fn serve_html_with_deprecation_banner(path: &str, data: &[u8]) -> Response {
+    const BANNER: &str = concat!(
+        r#"<div id="octos-app-deprecation" role="status" "#,
+        r#"style="position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:10px 16px;"#,
+        r#"background:#b45309;color:#fff;font:14px/1.5 system-ui,sans-serif;"#,
+        r#"text-align:center;">"#,
+        r#"<strong>Deprecation:</strong> the /app web client (octos-web) is deprecated and will "#,
+        r#"be removed in a future release. Use "#,
+        r#"<a href="https://github.com/octos-org/octoscode-web" style="color:#fde68a;">"#,
+        r#"octoscode-web</a> instead.</div>"#
+    );
+    let body = match std::str::from_utf8(data) {
+        Ok(text) if text.contains("</body>") => text
+            .replacen("</body>", &(BANNER.to_string() + "</body>"), 1)
+            .into_bytes(),
+        _ => data.to_vec(),
+    };
+    serve_file(path, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::AppState;
+
+    /// In-memory asset store standing in for the embedded bundles.
+    struct MapStore(std::collections::HashMap<String, Vec<u8>>);
+    impl AssetStore for MapStore {
+        fn get(&self, path: &str) -> Option<Vec<u8>> {
+            self.0.get(path).cloned()
+        }
+    }
+
+    /// RFC #3262 step 1 (T-0608) via the REAL route: a request for `/app/`
+    /// (the SPA index) returns the deprecation banner injected before
+    /// </body>, while a content-hashed asset under `/app/assets/` passes
+    /// through byte-identical. Exercising `serve_with` means a routing
+    /// mistake that bannered the assets too would fail here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_inject_the_deprecation_banner_into_the_app_index_only() {
+        let index = b"<html><head></head><body><div id=\"root\"></div></body></html>".to_vec();
+        let asset = b"const x=1; /* no html */".to_vec();
+        let store = MapStore(std::collections::HashMap::from([
+            (WEB_INDEX.to_string(), index.clone()),
+            ("web/assets/index-abc123.js".to_string(), asset.clone()),
+        ]));
+        let state = AppState::empty_for_tests();
+
+        let index_response = serve_with(&store, &state, "app/").await;
+        let index_body = axum::body::to_bytes(index_response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect index body");
+        let text = String::from_utf8(index_body.to_vec()).expect("index is utf-8");
+        assert_eq!(text.matches("octos-app-deprecation").count(), 1, "{text}");
+        assert!(
+            text.contains(r#"href="https://github.com/octos-org/octoscode-web""#),
+            "banner points at octoscode-web: {text}"
+        );
+        assert_eq!(text.matches("</body>").count(), 1, "{text}");
+        assert!(text.contains("</div></body>"), "{text}");
+
+        let asset_response = serve_with(&store, &state, "app/assets/index-abc123.js").await;
+        let asset_body = axum::body::to_bytes(asset_response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect asset body");
+        assert_eq!(
+            asset_body.to_vec(),
+            asset,
+            "content-hashed asset bytes are untouched by the real route"
+        );
+    }
+
+    /// #3262: an index without a closing </body> is served unmodified rather
+    /// than mangled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_serve_a_body_less_index_unmodified() {
+        let index = b"<html><head></head></html>".to_vec();
+        let response = serve_html_with_deprecation_banner(WEB_INDEX, &index);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect body");
+        assert_eq!(body.to_vec(), index, "no </body> → no injection");
+    }
 }
