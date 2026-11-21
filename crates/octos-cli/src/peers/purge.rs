@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::peer_io;
+use super::{
+    app_binding::{PeerContextBinding, PeerHostBinding, host_token_matches},
+    peer_io,
+};
 
 /// Directory (under the profile data dir) of the purge tombstones.
 pub(crate) const PEER_PURGES_DIR: &str = "peer-purges";
@@ -58,6 +61,195 @@ impl PurgeTombstone {
                 .as_deref()
                 .is_some_and(|name| name.trim().eq_ignore_ascii_case(ident))
     }
+}
+
+/// Pre-erase authorization and deletion scope for an unfinished purge (#2712
+/// State 1). This is not a tombstone and never authorizes a retry by itself:
+/// the caller must still prove the originator, host token and live route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PurgeIntent {
+    pub(crate) version: u32,
+    pub(crate) slug: String,
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    pub(crate) originator: String,
+    pub(crate) binding: PeerHostBinding,
+    pub(crate) contexts: Vec<(String, PeerContextBinding)>,
+    /// RFC 3339. Retries may resume only before this bounded deadline.
+    pub(crate) expires_at: String,
+}
+
+impl PurgeIntent {
+    pub(crate) fn new(
+        slug: String,
+        name: Option<String>,
+        originator: String,
+        binding: PeerHostBinding,
+        contexts: Vec<(String, PeerContextBinding)>,
+    ) -> Self {
+        Self {
+            version: 1,
+            slug,
+            name,
+            originator,
+            binding,
+            contexts,
+            expires_at: (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        }
+    }
+
+    fn names(&self, ident: &str) -> bool {
+        let ident = ident.trim();
+        ident == self.slug
+            || self
+                .name
+                .as_deref()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(ident))
+    }
+
+    fn expired(&self) -> bool {
+        chrono::DateTime::parse_from_rfc3339(&self.expires_at)
+            .map(|expires| expires <= chrono::Utc::now())
+            .unwrap_or(true)
+    }
+}
+
+const PURGE_INTENT_READ_CAP: usize = peer_io::PEER_FILE_READ_CAP_LARGE;
+const PURGE_INTENT_SCAN_CAP: usize = 1024;
+
+fn intents_dir(peers_root: &Path) -> Option<PathBuf> {
+    purges_dir(peers_root).map(|dir| dir.join("intents"))
+}
+
+fn intent_path(peers_root: &Path, slug: &str) -> Option<PathBuf> {
+    if !super::peer_slug_is_safe(slug) {
+        return None;
+    }
+    Some(intents_dir(peers_root)?.join(format!("{slug}.json")))
+}
+
+/// Persist the complete authorized scope before the first erase. Rewriting an
+/// intent is safe: the atomic durable write leaves either the old or new full
+/// snapshot after a crash, never a partial JSON document.
+pub(crate) fn write_purge_intent(peers_root: &Path, intent: &PurgeIntent) -> std::io::Result<()> {
+    let Some(dir) = intents_dir(peers_root) else {
+        return Err(std::io::Error::other("peers root has no parent"));
+    };
+    if intent.version != 1 {
+        return Err(std::io::Error::other("unsupported purge intent version"));
+    }
+    let body = serde_json::to_string(intent).map_err(std::io::Error::other)?;
+    if body.len() > PURGE_INTENT_READ_CAP {
+        return Err(std::io::Error::other("purge intent exceeds its read cap"));
+    }
+    std::fs::create_dir_all(&dir)?;
+    peer_io::write_peer_file_durable(&dir, &format!("{}.json", intent.slug), &body)
+}
+
+pub(crate) fn remove_purge_intent(peers_root: &Path, slug: &str) -> std::io::Result<()> {
+    let Some(dir) = intents_dir(peers_root) else {
+        return Ok(());
+    };
+    let Some(path) = intent_path(peers_root, slug) else {
+        return Ok(());
+    };
+    remove_tree_within(&dir, &path).map(|_| ())
+}
+
+fn read_purge_intent(peers_root: &Path, slug: &str) -> Option<PurgeIntent> {
+    let path = intent_path(peers_root, slug)?;
+    let dir = path.parent()?;
+    let leaf = path.file_name()?.to_str()?;
+    let body = peer_io::read_peer_file(dir, leaf, PURGE_INTENT_READ_CAP)?;
+    let intent: PurgeIntent = serde_json::from_str(&body).ok()?;
+    (intent.version == 1 && intent.slug == slug).then_some(intent)
+}
+
+fn find_purge_intent(peers_root: &Path, ident: &str) -> Option<PurgeIntent> {
+    if super::peer_slug_is_safe(ident)
+        && let Some(intent) = read_purge_intent(peers_root, ident)
+        && intent.names(ident)
+    {
+        return Some(intent);
+    }
+    let entries = std::fs::read_dir(intents_dir(peers_root)?).ok()?;
+    for entry in entries.flatten().take(PURGE_INTENT_SCAN_CAP) {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some(slug) = slug.strip_suffix(".json") else {
+            continue;
+        };
+        if let Some(intent) = read_purge_intent(peers_root, slug)
+            && intent.names(ident)
+        {
+            return Some(intent);
+        }
+    }
+    None
+}
+
+/// Resolve a State-1 retry only when all of these independent facts hold:
+/// originator + host token still match, the intent is unexpired, and the slug
+/// is either the same staged generation or carries its unfinalized tombstone.
+/// Unknown ids, forged scope and a later finalized generation all fail closed.
+pub(crate) fn purge_intent_for_retry(
+    peers_root: &Path,
+    ident: &str,
+    originator: &str,
+    host_token: Option<&str>,
+) -> Option<PurgeIntent> {
+    let intent = find_purge_intent(peers_root, ident)?;
+    if intent.expired() {
+        let _ = remove_purge_intent(peers_root, &intent.slug);
+        return None;
+    }
+    if intent.originator != originator || !host_token_matches(&intent.binding, host_token) {
+        return None;
+    }
+    let same_staged_generation =
+        super::app_binding::read_peer_host_binding(peers_root, &intent.slug)
+            .is_some_and(|binding| binding == intent.binding);
+    let unfinished_residue = slug_tombstone_exists(peers_root, &intent.slug)
+        && !slug_tombstone_is_finalized(peers_root, &intent.slug);
+    (same_staged_generation || unfinished_residue).then_some(intent)
+}
+
+/// Complete only the metadata tail of a purge whose token tombstone proves the
+/// destructive erase already finished. This covers a crash before slug
+/// finalization or intent cleanup without ever repeating that erase. Expiry is
+/// deliberately irrelevant here: no new deletion authority is granted.
+pub(crate) fn finish_purge_metadata_after_token_tombstone(
+    peers_root: &Path,
+    tombstone: &PurgeTombstone,
+    host_token: Option<&str>,
+) -> std::io::Result<bool> {
+    let Some(intent) = find_purge_intent(peers_root, &tombstone.slug) else {
+        return Ok(false);
+    };
+    if intent.originator != tombstone.originator || !host_token_matches(&intent.binding, host_token)
+    {
+        return Ok(false);
+    }
+    // A different staged binding is a later generation, not metadata for this
+    // purge. Leave both its slug record and the old intent untouched.
+    if super::app_binding::read_peer_host_binding(peers_root, &intent.slug)
+        .is_some_and(|binding| binding != intent.binding)
+    {
+        return Ok(false);
+    }
+    finalize_slug_tombstone(peers_root, &intent.slug, &tombstone.purged_at)?;
+    remove_purge_intent(peers_root, &intent.slug)?;
+    Ok(true)
+}
+
+/// A real non-symlink peer residue directory, without requiring `brief.md`.
+/// Missing paths are handled separately by the idempotent erase.
+pub(crate) fn purge_residue_dir(peers_root: &Path, slug: &str) -> Option<PathBuf> {
+    if !super::peer_slug_is_safe(slug) {
+        return None;
+    }
+    let dir = peers_root.join(slug);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    (meta.is_dir() && !meta.file_type().is_symlink()).then_some(dir)
 }
 
 fn purges_dir(peers_root: &Path) -> Option<PathBuf> {
@@ -268,4 +460,75 @@ pub(crate) fn remove_tree_within(root: &Path, path: &Path) -> std::io::Result<bo
 /// Whether `path` is its own canonical form (no symlink re-roots it).
 pub(crate) fn is_real_path(path: &Path) -> bool {
     dunce::canonicalize(path).is_ok_and(|real| real == path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peers::app_binding::token_digest;
+
+    fn fixture_intent() -> PurgeIntent {
+        PurgeIntent::new(
+            "mail".into(),
+            Some("Mail".into()),
+            "api:owner".into(),
+            PeerHostBinding {
+                version: 1,
+                cwd: PathBuf::from("/tmp/mail-workspace"),
+                memory_namespace: "app/mail/acct-1".into(),
+                token_sha256: token_digest("owner-token"),
+            },
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn state1_intent_requires_owner_token_and_the_same_unfinished_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers_root = dir.path().join("peers");
+        std::fs::create_dir_all(peers_root.join("mail")).unwrap();
+        let intent = fixture_intent();
+        write_purge_intent(&peers_root, &intent).unwrap();
+        write_slug_tombstone(&peers_root, "mail", "2026-11-20T00:00:00Z").unwrap();
+
+        assert!(
+            purge_intent_for_retry(&peers_root, "mail", "api:other", Some("owner-token")).is_none()
+        );
+        assert!(
+            purge_intent_for_retry(&peers_root, "mail", "api:owner", Some("forged-token"))
+                .is_none()
+        );
+        assert!(
+            purge_intent_for_retry(&peers_root, "unknown", "api:owner", Some("owner-token"))
+                .is_none()
+        );
+        // A process-local reader has no in-memory authority: this is the same
+        // durable re-read a restarted owner performs.
+        assert_eq!(
+            purge_intent_for_retry(&peers_root, "Mail", "api:owner", Some("owner-token")),
+            Some(intent)
+        );
+
+        finalize_slug_tombstone(&peers_root, "mail", "2026-11-20T00:01:00Z").unwrap();
+        assert!(
+            purge_intent_for_retry(&peers_root, "mail", "api:owner", Some("owner-token")).is_none(),
+            "an old intent must never erase a later finalized generation"
+        );
+    }
+
+    #[test]
+    fn expired_state1_intent_is_removed_and_cannot_authorize_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers_root = dir.path().join("peers");
+        std::fs::create_dir_all(peers_root.join("mail")).unwrap();
+        let mut intent = fixture_intent();
+        intent.expires_at = "2000-01-01T00:00:00Z".into();
+        write_purge_intent(&peers_root, &intent).unwrap();
+        write_slug_tombstone(&peers_root, "mail", "2026-11-20T00:00:00Z").unwrap();
+
+        assert!(
+            purge_intent_for_retry(&peers_root, "mail", "api:owner", Some("owner-token")).is_none()
+        );
+        assert!(read_purge_intent(&peers_root, "mail").is_none());
+    }
 }

@@ -111,6 +111,15 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 3 | `api::ui_protocol_transport::peer_host_tools_tests::should_never_give_an_external_turn_a_host_routed_tool_when_one_is_registered` | Host-routed tools never enter an external turn's executable set. |
 | 4 | `api::ui_protocol_transport::peer_host_tools_tests::should_finish_a_retry_when_an_earlier_attempt_erased_the_provisioned_workspace` | Peer retry recreates its required workspace and reaches completion after destructive failure. |
 
+## Peer purge State 1 durable rescan (T-0398)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 1 | `api::ui_protocol_transport::peer_host_tools_tests::should_rescan_state1_residue_with_the_persisted_owner_intent` | A real partial erase leaves State 1 residue; a fresh owner retry uses the durable scope, concurrent retries do not block or double-erase, State 2 stays refused, and completion is idempotent. |
+| 3 | `peers::purge::tests::state1_intent_requires_owner_token_and_the_same_unfinished_generation` | Originators, forged/unknown tokens and a later finalized generation cannot turn a durable intent into deletion authority. |
+| 4 | `peers::purge::tests::expired_state1_intent_is_removed_and_cannot_authorize_retry` | An expired durable intent is cleaned up and cannot resume deletion. |
+| 4 | `api::ui_protocol_transport::peer_host_tools_tests::should_finish_only_metadata_when_restart_follows_the_token_tombstone` | A restart after the token tombstone but before slug finalization completes only the missing metadata and never repeats destructive erasure. |
+
 ## Session actor recovery, persistence, and cancellation
 
 | Cat. | Exact test | Guard |
