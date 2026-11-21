@@ -849,10 +849,12 @@ pub mod memory_note;
 pub mod memory_search;
 pub mod message;
 pub mod peer_close;
+pub mod peer_fork;
 pub mod peer_gather;
 pub mod peer_handoff;
 pub mod peer_host_tool;
 pub mod peer_list;
+pub mod peer_reopen;
 pub mod peer_respond;
 pub mod peer_send_input;
 pub mod read_file;
@@ -923,6 +925,7 @@ pub use memory_note::MemoryNoteTool;
 pub use memory_search::MemorySearchTool;
 pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
+pub use peer_fork::{PeerForkCallback, PeerForkTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 mod peer_publish;
 pub use peer_handoff::{
@@ -934,6 +937,7 @@ pub use peer_host_tool::{
 };
 pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_publish::{PeerPublishCallback, PeerPublishTool};
+pub use peer_reopen::{PeerReopenCallback, PeerReopenTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
