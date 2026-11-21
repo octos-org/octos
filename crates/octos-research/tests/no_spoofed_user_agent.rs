@@ -25,7 +25,6 @@ fn sources() -> Vec<PathBuf> {
     for file in [
         "octos-agent/src/tools/web_search.rs",
         "octos-agent/src/tools/deep_search.rs",
-        "octos-agent/src/tools/site_crawl.rs",
         "app-skills/news/src/main.rs",
         "octos-cli/src/api/bilibili.rs",
     ] {
