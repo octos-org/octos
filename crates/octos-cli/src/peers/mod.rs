@@ -2156,6 +2156,13 @@ pub(crate) fn reserve_peer_dir(
             format!("{}{suffix}", base[..end].trim_end_matches('-'))
         };
         let dir = peers_root.join(&slug);
+        let lock = peer_io::mutation_lock(&dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if purge::purge_recovery_in_progress(peers_root, &slug) {
+            // An old purge can still resume and erase this slug. Skip to a
+            // fresh suffix instead of exposing a binding-less generation to it.
+            continue;
+        }
         match std::fs::create_dir(&dir) {
             Ok(()) => return Ok((slug, dir)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2218,12 +2225,19 @@ pub(crate) fn reserve_named_peer_dir(
     };
     std::fs::create_dir_all(peers_root)
         .map_err(|err| RpcError::internal_error(format!("failed to create peers dir: {err}")))?;
+    let dir = peers_root.join(&slug);
+    let lock = peer_io::mutation_lock(&dir);
+    let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+    if purge::purge_recovery_in_progress(peers_root, &slug) {
+        return Err(RpcError::invalid_params(format!(
+            "peer slug '{slug}' has unfinished purge recovery; retry the purge or choose a different name"
+        )));
+    }
     if existing_peer_name_conflict(peers_root, name, &slug) {
         return Err(RpcError::invalid_params(format!(
             "a peer named '{name}' already exists"
         )));
     }
-    let dir = peers_root.join(&slug);
     match std::fs::create_dir(&dir) {
         Ok(()) => Ok((slug, dir)),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(
