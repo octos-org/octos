@@ -40116,6 +40116,34 @@ async fn run_standalone_turn(
             );
             tool_registry.register(octos_agent::PeerCloseTool::new(close));
 
+            // octos#2026 (T-0411) — native peer REOPEN / FORK. Same depth-1
+            // gate as peer_close (this whole block is peer-handoff-gated, so
+            // peer sessions never see these tools); the callbacks enforce
+            // originator-only authorization and the host-app lifetime fence.
+            let reopen_peers_root = session_runtime.profile.data_dir.join("peers");
+            let reopen_origin_session = session_id.to_string();
+            tool_registry.register(octos_agent::PeerReopenTool::new(Arc::new(
+                move |ident: String| {
+                    crate::peers::reopen_closed_peer(
+                        &reopen_peers_root,
+                        &ident,
+                        &reopen_origin_session,
+                    )
+                },
+            )));
+            let fork_peers_root = session_runtime.profile.data_dir.join("peers");
+            let fork_origin_session = session_id.to_string();
+            tool_registry.register(octos_agent::PeerForkTool::new(Arc::new(
+                move |ident: String, name: Option<String>| {
+                    crate::peers::fork_staged_peer(
+                        &fork_peers_root,
+                        &ident,
+                        &fork_origin_session,
+                        name.as_deref(),
+                    )
+                },
+            )));
+
             // #peer-respond — answer a peer BLOCKED on an interactive prompt
             // (tool-approval or clarifying question) so the master acts as its
             // human-in-the-loop. Same depth-1 + originator-auth guards as
