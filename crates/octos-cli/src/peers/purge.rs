@@ -230,6 +230,15 @@ pub(crate) fn purge_intent_for_retry(
     (same_staged_generation || unfinished_residue).then_some(intent)
 }
 
+/// Whether a slug still has recovery authority that could erase its directory.
+/// Reservation must not admit a new generation while either an unexpired intent
+/// or an unfinalized slug record exists, regardless of whether its new binding
+/// has been written yet.
+pub(crate) fn purge_recovery_in_progress(peers_root: &Path, slug: &str) -> bool {
+    (slug_tombstone_exists(peers_root, slug) && !slug_tombstone_is_finalized(peers_root, slug))
+        || read_purge_intent(peers_root, slug).is_some_and(|intent| !intent.expired())
+}
+
 /// Complete only the metadata tail of a purge whose token tombstone proves the
 /// destructive erase already finished. This covers a crash before slug
 /// finalization or intent cleanup without ever repeating that erase. Expiry is

@@ -2154,28 +2154,23 @@ async fn should_refuse_an_old_intent_when_the_slug_is_a_new_generation() {
     // tombstone/finalization. The unfinalized slug and old intent survive.
     std::fs::remove_dir_all(&peer_dir).unwrap();
 
-    let other_owner = fx.system.clone();
     let provisioned_b = dunce::canonicalize(&fx.data_dir)
         .unwrap()
         .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
         .join("app/mail/generation-b");
     std::fs::create_dir_all(&provisioned_b).unwrap();
-    raw_peer_prepare(
-        &fx.state,
-        &rpc(
-            APPUI_METHOD_PEER_PREPARE,
-            json!({
-                "brief": "Generation B",
-                "names": ["Mail"],
-                "session_id": other_owner,
-                "memory_namespace": "app/mail/generation-b",
-                "cwd": provisioned_b.to_string_lossy(),
-            }),
-        ),
-        None,
-    )
-    .await
-    .expect("stage generation B under the same slug");
+    // Bypass the public reservation fence to prove the retry fence remains a
+    // second line of defense against a different staged binding.
+    let binding_b = crate::peers::app_binding::PeerHostBinding {
+        version: 1,
+        cwd: provisioned_b,
+        memory_namespace: "app/mail/generation-b".into(),
+        token_sha256: crate::peers::app_binding::token_digest("generation-b-token"),
+    };
+    std::fs::create_dir(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("brief.md"), "Generation B").unwrap();
+    std::fs::write(peer_dir.join("originator"), fx.system.0.as_bytes()).unwrap();
+    crate::peers::app_binding::write_host_binding_in(&peer_dir, &binding_b).unwrap();
     assert!(peer_dir.join("brief.md").exists());
 
     let (retry_ws, _retry_rx) = ws_connection_for_test(8);
@@ -2192,6 +2187,80 @@ async fn should_refuse_an_old_intent_when_the_slug_is_a_new_generation() {
     );
     assert!(peer_dir.join("brief.md").exists());
     assert!(peer_dir.join("host_binding.json").exists());
+}
+
+#[tokio::test]
+async fn should_refuse_re_staging_while_purge_recovery_is_unfinished() {
+    let fx = fixture().await;
+    let provisioned_a = dunce::canonicalize(&fx.data_dir)
+        .unwrap()
+        .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
+        .join("app/mail/reservation-a");
+    std::fs::create_dir_all(&provisioned_a).unwrap();
+    raw_peer_prepare(
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Generation A",
+                "names": ["Mail"],
+                "session_id": fx.system,
+                "memory_namespace": "app/mail/reservation-a",
+                "cwd": provisioned_a.to_string_lossy(),
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("stage generation A");
+    let peer_dir = peers_root(&fx).join("mail");
+    let binding_a = crate::peers::app_binding::read_peer_host_binding(&peers_root(&fx), "mail")
+        .expect("generation A binding");
+    let intent_a = crate::peers::purge::PurgeIntent::new(
+        "mail".into(),
+        Some("Mail".into()),
+        fx.system.0.clone(),
+        binding_a,
+        Vec::new(),
+    );
+    crate::peers::purge::write_purge_intent(&peers_root(&fx), &intent_a).unwrap();
+    std::fs::remove_dir_all(&peer_dir).unwrap();
+    let provisioned_b = dunce::canonicalize(&fx.data_dir)
+        .unwrap()
+        .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
+        .join("app/mail/reservation-b");
+    std::fs::create_dir_all(&provisioned_b).unwrap();
+    let prepare_b = || {
+        rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Generation B",
+                "names": ["Mail"],
+                "session_id": fx.system,
+                "memory_namespace": "app/mail/reservation-b",
+                "cwd": provisioned_b.to_string_lossy(),
+            }),
+        )
+    };
+
+    raw_peer_prepare(&fx.state, &prepare_b(), None)
+        .await
+        .expect_err("a live intent must block a new generation even before the slug tombstone");
+    assert!(!peer_dir.exists());
+    crate::peers::purge::write_slug_tombstone(&peers_root(&fx), "mail", "2026-11-21T00:00:00Z")
+        .unwrap();
+    raw_peer_prepare(&fx.state, &prepare_b(), None)
+        .await
+        .expect_err("an unfinalized slug must block a new generation");
+    assert!(!peer_dir.exists());
+
+    crate::peers::purge::finalize_slug_tombstone(&peers_root(&fx), "mail", "2026-11-21T00:01:00Z")
+        .unwrap();
+    crate::peers::purge::remove_purge_intent(&peers_root(&fx), "mail").unwrap();
+    raw_peer_prepare(&fx.state, &prepare_b(), None)
+        .await
+        .expect("a finalized purge with no live intent permits a new generation");
+    assert!(peer_dir.join("brief.md").exists());
 }
 
 // ---------------------------------------------------------------------------

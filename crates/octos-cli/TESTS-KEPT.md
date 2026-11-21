@@ -121,6 +121,7 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 4 | `peers::purge::tests::expired_state1_intent_is_removed_and_cannot_authorize_retry` | An expired durable intent is cleaned up and cannot resume deletion. |
 | 4 | `api::ui_protocol_transport::peer_host_tools_tests::should_finish_only_metadata_when_restart_follows_the_token_tombstone` | A restart after the token tombstone but before slug finalization completes only the missing metadata and never repeats destructive erasure. |
 | 3 | `api::ui_protocol_transport::peer_host_tools_tests::should_refuse_an_old_intent_when_the_slug_is_a_new_generation` | An old purge intent cannot erase a different peer generation staged under the same slug. |
+| 3 | `api::ui_protocol_transport::peer_host_tools_tests::should_refuse_re_staging_while_purge_recovery_is_unfinished` | Live intents and unfinalized tombstones block even binding-less re-staging; finalization and intent cleanup reopen a safe new generation. |
 
 ## Session actor recovery, persistence, and cancellation
 

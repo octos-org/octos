@@ -15,9 +15,12 @@ written down.
 When a retry cannot authorize from staged files, it may re-enter the same purge
 executor only after independently proving the matching originator and host
 token, any live host-route ownership, an unexpired intent, and either the same
-staged binding generation or that generation's unfinalized slug tombstone. A
-staged binding that differs from the intent is always a later generation and is
-never erased, even if the slug record is still unfinalized. Unknown or forged
+staged binding generation or that generation's unfinalized slug tombstone.
+Reservation refuses a slug with a live unexpired intent or an unfinalized slug
+record and serializes that check with residue removal, so even a binding-less
+new generation cannot appear while the old purge may resume. A staged binding
+that differs from the intent is always a later generation and is never erased,
+even if the slug record is still unfinalized. Unknown or forged
 identifiers, expired records and finalized/later generations fail closed;
 expired intents are removed. The active owner performs the bounded rescan
 through the existing in-flight guard, so concurrent retries coalesce and a
