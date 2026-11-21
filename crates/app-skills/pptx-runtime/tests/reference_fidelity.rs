@@ -1,5 +1,5 @@
 use image::{Rgb, RgbImage};
-use octos_pptx::{Context, fs::sha_file};
+use octos_pptx::{Context, fidelity, fs::sha_file};
 use serde_json::{Value, json};
 
 fn facts() -> Value {
@@ -248,4 +248,100 @@ fn actual_render_repair_requires_pixel_change_not_a_rewritten_review() {
         )
         .unwrap();
     assert_eq!(reused["reused_objects"], 1);
+}
+
+#[test]
+fn local_background_permission_does_not_allow_collateral_edits_resizing_or_reference_swap() {
+    let (_dir, mut ctx) = fixture();
+    ctx.execute(json!({"action":"cycle","spec":"deck.json","output":"baseline","width":640}))
+        .unwrap();
+    std::fs::copy(
+        ctx.root.join("baseline/editable.pptx"),
+        ctx.root.join("final.pptx"),
+    )
+    .unwrap();
+    let pack=ctx.execute(json!({"action":"review_pack","cycle":"baseline/cycle.json","output":"baseline-review"})).unwrap();
+    let mut flagged = facts();
+    flagged["layout_relation"] = json!("changed");
+    let obs = observations(&ctx, &pack, flagged);
+    submit_record(
+        &mut ctx,
+        "baseline/cycle.json",
+        "baseline-review/report.json",
+        &obs,
+        "baseline",
+        "reviewer",
+    );
+    let old = ctx.json(".octos/pptx-evidence-history.json").unwrap();
+    let id = old["findings"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let plan = octos_pptx::review_routes::load_plan(&ctx).unwrap();
+    let baseline_contract = old["qa_contract"].clone();
+    let base = image::open(ctx.root.join("blank.png")).unwrap().to_rgb8();
+    let original = ctx.json("deck.json").unwrap();
+
+    for (name, width, outside, swap_reference) in [
+        ("collateral", 640, true, false),
+        ("rescaled", 1280, false, false),
+        ("reference-swap", 640, false, true),
+    ] {
+        let mut art = base.clone();
+        art.put_pixel(100, 110, Rgb([90, 80, 70]));
+        if outside {
+            art.put_pixel(620, 15, Rgb([0, 0, 0]));
+        }
+        let background = format!("{name}-blank.png");
+        art.save(ctx.root.join(&background)).unwrap();
+        let mut spec = original.clone();
+        spec["pages"][0]["background"] = json!(background);
+        if swap_reference {
+            let mut ref_image = image::open(ctx.root.join("original.png"))
+                .unwrap()
+                .to_rgb8();
+            ref_image.put_pixel(620, 15, Rgb([0, 0, 0]));
+            ref_image
+                .save(ctx.root.join("different-original.png"))
+                .unwrap();
+            spec["pages"][0]["design"] = json!("different-original.png");
+        }
+        ctx.replace_json("deck.json", &spec).unwrap();
+        ctx.execute(json!({"action":"cycle","spec":"deck.json","output":name,"width":width}))
+            .unwrap();
+        let (cycle, spec) =
+            octos_pptx::review::bound_cycle(&ctx, &ctx.path(format!("{name}/cycle.json")).unwrap())
+                .unwrap();
+        let inventory = octos_pptx::object_review::inventory(&cycle, &spec).unwrap();
+        let mut object = json!({"page":"example","object_id":"label","evidence_hash":inventory[0]["evidence_hash"],
+            "fidelity":facts(),"checks":{}});
+        object["fidelity"]["evidence"] = fidelity::evidence(&inventory[0]);
+        for k in octos_pptx::object_review::CHECKS {
+            object["checks"][k] = json!({"status":"pass","observation":"Claimed good"});
+        }
+        let review = json!({"object_reviews":[object],"findings":[{"id":id,"state":"resolved"}]});
+        let (contract, proofs) =
+            fidelity::repair_contract(&ctx, &cycle, &spec, &review, &old, true, &plan).unwrap();
+        assert_eq!(
+            contract, baseline_contract,
+            "{name} must retain frozen constraints"
+        );
+        let expected = match name {
+            "collateral" => "BACKGROUND_CHANGED_OUTSIDE_DEFECT",
+            "rescaled" => "REPAIR_RENDER_DIMENSIONS_CHANGED",
+            _ => "NO_MATCHING_REGISTERED_BASELINE",
+        };
+        assert_eq!(proofs[0]["code"], expected, "{proofs:?}");
+        let (contract, proofs) =
+            fidelity::repair_contract(&ctx, &cycle, &spec, &review, &old, false, &plan).unwrap();
+        assert_eq!(contract, baseline_contract);
+        assert!(proofs.is_empty());
+    }
+    // An old frozen task must not gain these new permissions implicitly.
+    assert!(!fidelity::enabled(
+        &json!({"mode":"independent_visual","reviewer_agent":"reviewer"})
+    ));
 }

@@ -196,3 +196,41 @@ fn should_use_nonzero_cli_exit_for_failed_or_unknown_qa() {
     let result: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["result"]["status"], "unknown");
 }
+
+#[test]
+fn should_preserve_legacy_array_regions_and_allow_equivalent_metadata_upgrade() {
+    let (_dir, ctx) = fixture();
+    change(&ctx, |s| {
+        s["pages"][0]["regions"]["card"] = json!([40, 40, 360, 160])
+    });
+    cycle(&ctx, "legacy-array");
+    claim(&ctx, "legacy-array");
+    // Exercise already-persisted contracts in the original array format too.
+    let history = ".octos/pptx-evidence-history.json";
+    let mut saved = ctx.json(history).unwrap();
+    saved["qa_contract"]["pages"]["overview"]["regions"]["card"] = json!([40, 40, 360, 160]);
+    ctx.replace_json(history, &saved).unwrap();
+    let unchanged = qa(&ctx, "legacy-array");
+    assert!(
+        !has(&unchanged, "CONSTRAINT_CHANGED"),
+        "unchanged geometry is not a revision"
+    );
+    assert!(
+        has(&unchanged, "OWNER_UNVERIFIED"),
+        "representation equality is not ownership proof"
+    );
+    change(&ctx, |s| {
+        s["pages"][0]["regions"]["card"] = json!({
+            "quad":[[40,40],[400,40],[400,200],[40,200]],
+            "scope":"label","basis":"Synthetic independently defined card"
+        })
+    });
+    cycle(&ctx, "documented-array");
+    let upgraded = claim(&ctx, "documented-array");
+    assert_eq!(upgraded["native_qa"]["status"], "pass");
+    change(&ctx, |s| {
+        s["pages"][0]["regions"]["card"]["quad"] = json!([[0, 0], [640, 0], [640, 360], [0, 360]])
+    });
+    cycle(&ctx, "array-expanded");
+    assert!(has(&qa(&ctx, "array-expanded"), "CONSTRAINT_CHANGED"));
+}
