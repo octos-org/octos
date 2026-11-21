@@ -13,10 +13,11 @@
 //! subscription, replay and forwarder, and answering a `turn/start` before
 //! its turn may run (an accept the client never got aborts the turn).
 //!
-//! An admitted turn still runs in `run_standalone_turn`, which delivers its
-//! events through a `WsConnection`; the caller supplies that runner
-//! ([`TurnCaller::turn_runner`]). A runner that delivers elsewhere is later
-//! work, not part of this extraction.
+//! An admitted turn runs in `run_standalone_turn`, which delivers its events
+//! through a [`TurnConnection`]; the caller supplies the runner
+//! ([`TurnCaller::turn_runner`]). A socket's runner delivers to its client;
+//! `ExternalTurns` runs its turns on a `LedgerConnection`, whose events reach
+//! readers through the ledger alone.
 
 use super::*;
 
@@ -119,43 +120,48 @@ impl TurnRunner for WsConnection {
             .await;
             return;
         }
-
-        run_standalone_turn(
-            self,
-            run.state,
-            run.ledger,
-            run.contracts,
-            run.background_work,
-            run.features,
-            run.params,
-            run.prompt,
-            run.pre_admitted_voice,
-            run.resolved_profile_id,
-            run.turn_state,
-            run.interrupt_rx,
-            run.steer_buffer,
-            false,
-            None,
-            // #1133 — regular `turn/start` path is user-initiated;
-            // it never runs as a goal continuation, so no goal
-            // accountant wiring. Only the master continuation
-            // runner sets this to `Some(...)` for `GoalContinue`.
-            None,
-            // #1650 — interactive goal binding snapshotted at admission.
-            run.interactive_goal_binding,
-            // #436 — regular user turns already persist their prompt
-            // (they are not internal continuations); no override needed.
-            false,
-            // #436 P1 #2 — regular turns don't gate completion on dispatch.
-            None,
-            // OLP-CTRL 回合 4 — an interactive turn is never a steer
-            // continuation turn; it must not consume reviewer-notes.
-            false,
-            None,
-            run.turn_cancel,
-        )
-        .await;
+        run_admitted_turn(Arc::new(self), run).await;
     }
+}
+
+/// Run an admitted interactive turn, delivering its events through
+/// `connection`.
+pub(super) async fn run_admitted_turn(connection: Arc<dyn TurnConnection>, run: TurnRun) {
+    run_standalone_turn(
+        connection,
+        run.state,
+        run.ledger,
+        run.contracts,
+        run.background_work,
+        run.features,
+        run.params,
+        run.prompt,
+        run.pre_admitted_voice,
+        run.resolved_profile_id,
+        run.turn_state,
+        run.interrupt_rx,
+        run.steer_buffer,
+        false,
+        None,
+        // #1133 — regular `turn/start` path is user-initiated;
+        // it never runs as a goal continuation, so no goal
+        // accountant wiring. Only the master continuation
+        // runner sets this to `Some(...)` for `GoalContinue`.
+        None,
+        // #1650 — interactive goal binding snapshotted at admission.
+        run.interactive_goal_binding,
+        // #436 — regular user turns already persist their prompt
+        // (they are not internal continuations); no override needed.
+        false,
+        // #436 P1 #2 — regular turns don't gate completion on dispatch.
+        None,
+        // OLP-CTRL 回合 4 — an interactive turn is never a steer
+        // continuation turn; it must not consume reviewer-notes.
+        false,
+        None,
+        run.turn_cancel,
+    )
+    .await;
 }
 
 /// A refused request. A scope error goes out through `send_scope_error`,

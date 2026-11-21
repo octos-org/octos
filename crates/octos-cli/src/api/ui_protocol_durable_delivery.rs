@@ -17,7 +17,7 @@ pub(super) fn warn_ledger_failure(context: &'static str, error: &LedgerError) {
 /// fully handled without touching the wire (the v2 forwarder lane, or a
 /// capability-filtered event), so there is nothing to enqueue.
 pub(super) fn prepare_lifecycle_send(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
@@ -57,7 +57,7 @@ pub(super) fn prepare_lifecycle_send(
     // Tag the broadcast with the originating connection so this
     // connection's own live forwarder skips the duplicate copy.
     let event = ledger
-        .try_append_notification_from(notification, ws.connection_id)
+        .try_append_notification_from(notification, ws.connection_id())
         .map_err(|error| SendError::LifecycleFailure(error.to_string()))?;
     let cursor = event.cursor.clone();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection
@@ -93,7 +93,7 @@ pub(super) fn prepare_lifecycle_send(
 /// its [`SendMeta`]. `Ok(None)` = fully handled without touching the wire,
 /// so there is nothing to enqueue.
 pub(super) fn prepare_durable_send(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
@@ -127,7 +127,7 @@ pub(super) fn prepare_durable_send(
         return Ok(None);
     }
     let event = ledger
-        .try_append_notification_from(notification, ws.connection_id)
+        .try_append_notification_from(notification, ws.connection_id())
         .map_err(|error| SendError::LifecycleFailure(error.to_string()))?;
     let cursor = event.cursor.clone();
     // Peer close/purge may run on the host connection while the question
@@ -136,7 +136,7 @@ pub(super) fn prepare_durable_send(
     if matches!(
         &event.event,
         UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionCancelled(_))
-    ) && !ledgered_event_visible_to_connection(&event, ws.connection_id)
+    ) && !ledgered_event_visible_to_connection(&event, ws.connection_id())
     {
         return Ok(None);
     }

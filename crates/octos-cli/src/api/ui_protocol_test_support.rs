@@ -1235,7 +1235,7 @@ pub(crate) fn g1_system_session() -> SessionKey {
 /// Run one approval request of a turn on `ws` in the background; return the
 /// task and the approval once it is pending.
 pub(crate) async fn g1_raise_approval(
-    ws: &WsConnection,
+    ws: &(impl TurnConnection + Clone + 'static),
     ledger: &Arc<UiProtocolLedger>,
     contracts: &Arc<UiProtocolContractStores>,
     state: &Arc<AppState>,
@@ -1243,7 +1243,7 @@ pub(crate) async fn g1_raise_approval(
 ) -> (tokio::task::JoinHandle<ToolApprovalDecision>, ApprovalId) {
     let turn_id = TurnId::new();
     let requester = UiProtocolApprovalRequester {
-        ws: ws.clone(),
+        ws: Arc::new(ws.clone()),
         ledger: Arc::clone(ledger),
         contracts: Arc::clone(contracts),
         state: Arc::clone(state),
@@ -1340,7 +1340,7 @@ pub(crate) async fn g1_ask_question(
     use octos_agent::UserQuestionRequester as _;
     let turn_id = TurnId::new();
     let requester = SessionUserQuestionRequester {
-        ws: ws.clone(),
+        ws: Arc::new(ws.clone()),
         ledger: Arc::clone(ledger),
         contracts: Arc::clone(contracts),
         state: Arc::clone(state),

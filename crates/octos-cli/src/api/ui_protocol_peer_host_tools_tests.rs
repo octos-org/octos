@@ -378,7 +378,7 @@ fn app_approver(
     let (ws, rx) = ws_connection_for_test(64);
     std::mem::forget(rx);
     Arc::new(UiProtocolApprovalRequester {
-        ws,
+        ws: Arc::new(ws),
         ledger: Arc::new(UiProtocolLedger::new(64)),
         contracts: contracts.clone(),
         state: fx.state.clone(),

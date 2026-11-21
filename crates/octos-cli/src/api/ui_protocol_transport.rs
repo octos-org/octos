@@ -6,12 +6,16 @@ use octos_core::ui_protocol::user_question_cancelled_reasons;
 mod dto;
 #[path = "ui_protocol_durable_delivery.rs"]
 mod durable_delivery;
+#[path = "ui_protocol_external_turns.rs"]
+mod external_turns;
 #[path = "ui_protocol_memory_entries.rs"]
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
 #[path = "ui_protocol_session_turn_service.rs"]
 mod session_turn_service;
+#[path = "ui_protocol_turn_connection.rs"]
+mod turn_connection;
 #[path = "ui_protocol_persistence.rs"]
 mod ui_protocol_persistence;
 #[path = "ui_protocol_workspace_team.rs"]
@@ -20,6 +24,7 @@ use super::delivered_media::store_delivered_media_copies;
 pub(crate) use dto::*;
 pub(crate) use octos_core::autonomy_rpc::{AutonomyCommand, parse_autonomy_command};
 use session_turn_service::{SessionTurnService, TurnCaller};
+use turn_connection::TurnConnection;
 
 use durable_delivery::{
     emit_session_compact_notifications, prepare_durable_send, prepare_lifecycle_send,
@@ -2044,7 +2049,7 @@ struct ActiveTurn {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ConnectionUiFeatures {
+pub(crate) struct ConnectionUiFeatures {
     typed_approvals: bool,
     pane_snapshots: bool,
     session_workspace_cwd: bool,
@@ -6340,7 +6345,7 @@ fn forward_task_progress_to_channel(
 /// are coalesce-friendly, so appending each to the durable ledger would only
 /// bloat replay history with redundant in-flight states.
 fn forward_terminal_agent_update_durable(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     task: &octos_agent::BackgroundTask,
     runtime_profile_id: Option<&str>,
@@ -6544,7 +6549,7 @@ fn refuse_registered_question_park_for_closed_peer(
 }
 
 struct UiProtocolApprovalRequester {
-    ws: WsConnection,
+    ws: Arc<dyn TurnConnection>,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
     /// Held so the FIX-07 audit log can resolve `<data_dir>/audit/` from
@@ -6873,7 +6878,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 /// reconnecting client via replay.
 async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     approval_id: &ApprovalId,
@@ -6905,7 +6910,7 @@ async fn cancel_approval_after_request_send_failure(
 /// Record every cancelled question before waiting on any transport queue.
 /// A second abort while sending must not lose the remainder of a drained batch.
 async fn cancel_turn_questions_durable(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     questions: &PendingQuestionStore,
     session_id: &SessionKey,
@@ -7042,7 +7047,7 @@ impl Drop for PendingApprovalWaiterGuard {
 /// task-local stays unset), so the `ask_user_question` tool degrades to its
 /// structured-metadata fallback and the turn never hard-blocks.
 struct SessionUserQuestionRequester {
-    ws: WsConnection,
+    ws: Arc<dyn TurnConnection>,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
     /// #peer-awaiting-wake — held so a peer parking on a question can resolve
@@ -13913,7 +13918,7 @@ async fn raw_skill_action_invoke(
     }
     let approval_requester = ui_context.map(|ui_context| {
         Arc::new(UiProtocolApprovalRequester {
-            ws: ui_context.ws,
+            ws: Arc::new(ui_context.ws),
             ledger: Arc::clone(ledger),
             contracts: ui_context.contracts,
             state: Arc::clone(state),
@@ -17091,8 +17096,8 @@ fn apply_turn_host_tool_rosters(
     );
 }
 
-fn host_tools_turn_connection(ws: &WsConnection, internal_continuation: bool) -> Option<u64> {
-    (!internal_continuation && !ws.is_external()).then_some(ws.connection_id.0)
+fn host_tools_turn_connection(ws: &dyn TurnConnection, internal_continuation: bool) -> Option<u64> {
+    (!internal_continuation && !ws.is_external()).then_some(ws.connection_id().0)
 }
 
 /// An external client's `peer/tools/register` or `peer/tool/result`.
@@ -27474,7 +27479,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let turn_dispatched = requires_message_dispatch
             .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         run_standalone_turn(
-            ws_for_turn,
+            Arc::new(ws_for_turn),
             state_for_turn,
             ledger_for_turn,
             contracts_for_turn,
@@ -28544,8 +28549,20 @@ fn emit_approval_decided(
     event: &ApprovalDecidedEvent,
     tool_name: Option<&str>,
 ) -> Result<(), SendError> {
+    deliver_approval_decided(event, tool_name, |decided| {
+        caller.emit_durable(ledger, decided)
+    })
+}
+
+/// [`emit_approval_decided`] through `emit`, which appends the decision to
+/// the ledger and delivers it.
+fn deliver_approval_decided(
+    event: &ApprovalDecidedEvent,
+    tool_name: Option<&str>,
+    emit: impl FnOnce(UiNotification) -> Result<(), SendError>,
+) -> Result<(), SendError> {
     log_decision_tracing(event, tool_name);
-    match caller.emit_durable(ledger, UiNotification::ApprovalDecided(event.clone())) {
+    match emit(UiNotification::ApprovalDecided(event.clone())) {
         Err(error @ SendError::LifecycleFailure(_)) => Err(error),
         Err(error) => {
             tracing::warn!(
@@ -38091,7 +38108,7 @@ const WITHHELD_APP_CONTEXT_PROMPT: &str = "You are an assistant. This session be
 
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
-    ws: WsConnection,
+    ws: Arc<dyn TurnConnection>,
     state: Arc<AppState>,
     ledger: Arc<UiProtocolLedger>,
     contracts: Arc<UiProtocolContractStores>,
@@ -38876,7 +38893,7 @@ async fn run_standalone_turn(
         if features.context_lifecycle_available() {
             let _ = send_notification_durable(&ws, &ledger, notification);
         } else if let Err(error) =
-            ledger.try_append_notification_from(notification, ws.connection_id)
+            ledger.try_append_notification_from(notification, ws.connection_id())
         {
             warn_ledger_failure("pre-turn context lifecycle", &error);
         }
@@ -40101,8 +40118,10 @@ async fn run_standalone_turn(
                     // attributing the master session.
                     let on_approval_decided =
                         |event: &ApprovalDecidedEvent, tool_name: Option<&str>| {
-                            emit_approval_decided(&respond_ws, &respond_ledger, event, tool_name)
-                                .map_err(|error| {
+                            deliver_approval_decided(event, tool_name, |decided| {
+                                send_notification_durable(&*respond_ws, &respond_ledger, decided)
+                            })
+                            .map_err(|error| {
                                 format!("durable approval append failed: {error:?}")
                             })?;
                             if let Some(dir) = &respond_audit_data_dir {
@@ -40603,7 +40622,7 @@ async fn run_standalone_turn(
             if features.context_lifecycle_available() {
                 let _ = send_notification_durable(&ws, &ledger, notification);
             } else if let Err(error) =
-                ledger.try_append_notification_from(notification, ws.connection_id)
+                ledger.try_append_notification_from(notification, ws.connection_id())
             {
                 warn_ledger_failure("in-loop context lifecycle", &error);
             }
@@ -44279,7 +44298,7 @@ fn report_terminal_delivery_error(error: SendError) {
 async fn try_emit_terminal(
     turn_state: &TokioMutex<TurnState>,
     expected_reason: TerminalReason,
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     turn_id: &TurnId,
@@ -44486,7 +44505,7 @@ fn envelope_tool_arguments_preview(arguments: &Value) -> String {
 #[cfg(any(test, feature = "transport-test-fixtures"))]
 async fn try_emit_completed_terminal_with_forced_backpressure(
     turn_state: &TokioMutex<TurnState>,
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     turn_id: &TurnId,
@@ -44674,7 +44693,7 @@ fn emit_progress_envelope(
 /// that would pin an executor worker — and park this drain loop before it
 /// can ever reach the terminal gate — while a stdio host reads slowly.
 async fn forward_progress_event(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     progress_context: &ProgressMappingContext,
@@ -44774,7 +44793,7 @@ async fn forward_progress_event(
     if let Some(status) = mapping.status {
         // Tag with this connection's id so its forwarder skips
         // the broadcast copy after the direct send below.
-        let event = match ledger.try_append_progress_from(status.event, ws.connection_id) {
+        let event = match ledger.try_append_progress_from(status.event, ws.connection_id()) {
             Ok(event) => event,
             Err(error) => {
                 tracing::warn!(
@@ -46767,7 +46786,7 @@ fn append_appui_server_log(message: impl AsRef<str>) {
 /// [`send_notification_ephemeral`] (typed `UiNotification`) +
 /// [`emit_envelope_for_legacy_notification`] for those methods.
 fn send_raw_notification_ephemeral(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     method: &'static str,
     params: Value,
 ) -> Result<(), SendError> {
@@ -46817,7 +46836,7 @@ fn send_raw_notification_ephemeral(
 /// replays it, still ahead of the terminal.
 pub(crate) enum SteerReturnSink<'a> {
     Live {
-        ws: &'a WsConnection,
+        ws: &'a dyn TurnConnection,
         ledger: &'a UiProtocolLedger,
     },
     LedgerOnly {
@@ -46919,7 +46938,7 @@ async fn transition_to_terminal_settling_steers(
 /// sync `send_turn_error` family used to deliver, now through the offloaded
 /// lifecycle lane so a stalled stdio host reader pins no executor worker.
 async fn send_turn_error_offloaded(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     turn_id: &TurnId,
@@ -46933,7 +46952,7 @@ async fn send_turn_error_offloaded(
 /// #2807 — the turn drain loop's detailed terminal forward: same event
 /// shape, delivered through the offloaded lifecycle lane.
 async fn send_turn_error_with_details_offloaded(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     turn_id: &TurnId,
@@ -46992,7 +47011,7 @@ pub(crate) fn build_router_status_event(
 ///
 /// No-op when `router` is `None`.
 async fn emit_router_status_durable(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     router: Option<&Arc<octos_llm::AdaptiveRouter>>,
@@ -47014,7 +47033,7 @@ async fn emit_router_status_durable(
 }
 
 fn spawn_router_failover_forwarder(
-    ws: WsConnection,
+    ws: Arc<dyn TurnConnection>,
     ledger: Arc<UiProtocolLedger>,
     session_id: SessionKey,
     router: Option<Arc<octos_llm::AdaptiveRouter>>,
@@ -47310,7 +47329,10 @@ fn send_scope_error(ws: &WsConnection, id: String, error: RpcError) {
 /// connection; `false` when the connection's negotiated feature set
 /// filters it out (e.g. a `projection.envelope.v1` client that must
 /// not receive a legacy `MessageDelta` direct-send).
-fn direct_send_passes_capability_filter(ws: &WsConnection, event: &UiProtocolLedgerEvent) -> bool {
+fn direct_send_passes_capability_filter(
+    ws: &dyn TurnConnection,
+    event: &UiProtocolLedgerEvent,
+) -> bool {
     let features = ws.snapshot_live_features();
     live_event_passes_capability_filter(event, features)
 }
@@ -47326,14 +47348,14 @@ struct SendMeta {
 /// Shared result mapping of the lifecycle delivery twins: delivery metric,
 /// durable-cursor bookkeeping, and the `delivery_failed` warn.
 fn finish_lifecycle_send(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     meta: SendMeta,
     sent: Result<(), SendError>,
 ) -> Result<(), SendError> {
     match sent {
         Ok(()) => {
             record_ui_protocol_delivery_metric(meta.delivery_metric);
-            ws.metrics.record_durable_cursor(&meta.cursor);
+            ws.metrics().record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::LifecycleFailure(reason)) => {
@@ -47352,7 +47374,7 @@ fn finish_lifecycle_send(
 }
 
 fn send_notification_lifecycle(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47370,7 +47392,7 @@ fn send_notification_lifecycle(
 /// task cooperatively instead of pinning an executor worker on a blocking
 /// `SyncSender::send`.
 async fn send_notification_lifecycle_offloaded(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47383,18 +47405,18 @@ async fn send_notification_lifecycle_offloaded(
 
 #[cfg(any(test, feature = "transport-test-fixtures"))]
 fn send_notification_lifecycle_forced_backpressure_fixture(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
     let event = ledger
-        .try_append_notification_from(notification, ws.connection_id)
+        .try_append_notification_from(notification, ws.connection_id())
         .map_err(|error| SendError::LifecycleFailure(error.to_string()))?;
     let method = ledger_event_method(&event.event).to_string();
     let _frame = frame_from_ledger(event.event)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
     metrics::counter!("ws.send.error.lifecycle").increment(1);
-    ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+    ws.metrics().dropped_count.fetch_add(1, Ordering::Relaxed);
     tracing::warn!(
         target: "octos::ui_protocol::ws",
         method = %method,
@@ -47514,7 +47536,7 @@ fn goal_event_generation_admits(
 /// durable-cursor bookkeeping, and the immediate replay_lossy on a
 /// backpressure drop.
 fn finish_durable_send(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     meta: SendMeta,
     sent: Result<(), SendError>,
@@ -47522,7 +47544,7 @@ fn finish_durable_send(
     match sent {
         Ok(()) => {
             record_ui_protocol_delivery_metric(meta.delivery_metric);
-            ws.metrics.record_durable_cursor(&meta.cursor);
+            ws.metrics().record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::BackpressureDrop) => {
@@ -47536,7 +47558,7 @@ fn finish_durable_send(
 }
 
 fn send_notification_durable(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47555,7 +47577,7 @@ fn send_notification_durable(
 /// task cooperatively instead of pinning an executor worker on a blocking
 /// `SyncSender::send`.
 async fn send_notification_durable_offloaded(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47577,7 +47599,7 @@ async fn send_notification_durable_offloaded(
 /// disclosed immediately. Dropping the inner future is safe: the offloaded
 /// lane is cancellable at every await with an atomic enqueue (#2065).
 async fn send_notification_durable_offloaded_budgeted(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47598,14 +47620,14 @@ async fn send_notification_durable_offloaded_budgeted(
             // sees the same `FatalClosed` the probe loop would have
             // returned (no drop accounting, mirroring `send_durable`'s
             // latched arm).
-            if ws.failed.load(Ordering::Acquire) {
+            if ws.is_failed() {
                 return Err(SendError::FatalClosed);
             }
             // Mirror send_durable's BackpressureDrop accounting: the count
             // lands in the accumulator first, then finish_durable_send's
             // immediate replay_lossy attempt discloses it (or re-queues the
             // count when the lossy frame cannot enqueue either).
-            ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+            ws.metrics().dropped_count.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("ws.send.drop.backpressure", "method" => meta.method.clone())
                 .increment(1);
             tracing::warn!(
@@ -47621,7 +47643,7 @@ async fn send_notification_durable_offloaded_budgeted(
 }
 
 fn send_notification_ephemeral(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
 ) -> Result<(), SendError> {
@@ -47679,7 +47701,7 @@ fn send_notification_ephemeral(
 }
 
 fn send_ledger_event_durable(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     event: UiProtocolLedgerEvent,
 ) -> Result<(), SendError> {
@@ -47710,7 +47732,7 @@ fn send_ledger_event_durable(
         Ok(()) => {
             record_ui_protocol_delivery_metric(delivery_metric);
             if let Some(cursor) = cursor {
-                ws.metrics.record_durable_cursor(&cursor);
+                ws.metrics().record_durable_cursor(&cursor);
             }
             Ok(())
         }
@@ -47733,7 +47755,7 @@ fn send_ledger_event_durable(
 /// cancellable with an atomic enqueue so abort+join leaves nothing
 /// detached in flight.
 async fn send_ledger_event_durable_offloaded(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     event: UiProtocolLedgerEvent,
 ) -> Result<(), SendError> {
@@ -47748,7 +47770,7 @@ async fn send_ledger_event_durable_offloaded(
         Ok(()) => {
             record_ui_protocol_delivery_metric(delivery_metric);
             if let Some(cursor) = cursor {
-                ws.metrics.record_durable_cursor(&cursor);
+                ws.metrics().record_durable_cursor(&cursor);
             }
             Ok(())
         }
@@ -47891,25 +47913,25 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
 /// try to enqueue it. Failures here are logged and discarded — the next
 /// successful send will retry via `flush_replay_lossy`.
 fn emit_replay_lossy_opportunistic(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_stream: &str,
 ) {
     let session_id = SessionKey(session_stream.to_string());
-    let dropped = ws.metrics.dropped_count.swap(0, Ordering::Relaxed);
+    let dropped = ws.metrics().dropped_count.swap(0, Ordering::Relaxed);
     if dropped == 0 {
         return;
     }
-    let last_cursor = ws.metrics.snapshot_last_cursor();
+    let last_cursor = ws.metrics().snapshot_last_cursor();
     let lossy = UiNotification::ReplayLossy(ReplayLossyEvent {
         session_id,
         dropped_count: dropped,
         last_durable_cursor: last_cursor,
     });
-    let event = match ledger.try_append_notification_from(lossy, ws.connection_id) {
+    let event = match ledger.try_append_notification_from(lossy, ws.connection_id()) {
         Ok(event) => event,
         Err(error) => {
-            ws.metrics
+            ws.metrics()
                 .dropped_count
                 .fetch_add(dropped, Ordering::Relaxed);
             tracing::warn!(
@@ -47928,7 +47950,7 @@ fn emit_replay_lossy_opportunistic(
     if ws.try_enqueue(frame).is_err() {
         // Channel is still full or closed. Push the count back and let the
         // next successful send opportunity flush it.
-        ws.metrics
+        ws.metrics()
             .dropped_count
             .fetch_add(dropped, Ordering::Relaxed);
         tracing::warn!(
@@ -47967,18 +47989,18 @@ async fn deliver_terminal_progress_event(
 /// turn boundary. Intended to be called just before `turn/completed` or
 /// `turn/error` so the client knows the cursor is incomplete.
 fn flush_replay_lossy(
-    ws: &WsConnection,
+    ws: &dyn TurnConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
     progress_dropped: &Arc<AtomicU64>,
 ) {
     let progress_drops = progress_dropped.swap(0, Ordering::Relaxed);
     if progress_drops > 0 {
-        ws.metrics
+        ws.metrics()
             .dropped_count
             .fetch_add(progress_drops, Ordering::Relaxed);
     }
-    if ws.metrics.dropped_count.load(Ordering::Relaxed) == 0 {
+    if ws.metrics().dropped_count.load(Ordering::Relaxed) == 0 {
         return;
     }
     emit_replay_lossy_opportunistic(ws, ledger, &session_id.0);
