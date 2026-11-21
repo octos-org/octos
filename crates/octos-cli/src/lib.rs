@@ -57,6 +57,8 @@ pub mod config_watcher;
 pub mod content_catalog;
 #[path = "api/context_manager.rs"]
 pub(crate) mod context_manager;
+#[path = "api/conversation_episode.rs"]
+pub(crate) mod conversation_episode;
 pub(crate) mod conversation_outcome;
 pub mod embed_model;
 // Interactive-contract stores (pending approvals / user questions / diff
