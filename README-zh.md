@@ -338,6 +338,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
 - [基于工具结果的进展提醒与可选周期反思](docs/event-driven-reflection.md)
 - [从源码运行并实时打补丁（实验性）](docs/JIT_DEV_MODE.md)
+- [GitHub Action：@ 提及、固定提示词与 Pull Request 值守](action/README.md)
 - [文档站点](https://octos-org.github.io/octos/zh/)
 
 ## 参与开发

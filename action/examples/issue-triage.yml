@@ -1,0 +1,40 @@
+# Copy to `.github/workflows/octos-triage.yml` in your repository.
+#
+# Octos reads every new issue and writes a triage note. Anyone can open an
+# issue, so the run is read-only and the note goes to the run summary only.
+# Set `comment: "true"` once you like what you see.
+
+name: Octos issue triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write # only needed with `comment: "true"`
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Pin a release tag or a commit SHA instead of `main`.
+      - uses: octos-org/octos/action@main
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        with:
+          provider: deepseek
+          model: deepseek-flash
+          access: read
+          comment: "false"
+          allowed_non_write_users: "*"
+          prompt: |
+            Triage the new issue below.
+            1. Say whether it is a bug report, a feature request or a question.
+            2. List what a maintainer still needs from the reporter, if anything.
+            3. Name the files in this repository that are most likely involved,
+               and say in one or two sentences why.
+            Keep it under 200 words.

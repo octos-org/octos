@@ -1,0 +1,71 @@
+# Copy to `.github/workflows/octos.yml` in your repository.
+#
+# - Mention `@octos` in an issue, a pull request comment or a review comment
+#   to get an answer or a change.
+# - Comment `@octos review` on a pull request to get a review with line
+#   comments. `pr-review.yml` in this folder reviews every pull request.
+# - Comment `@octos watch` on a pull request, or give it the `octos-watch`
+#   label, and Octos reacts to failed CI runs and to maintainers' reviews.
+#
+# Add the model key as a repository secret first. The workflow file must be on
+# the default branch before `workflow_run` and `issue_comment` reach it.
+
+name: Octos
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  workflow_run:
+    workflows: [CI] # the workflows whose failures Octos should look at
+    types: [completed]
+
+permissions:
+  actions: read # failed job logs
+  contents: write # push the fix; `read` is enough with `access: read`
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: octos-${{ github.event.issue.number || github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  octos:
+    # Start a runner only when there is something to do. The action checks
+    # again, and it checks that the sender has write access.
+    if: >-
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@octos')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@octos')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@octos') &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_review' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        contains(github.event.pull_request.labels.*.name, 'octos-watch')) ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'failure' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # Pin a release tag or a commit SHA instead of `main`.
+      - uses: octos-org/octos/action@main
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        with:
+          provider: deepseek
+          model: deepseek-flash
+          access: write
+          # Commits pushed with the default token do not start CI. Give the
+          # token of a GitHub App or a fine-grained personal access token
+          # (contents, issues and pull requests: write) to have CI run on a fix.
+          # github_token: ${{ secrets.OCTOS_BOT_TOKEN }}
