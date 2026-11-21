@@ -367,3 +367,14 @@ Creation admission also retains these persistence regressions (T-0323):
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 5 | `api::cron_panel::timestamp_tests::should_render_invalid_deadlines_without_overflowing` | List invalid persisted deadlines without overflow or misleading delay; retain raw timestamp and legal overdue display. |
+
+## Native peer reopen/fork durable resume (octos#2026, T-0411)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 4 | `peers::reopen_fork_tests::should_reopen_a_closed_peer_preserving_work_and_refusing_unauthorized_or_open` | Reopen clears ONLY the close marker: brief, committed results, unfinished notes and originator survive; non-originator refused with no state change; reopening an OPEN peer refused (crash/restart consistency); synthesis stamp restored at the committed round so old results do not re-fire. |
+| 4 | `peers::reopen_fork_tests::should_stamp_a_legacy_bare_result_peer_on_reopen` | A legacy peer with only the bare `result.md` (no numbered versions) is stamped at delivered round 1 on reopen, so its old result cannot re-arm synthesis after the last-peer close reset. |
+| 3 | `peers::reopen_fork_tests::should_fork_a_new_identity_with_scoped_inheritance_and_no_authority_carryover` | Fork mints a NEW identity inheriting brief/workspace/owner but NOT closed state, result history or the task-id binding; source untouched; non-originator refused; independent lifecycles. |
+| 4 | `peers::reopen_fork_tests::should_fork_unique_addresses_inherit_budget_and_refuse_a_fenced_source` | Two unnamed forks get distinct slugs and NO shared display name (unambiguous name resolution); the budget LIMIT is inherited without the usage ledger; a fenced source is refused with no half-staged dir. |
+| 3 | `peers::reopen_fork_tests::should_refuse_reopen_and_fork_when_the_source_is_purge_owned` | A slug tombstone (unfinalized OR finalized) or a live purge intent/recovery blocks BOTH reopen and fork; the purge's close marker survives and no residue brief is inherited. |
+| 5 | `peers::reopen_fork_tests::should_fork_with_an_explicit_new_name` | An explicit fork name is honored and a duplicate explicit name is refused with no side effects. |
