@@ -71,9 +71,10 @@ pub(crate) struct ImMessage {
     /// A one-to-one chat between the sender and the bot.
     pub(crate) direct: bool,
     pub(crate) sender: ImSender,
-    /// The platform's id of the message in its chat. A button press has
-    /// none (Telegram gives a callback no message id), and the bridge makes
-    /// none up.
+    /// The platform's id of the message in its chat, which grows with the
+    /// order messages were sent in (Telegram message ids and Discord
+    /// snowflakes do). A button press has none (Telegram gives a callback no
+    /// message id), and the bridge makes none up.
     pub(crate) message_id: Option<i64>,
     /// When the platform says it was sent; never when the bridge got it.
     pub(crate) sent_at: Option<DateTime<Utc>>,
@@ -147,8 +148,9 @@ pub(crate) struct ServeImBridge {
     bindings: StdMutex<Vec<ImBinding>>,
     /// How old a message may be, by its platform time, and still run.
     ttl: Duration,
-    /// The turn the bridge last started in each chat, while it runs.
-    running: StdMutex<HashMap<SessionKey, TurnId>>,
+    /// The turn the bridge last started in each chat, while it runs, and
+    /// the id of the message that started it.
+    running: StdMutex<HashMap<SessionKey, (TurnId, i64)>>,
 }
 
 impl ServeImBridge {
@@ -266,14 +268,17 @@ impl ServeImBridge {
         let running = self.running_turn(binding.target.session_id());
         let reply = match (command.split_whitespace().next(), running) {
             (Some("status"), Some(_)) => "A turn is running.",
-            (Some("status" | "stop"), None) => "Nothing is running.",
-            // The stopped turn's result answers.
-            (Some("stop"), Some(turn_id)) => {
+            (Some("status"), None) => "Nothing is running.",
+            // Only a turn an earlier message started: a redelivered /stop
+            // must not reach a turn started after it, before or after a
+            // restart. The stopped turn's result answers.
+            (Some("stop"), Some((turn_id, started_by))) if started_by < message_id => {
                 match self.turns.interrupt(&binding.target, turn_id).await {
                     Ok(_) => return Handled::Answered,
                     Err(_) => "Could not stop the turn.",
                 }
             }
+            (Some("stop"), _) => "Nothing sent before this /stop is running.",
             _ => {
                 return self
                     .refuse(binding.chat, Some(message_id), Refusal::UnknownCommand)
@@ -300,7 +305,8 @@ impl ServeImBridge {
             }
         }
         let session = binding.target.session_id().clone();
-        self.lock_running().insert(session, turn_id.clone());
+        self.lock_running()
+            .insert(session, (turn_id.clone(), message_id));
         let bridge = self.clone();
         Handled::Started(tokio::spawn(async move {
             let outcome = bridge.turns.ended(&binding.target, &turn_id, events).await;
@@ -318,7 +324,10 @@ impl ServeImBridge {
         let session = binding.target.session_id();
         {
             let mut running = self.lock_running();
-            if running.get(session) == Some(&turn_id) {
+            if running
+                .get(session)
+                .is_some_and(|(running, _)| *running == turn_id)
+            {
                 running.remove(session);
             }
         }
@@ -358,11 +367,11 @@ impl ServeImBridge {
         delivery
     }
 
-    fn lock_running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionKey, TurnId>> {
+    fn lock_running(&self) -> std::sync::MutexGuard<'_, HashMap<SessionKey, (TurnId, i64)>> {
         self.running.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn running_turn(&self, session: &SessionKey) -> Option<TurnId> {
+    fn running_turn(&self, session: &SessionKey) -> Option<(TurnId, i64)> {
         self.lock_running().get(session).cloned()
     }
 

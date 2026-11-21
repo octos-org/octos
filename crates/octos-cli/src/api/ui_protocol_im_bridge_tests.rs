@@ -9,6 +9,7 @@ const BOT: i64 = 900;
 const ME: i64 = 4242;
 const SOMEONE: i64 = 5151;
 const TTL: Duration = Duration::from_secs(600);
+const STOP_TOO_LATE: &str = "Nothing sent before this /stop is running.";
 
 /// A channel that keeps what it was asked to send, and fails sends while
 /// `fail` is set.
@@ -130,12 +131,23 @@ async fn a_bound_message_runs_once_and_its_result_goes_back_to_its_chat() {
         bridge.handle(message(5, "/status")).await,
         Handled::Answered
     ));
+    // The same /stop again, after a later message started a turn: it does
+    // not reach that turn.
+    let later = bridge.handle(message(6, "hold")).await;
+    assert!(matches!(
+        bridge.handle(message(4, "/stop")).await,
+        Handled::Answered
+    ));
+    llm.release.add_permits(1);
+    assert_eq!(delivered(later).await, Delivery::Sent);
     assert_eq!(
         channel.take(),
         [
             (ME, "A turn is running.".into(), Some(3)),
             (ME, "Stopped.".into(), Some(2)),
             (ME, "Nothing is running.".into(), Some(5)),
+            (ME, STOP_TOO_LATE.into(), Some(4)),
+            (ME, "reply: hold".into(), Some(6)),
         ]
     );
 }
@@ -331,6 +343,15 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
             delivered(bridge.handle(message(2, "lost")).await).await,
             Delivery::NotConfirmed
         );
+        channel
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let stopped = bridge.handle(message(4, "hold")).await;
+        assert!(matches!(
+            bridge.handle(message(5, "/stop")).await,
+            Handled::Answered
+        ));
+        assert_eq!(delivered(stopped).await, Delivery::Sent);
         // Message 3's turn started, then the server stopped.
         let cut_off = turn_id_for(&binding(ME, ME, &chat), 3);
         let started = octos_core::ui_protocol::TurnStartedEvent {
@@ -353,16 +374,32 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
         (1, TurnRecord::Completed),
         (2, TurnRecord::Completed),
         (3, TurnRecord::Orphaned),
+        (4, TurnRecord::Interrupted),
     ] {
         match bridge.handle(message(id, "again")).await {
             Handled::Duplicate(got) => assert_eq!(got, record, "message {id}"),
             other => panic!("message {id} handled again: {other:?}"),
         }
     }
+    // The /stop that stopped message 4's turn, delivered again: the turn
+    // a later message started keeps running.
+    let later = bridge.handle(message(6, "hold")).await;
+    assert!(matches!(
+        bridge.handle(message(5, "/stop")).await,
+        Handled::Answered
+    ));
+    llm.release.add_permits(1);
+    assert_eq!(delivered(later).await, Delivery::Sent);
     assert_eq!(
-        delivered(bridge.handle(message(4, "after")).await).await,
-        Delivery::Sent
+        channel.take(),
+        [
+            (ME, STOP_TOO_LATE.into(), Some(5)),
+            (ME, "reply: hold".into(), Some(6)),
+        ]
     );
-    assert_eq!(channel.take(), [(ME, "reply: after".into(), Some(4))]);
-    assert_eq!(prompts(&llm), ["before", "lost", "after"]);
+    // Nothing ran twice; the stopped turn may end before it reaches the
+    // model.
+    let seen = prompts(&llm);
+    assert_eq!(seen[..2], ["before", "lost"]);
+    assert!(matches!(seen[2..].len(), 1 | 2) && seen[2..].iter().all(|p| p == "hold"));
 }
