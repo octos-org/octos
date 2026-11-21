@@ -8,6 +8,8 @@ mod dto;
 mod durable_delivery;
 #[path = "ui_protocol_external_turns.rs"]
 mod external_turns;
+#[path = "ui_protocol_im_bridge.rs"]
+mod im_bridge;
 #[path = "ui_protocol_memory_entries.rs"]
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]

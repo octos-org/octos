@@ -6,10 +6,10 @@ use super::*;
 /// A model that answers each prompt with `reply: <prompt>`; on `hold` it
 /// waits for `release` first. It records the prompts it saw and the tools it
 /// was offered.
-struct ScriptedLlm {
-    prompts: StdMutex<Vec<String>>,
+pub(crate) struct ScriptedLlm {
+    pub(crate) prompts: StdMutex<Vec<String>>,
     tools: StdMutex<Vec<String>>,
-    release: tokio::sync::Semaphore,
+    pub(crate) release: tokio::sync::Semaphore,
 }
 
 #[async_trait::async_trait]
@@ -40,7 +40,7 @@ impl octos_llm::LlmProvider for ScriptedLlm {
     }
 }
 
-fn scripted() -> Arc<ScriptedLlm> {
+pub(crate) fn scripted() -> Arc<ScriptedLlm> {
     Arc::new(ScriptedLlm {
         prompts: StdMutex::default(),
         tools: StdMutex::default(),
@@ -48,17 +48,17 @@ fn scripted() -> Arc<ScriptedLlm> {
     })
 }
 
-struct Fixture {
-    state: Arc<AppState>,
-    ledger: Arc<UiProtocolLedger>,
-    contracts: Arc<UiProtocolContractStores>,
-    entry: ExternalTurns,
-    profile: BoundProfile,
+pub(crate) struct Fixture {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) ledger: Arc<UiProtocolLedger>,
+    pub(crate) contracts: Arc<UiProtocolContractStores>,
+    pub(crate) entry: ExternalTurns,
+    pub(crate) profile: BoundProfile,
 }
 
 /// A serve process over `dir`: a second one over the same directory is the
 /// same server after a restart.
-async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
+pub(crate) async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
     let (state, _) = state_with_profile_llm(dir, CHAT_PROFILE, llm).await;
     let ledger = event_ledger(&state).await;
     let contracts = Arc::new(UiProtocolContractStores::default());
@@ -73,13 +73,29 @@ async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
     }
 }
 
+/// `serve` again over `dir`, as after a restart. A new process finds the
+/// episode store closed. In this process the last serve's turn tasks can
+/// still hold it for a moment after their turns ended, and nothing signals
+/// when they let go, so wait for its lock first.
+pub(crate) async fn restart(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
+    let data_dir = dir.join("profiles").join(CHAT_PROFILE).join("data");
+    for _ in 0..1000 {
+        let released = octos_memory::EpisodeStore::open(&data_dir).await.is_ok();
+        if released {
+            return serve(dir, llm).await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the last serve still holds {}", data_dir.display());
+}
+
 /// A chat id no other test uses: the turn registry is process-wide.
-fn unique(name: &str) -> SessionKey {
+pub(crate) fn unique(name: &str) -> SessionKey {
     chat_key(&format!("{name}-{}", uuid::Uuid::new_v4().simple()))
 }
 
 impl Fixture {
-    async fn chat(&self, key: &SessionKey) -> BoundChat {
+    pub(crate) async fn chat(&self, key: &SessionKey) -> BoundChat {
         create_chat(&self.state, key.clone()).await.unwrap();
         BoundChat::verify(self.profile.clone(), key.clone()).unwrap()
     }
@@ -164,6 +180,8 @@ async fn only_an_existing_chat_of_a_served_profile_can_be_bound() {
         fx.entry.record(&bound, &turn).await.unwrap(),
         TurnRecord::NotStarted
     );
+    // A refused start leaves nothing to reconcile.
+    assert!(fx.entry.reconcile(&fx.profile).await.is_empty());
 }
 
 #[tokio::test]
@@ -304,7 +322,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         std::fs::create_dir(file).unwrap();
     }
 
-    let fx = serve(dir.path(), llm.clone()).await;
+    let fx = restart(dir.path(), llm.clone()).await;
     let reconciled = async || {
         let mut turns: Vec<_> = (fx.entry.reconcile(&fx.profile).await.into_iter())
             .map(|(_, turn, record)| (turn, record.ok()))
