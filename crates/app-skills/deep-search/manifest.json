@@ -16,6 +16,7 @@
         "PERPLEXITY_API_KEY",
         "BRAVE_API_KEY",
         "YDC_API_KEY",
+        "KEENABLE_API_KEY",
         "SEARXNG_URL",
         "DEEPSEEK_API_KEY",
         "KIMI_API_KEY",
@@ -47,7 +48,7 @@
           },
           "search_engine": {
             "type": "string",
-            "description": "Try one provider first: gdelt, google_news_rss, searxng, serper, tavily, perplexity, brave, you; or all. Default: automatic order (free sources first: GDELT + Google News for news, then SearXNG if configured, then keyed APIs). Results-page search (duckduckgo, bing_cdp) runs last for general web results unless the operator turned it off. Falls back to the automatic order if it returns nothing."
+            "description": "Try one provider first: gdelt, google_news_rss, searxng, serper, tavily, perplexity, brave, you, keenable; or all. Default: automatic order (free sources first: GDELT + Google News for news, then SearXNG if configured, then keyed APIs). Results-page search (duckduckgo, bing_cdp) runs last for general web results unless the operator turned it off. Falls back to the automatic order if it returns nothing."
           },
           "output": {
             "type": "string",
