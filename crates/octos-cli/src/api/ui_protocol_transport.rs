@@ -19938,6 +19938,39 @@ fn write_peer_fleet_synthesis_marks(
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+/// octos#2026 review (BH3GEI) — when a peer is REOPENED, record its current
+/// round as already-synthesized for its master, so the fleet gate does NOT
+/// fire a fresh autonomous synthesis over results that were committed BEFORE
+/// the close (closing the last peer resets the stamp). Existing records are
+/// kept and never downgraded; a `Legacy` stamp already covers every peer at
+/// its current round, so it is left alone. Called BEFORE the close marker is
+/// cleared: a failed stamp write fails the reopen fail-closed rather than
+/// letting the old results re-fire.
+pub(crate) fn mark_reopened_peer_synthesized_through(
+    peers_root: &Path,
+    master: &str,
+    slug: &str,
+    round: u32,
+) -> Result<(), String> {
+    if round == 0 {
+        return Ok(());
+    }
+    match read_peer_fleet_synthesis_marks(peers_root, master) {
+        FleetSynthesisMarks::Legacy => Ok(()),
+        FleetSynthesisMarks::None | FleetSynthesisMarks::Rounds(_) => {
+            let mut marks = match read_peer_fleet_synthesis_marks(peers_root, master) {
+                FleetSynthesisMarks::Rounds(rounds) => rounds,
+                _ => HashMap::new(),
+            };
+            let entry = marks.entry(slug.to_owned()).or_insert(0);
+            *entry = (*entry).max(round);
+            let ordered: Vec<(String, u32)> = marks.into_iter().collect();
+            write_peer_fleet_synthesis_marks(peers_root, master, &ordered)
+                .map_err(|err| format!("failed to preserve synthesis marks on reopen: {err}"))
+        }
+    }
+}
+
 /// Remove the per-master `.synthesized` marker (best-effort). Absent is not an
 /// error. Used to RESET a fully-cleared fleet so a fresh one can fire once.
 fn remove_peer_fleet_synthesized_stamp(peers_root: &Path, master: &str) {

@@ -4347,6 +4347,17 @@ pub(crate) fn reopen_closed_peer(
             "peer '{slug}' is not closed — there is nothing to reopen"
         ));
     }
+    // #2026 review (BH3GEI) — closing the last open peer RESET the master's
+    // synthesis stamp; without restoring it, the reopened peer's already
+    // committed results would re-fire an autonomous synthesis. Record the
+    // peer's current round as already-synthesized BEFORE clearing the close
+    // marker, fail-closed on a stamp-write error.
+    crate::api::ui_protocol_transport::mark_reopened_peer_synthesized_through(
+        peers_root,
+        origin_session,
+        &slug,
+        count_peer_result_versions(&peer_dir),
+    )?;
     // The marker is the ONLY thing removed: briefs, dated result versions,
     // parked rows and the originator/workspace records all stay exactly as
     // they were, so the peer resumes its unfinished work instead of starting
@@ -4389,6 +4400,23 @@ pub(crate) fn fork_staged_peer(
             "peer '{slug}' no longer exists (its staged directory was removed)"
         ));
     };
+    // #2026 review (BH3GEI) — a FENCED peer's isolation must not silently
+    // become a shared checkout on the same root: refuse rather than fork it
+    // into the user's real repo. Stage a fresh fenced peer via peer_handoff
+    // instead.
+    if peer_io::read_peer_file(
+        &source_dir,
+        "workspace-mode",
+        peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .as_deref()
+        == Some("fenced")
+    {
+        return Err(format!(
+            "peer '{slug}' runs in a fenced worktree; peer_fork would drop its \
+             isolation — stage a fresh fenced peer with peer_handoff instead"
+        ));
+    }
     let brief = peer_io::read_peer_file(&source_dir, "brief.md", peer_io::PEER_FILE_READ_CAP_SMALL)
         .ok_or_else(|| format!("peer '{slug}' has no brief to inherit"))?;
     let source_name =
@@ -4401,49 +4429,46 @@ pub(crate) fn fork_staged_peer(
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{source_name}-fork"));
-    let (new_slug, new_dir) = match new_name {
-        Some(name) if !name.trim().is_empty() => reserve_named_peer_dir(peers_root, name)
-            .map_err(|err| format!("failed to reserve the fork's peer dir: {err:?}"))?,
-        _ => reserve_peer_dir(peers_root, &fork_name)
-            .map_err(|err| format!("failed to reserve the fork's peer dir: {err:?}"))?,
-    };
-    // Roll back the fresh dir on any failure so a failed fork leaves nothing.
-    let result = (|| -> Result<(), String> {
-        // Person ownership: the fork belongs to the SAME session that owns
-        // the source (the caller), never to a different principal.
-        peer_io::write_peer_file_atomic(&new_dir, "originator", origin_session)
-            .map_err(|err| format!("failed to record the fork's originator: {err}"))?;
-        peer_io::write_peer_file_atomic(&new_dir, "name", &fork_name)
-            .map_err(|err| format!("failed to record the fork's name: {err}"))?;
-        if let Some(root) = peer_io::read_peer_file(
-            &source_dir,
-            "workspace-root",
-            peer_io::PEER_FILE_READ_CAP_SMALL,
-        ) {
-            peer_io::write_peer_file_atomic(&new_dir, "workspace-root", &root)
-                .map_err(|err| format!("failed to inherit the workspace binding: {err}"))?;
-            // The workspace MODE is always shared on a fork: a fenced
-            // worktree is execution state, not part of the inherited brief.
-            peer_io::write_peer_file_atomic(&new_dir, "workspace-mode", "shared")
-                .map_err(|err| format!("failed to record the workspace mode: {err}"))?;
-        }
-        // brief.md LAST: it is the visibility gate for a staged peer, so the
-        // fork never becomes visible half-inherited.
-        peer_io::write_peer_file_atomic(&new_dir, "brief.md", &brief)
-            .map_err(|err| format!("failed to inherit the brief: {err}"))?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = std::fs::remove_dir_all(&new_dir);
-        return Err(err);
-    }
+    // Inherit the task-contract budget LIMIT (never the usage ledger): a
+    // capped source forks a capped peer, not an uncapped one.
+    let token_budget = peer_token_budget_status(peers_root, &slug)?.map(|status| status.limit);
+    let workspace_root = peer_io::read_peer_file(
+        &source_dir,
+        "workspace-root",
+        peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .map(PathBuf::from)
+    .ok_or_else(|| format!("peer '{slug}' has no workspace binding to inherit"))?;
+    // Go through the REAL staging pipeline (#2026 review): workspace binding,
+    // originator record, budget gate and brief are written by the same code
+    // path as peer_handoff, with rollback on failure. An EXPLICIT name takes
+    // the named, conflict-checked reservation; an unnamed fork reserves a
+    // unique slug and deliberately gets NO display-name file, so two forks
+    // can never share one address (`resolve_peer_name_to_slug` falls back to
+    // the unique slug).
+    let named = new_name.map(str::trim).filter(|name| !name.is_empty());
+    let staged = stage_peer_with_budget(
+        peers_root,
+        &workspace_root,
+        &fork_name,
+        named,
+        Some(origin_session),
+        &brief,
+        false,
+        None,
+        None,
+        token_budget,
+        None,
+    )
+    .map_err(|err| format!("failed to stage the fork: {err:?}"))?;
+    let new_slug = staged.slug;
     Ok((
         new_slug.clone(),
         format!(
-            "peer '{new_slug}' forked from '{slug}' — it inherits the brief and \
-             workspace binding under the same owner, with a NEW identity; the \
-             source's in-flight tasks, approvals and result history are NOT \
-             carried over"
+            "peer '{new_slug}' forked from '{slug}' — it inherits the brief, \
+             workspace binding and budget limit under the same owner, with a \
+             NEW identity; the source's in-flight tasks, approvals and result \
+             history are NOT carried over"
         ),
     ))
 }
@@ -4482,6 +4507,7 @@ mod reopen_fork_tests {
         let dir = peers.join(&slug);
         // Durable history: a brief, a committed result, an unfinished note.
         peer_io::write_peer_file_atomic(&dir, "result.md", "round-1 findings").unwrap();
+        peer_io::write_peer_file_atomic(&dir, "result-1.md", "round-1 findings").unwrap();
         peer_io::write_peer_file_atomic(&dir, "notes.md", "still open: cache key v2").unwrap();
         peer_io::write_peer_file_atomic(&dir, "closed", MASTER).unwrap();
         assert!(peer_is_closed(&peers, &slug));
@@ -4517,6 +4543,19 @@ mod reopen_fork_tests {
             peer_io::read_peer_file(&dir, "originator", 4096).as_deref(),
             Some(MASTER),
             "person ownership is unchanged"
+        );
+        // #2026 review (BH3GEI): closing the last peer resets the synthesis
+        // stamp, so reopen must record the committed round as already
+        // synthesized — otherwise the next turn end re-fires a synthesis
+        // over the OLD result. The stamp pins this peer at its current round.
+        let stamp = peers.join(format!(
+            ".synthesized-{}",
+            octos_core::safe_filename(MASTER)
+        ));
+        let body = std::fs::read_to_string(&stamp).expect("reopen restores the stamp");
+        assert!(
+            body.contains("1 researcher"),
+            "the committed round is already synthesized, no replay: {body}"
         );
 
         // Crash/restart consistency: the marker is the single lifecycle
@@ -4586,6 +4625,69 @@ mod reopen_fork_tests {
         reopen_closed_peer(&peers, &new_slug, MASTER).unwrap();
         assert!(!peer_is_closed(&peers, &new_slug));
         assert!(peer_is_closed(&peers, &slug), "the source stays closed");
+    }
+
+    /// #2026 review (BH3GEI) — unnamed forks must never share a display
+    /// name, a capped source forks a capped (not uncapped) peer, and a
+    /// fenced source is refused rather than forked into the real repo.
+    #[test]
+    fn should_fork_unique_addresses_inherit_budget_and_refuse_a_fenced_source() {
+        let root = tempfile::tempdir().unwrap();
+        let peers = root.path().join("peers");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let slug = stage_peer_with_budget(
+            &peers,
+            &workspace,
+            "analyst",
+            Some("analyst"),
+            Some(MASTER),
+            "compare the two cache designs",
+            false,
+            None,
+            None,
+            Some(500),
+            None,
+        )
+        .unwrap()
+        .slug;
+
+        // Two unnamed forks: distinct slugs and NO shared display name.
+        let (first, _) = fork_staged_peer(&peers, "analyst", MASTER, None).unwrap();
+        let (second, _) = fork_staged_peer(&peers, "analyst", MASTER, None).unwrap();
+        assert_ne!(first, second);
+        for fork in [&first, &second] {
+            let fork_dir = peers.join(fork);
+            assert!(
+                peer_io::read_peer_file(&fork_dir, "name", 4096).is_none(),
+                "an unnamed fork has no display-name file to collide on"
+            );
+            // Budget LIMIT inherited, usage ledger NOT carried over.
+            let status = peer_token_budget_status(&peers, fork)
+                .unwrap()
+                .expect("the fork inherits the cap");
+            assert_eq!(status.limit, 500, "a capped source forks a capped peer");
+        }
+        // Name addressing still resolves each fork unambiguously by slug.
+        assert_eq!(
+            resolve_peer_name_to_slug(&peers, &first).as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            resolve_peer_name_to_slug(&peers, &second).as_deref(),
+            Some(second.as_str())
+        );
+
+        // A fenced source is refused and leaves nothing behind.
+        let dir = peers.join(&slug);
+        peer_io::write_peer_file_atomic(&dir, "workspace-mode", "fenced").unwrap();
+        let err = fork_staged_peer(&peers, "analyst", MASTER, None).unwrap_err();
+        assert!(err.contains("fenced"), "{err}");
+        let count = std::fs::read_dir(&peers).unwrap().count();
+        assert_eq!(
+            count, 3,
+            "source + two forks only, no half-staged dir: {count}"
+        );
     }
 
     #[test]
