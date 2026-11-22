@@ -9,7 +9,7 @@ use octos_core::ui_protocol::{
 
 #[tokio::test]
 async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
     let (state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
     let on = ConnectionUiFeatures {
         session_chat_workspace_v1: true,
@@ -184,7 +184,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
 /// symlinks that lead out of the chat's folder.
 #[tokio::test]
 async fn chat_tools_cannot_leave_the_chat_folder() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
     let (mut state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
     with_profile_store(&mut state, &temp.path().join("store"), &profile);
     let (a, b) = (chat_key("a"), chat_key("b"));

@@ -99,7 +99,7 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
     use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
 
     let ingress = !matches!(case, DisconnectCase::OrdinaryBrowser);
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let session = SessionKey(format!(
         "{MAIN_PROFILE_ID}:api:ingress-lifetime-{}",
         uuid::Uuid::new_v4()
@@ -440,7 +440,7 @@ fn issue_ingress_grant(
 
 #[tokio::test]
 async fn turn_admission_holds_grant_fence_through_active_turn_insert() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let session = SessionKey(format!(
         "{MAIN_PROFILE_ID}:api:turn-admission-fence-{}",
         uuid::Uuid::new_v4()
@@ -517,7 +517,7 @@ async fn turn_admission_holds_grant_fence_through_active_turn_insert() {
 async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_ws() {
     use crate::contracts::scope::{ApprovalScopeKind, MatchKey};
 
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let profile = format!("prebind-revocation-{}", uuid::Uuid::new_v4().simple());
     let (entered, _entered_rx) = mpsc::unbounded_channel();
     let provider = Arc::new(GatedToolLlm {

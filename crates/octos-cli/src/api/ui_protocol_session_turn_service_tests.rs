@@ -103,7 +103,7 @@ async fn turn_start_matches_the_handler_on_admission_and_each_refusal() {
 
 #[tokio::test]
 async fn grant_read_error_fails_closed_for_ingress_but_not_browser_turns() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let (temp, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let (mut state, _profile) =
         state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
     // Make the stable lock parent unusable, so every admission snapshot fails

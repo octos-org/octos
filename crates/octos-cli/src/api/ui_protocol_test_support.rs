@@ -239,6 +239,17 @@ pub(crate) async fn unconfined_runtime(
     sandboxed_runtime(profile, session_id, cwd, Some(none)).await
 }
 
+fn prune_stale_reserved_folders() {
+    // A test that predates per-fixture guards may have dropped its TempDir
+    // after registering a chats root. Remove only currently-missing roots at
+    // runtime bootstrap; live fixture registrations, including the negative
+    // failed-registration fixture once it creates its neutralizing root, stay.
+    let reserved = crate::runtime::chat_workspace::reserved_folders();
+    for root in reserved.folders().into_iter().filter(|root| !root.exists()) {
+        reserved.remove(&root);
+    }
+}
+
 /// [`writable_runtime`], in `sandbox` instead of the profile's when given.
 async fn sandboxed_runtime(
     profile: &Arc<crate::runtime::ProfileRuntime>,
@@ -246,14 +257,7 @@ async fn sandboxed_runtime(
     cwd: &Path,
     sandbox: Option<octos_agent::SandboxConfig>,
 ) -> eyre::Result<Arc<crate::runtime::SessionRuntime>> {
-    // Earlier tests may have dropped TempDirs after registering their chats
-    // roots in this process-global list. Drop those stale fixture roots so a
-    // parallel test's cleanup cannot race this runtime's fail-closed check;
-    // production registers each live root before use.
-    let reserved = crate::runtime::chat_workspace::reserved_folders();
-    for root in reserved.folders().into_iter().filter(|root| !root.exists()) {
-        reserved.remove(&root);
-    }
+    prune_stale_reserved_folders();
     let write = octos_agent::EffectivePermissions::workspace_write();
     let cwd = Some(cwd.to_path_buf());
     crate::runtime::SessionRuntime::bootstrap_with_permissions_and_sandbox(
@@ -1005,7 +1009,7 @@ pub(crate) async fn start_once(
 ) -> (Seen, Vec<String>) {
     // Process-wide admission tables (the build cache) are keyed by turn.
     let turn = &TurnId::new();
-    let temp = tempfile::tempdir().expect("tempdir");
+    let (temp, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let state = if runtime {
         state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm))
             .await

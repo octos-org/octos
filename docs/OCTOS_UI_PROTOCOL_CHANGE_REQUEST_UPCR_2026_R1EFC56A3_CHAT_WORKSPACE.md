@@ -279,3 +279,10 @@ The file tools resolve every path through the scope:
 - Moving a session between Chat and Code.
 - The web client adding `session.work_mode.v1` and `session.chat_workspace.v1`
   to the features it requests. That is a web task.
+
+### Test-only follow-up (T-0655)
+
+Chat workspace tests unregister hidden roots belonging only to their own
+TempDir when the fixture ends, and test helpers prune fixture roots that an
+earlier test already deleted. This changes no protocol, product, or production
+runtime behavior.

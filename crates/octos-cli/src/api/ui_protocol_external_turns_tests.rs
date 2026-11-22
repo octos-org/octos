@@ -115,7 +115,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn only_an_existing_chat_of_a_served_profile_can_be_bound() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let fx = serve(dir.path(), scripted()).await;
     let error = BoundProfile::verify(&fx.state, "nobody").await.unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "profile_unresolved");
@@ -168,7 +168,7 @@ async fn only_an_existing_chat_of_a_served_profile_can_be_bound() {
 
 #[tokio::test]
 async fn a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_writes() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let llm = scripted();
     let fx = serve(dir.path(), llm.clone()).await;
     let (by_socket, by_entry) = (
@@ -224,7 +224,7 @@ async fn a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_wri
 
 #[tokio::test]
 async fn a_turn_id_runs_once_and_only_in_its_own_chat() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let llm = scripted();
     let fx = serve(dir.path(), llm.clone()).await;
     let (chat, other) = (
@@ -254,7 +254,7 @@ async fn a_turn_id_runs_once_and_only_in_its_own_chat() {
 
 #[tokio::test]
 async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let llm = scripted();
     let (key, unreadable) = (unique("restart"), unique("unreadable"));
     let [finished, unstarted, interrupted, other] = [(); 4].map(|_| TurnId::new());
@@ -362,7 +362,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
 
 #[tokio::test]
 async fn the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let llm = scripted();
     let fx = serve(dir.path(), llm.clone()).await;
     let chat = fx.chat(&unique("own")).await;
