@@ -5,6 +5,50 @@ rules, cards or repeated captions. OCR rectangles are search hints, not safe tex
 areas: OCR may include a connector as a dash, merge adjacent captions or omit
 glyphs. Compare actual letters and surrounding artwork before adopting a box.
 
+## Compare a registered region
+
+For a doubled value, a tilted label or disputed artwork, start from the exact
+editable candidate under review. Render it once with its native text visible
+and once with that text hidden, preserving the same artwork and shapes. With
+the Rust runtime, use the editable and blank renders from the same `cycle`.
+After any further edits, derive both views from the updated candidate. Render
+both at the same size with the same renderer and fonts. If an unchanged deck
+looks different after a renderer or font change, render the baseline again
+with those settings before attributing the difference to the repair.
+
+1. Call `pptx_tool` with `action: compare`, `before` set to the design image,
+   `background` to the candidate's text-hidden render, and `after` to its
+   visible render. Set `box` to the affected region in **after-image pixels**
+   as `[left, top, width, height]`. Include the owning surface and a nearby
+   landmark. Give `output` a fresh PNG path. Keep the returned input bindings,
+   box and panel binding with the finding.
+2. The first row of the comparison panel shows design, text hidden, text
+   visible, from left to right. Read that row **as one image**. To extract
+   it, take `[w, h]` from `panel_view_size`, then use `action: crop` on
+   `panel.path` with `box: [0, 0, 3*w, h]` (supply the computed numbers).
+   The independent reviewer opens the resulting PNG and records what is
+   visible in each third before moving to the next region. If the pixels
+   have left the model's visual context, reopen that PNG. If fine writing
+   cannot be resolved, use a tighter source region and record any remaining
+   uncertainty.
+3. Trace the defect to its layer. A readable value in the hidden view that
+   appears twice in the visible view points to lettering in the artwork.
+   Check which picture contributes it. If an added illustration reintroduced
+   the glyph, correct that layer so the matching clean plate shows through.
+   If the bound input plate itself contains the glyph, record the source
+   conflict and its location for the asset owner. A clean hidden view with text
+   off its card in the visible view calls for a native text placement repair.
+   For tilted text, locate the surface corners and the reading direction of
+   the original letters. Map those points back through the crop origin and
+   scale to slide coordinates. Check glyph slant separately from baseline
+   angle. Verify the rendered strokes fit the surface and nearby icons and
+   borders survive the change.
+
+Keep the local observation bound to the candidate that produced the panel.
+Recheck the revised full page at presentation size for any other differences
+before the independent page verdict. If another attempt leaves the same
+defect visible, carry its existing finding forward under the agreed stop rule.
+
 ## Read evidence at the label scale
 
 With the native Rust runtime, `cycle` and `compare_cycle` include

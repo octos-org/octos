@@ -10,7 +10,7 @@ Record observations in the existing review file, not another parallel checklist.
 | Comparison | Read and observe | What cannot establish a pass |
 | --- | --- | --- |
 | Current manuscript → actual PPTX text and notes | Reconcile required occurrences with native objects and intended card/node. Read complete statements: subject, action, qualifiers, negation, scope, comparisons, numbers/units and formulas. Check claims about notes, citations or appendices against those actual parts. | Matching keywords, a character-set test, or the producer's rewritten page data validating itself. |
-| Approved labeled design → supplied/embedded blank artwork | Compare non-text objects and relationships: connector direction/endpoints, branches, boxes, icon count, bullets, quantitative marks and available label space. Separate intended text removal from changed artwork. | A removal prompt saying “preserve everything”, zero OCR output, or native full/blank layer parity. Those do not prove that text removal preserved the original design. |
+| Approved labeled design → supplied/embedded blank artwork | Compare non-text objects and relationships: connector direction/endpoints, branches, boxes, icon count, bullets, quantitative marks and available label space. Use the supplied background to locate differences in artwork. | Zero OCR output or native full/blank layer parity alone. |
 | Actual final PPTX render → manuscript and visual intent | Look across the whole page, including unflagged areas. Check label-to-owner association, borders/icons/connectors, contrast, wrapping and peer alignment at readable scale. Readability and reference fidelity are separate observations. | A contact sheet, a clean overlap report, or accepting an inherited defect merely because the supplied blank contains it. |
 
 Apply only relevant comparisons: a native deck without a labeled reference has no
@@ -22,10 +22,9 @@ Latin identifiers or numbers. Generated lettering can itself be wrong.
 
 `pptx_tool` 的 `inspect` 读取实际原生文字、备注和形状清单，不经过 PDF。完整内容与原文逐项核对；原生对象中出现一个关键词不证明整句或来源完整。
 
-For an artwork discrepancy, identify the layer responsible before editing. Prefer
-repairing the source artwork when permitted, or adapt the native placement without
-changing the intended relationship. If a shared input is read-only, report the
-specific discrepancy to its owner. Do not silently delete a required label, shrink
+For an artwork discrepancy, check which background the page actually embeds.
+Correct native placement against the supplied artwork. Report discrepancies in
+the supplied artwork itself to its owner. Do not silently delete a required label, shrink
 everything, add a covering patch, or expand a declared owner to hide a conflict.
 
 ## Make small defects visible

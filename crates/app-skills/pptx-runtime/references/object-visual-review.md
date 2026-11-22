@@ -11,6 +11,16 @@ matching one label's reference width does not establish typography consistency.
 The independent reviewer uses the original/blank/current images, rather than
 inheriting the maker's numeric classifications as visual conclusions.
 
+For a disputed region, ask `compare` for the same `box` on the design,
+candidate-derived blank and current render. Its output panel already places
+those three views side by side in the top row. Pass that row as one image to
+the reviewer so all three views are visible together when the finding is
+recorded. Use the returned `panel_view_size` for each cell's dimensions.
+A visible glyph in the blank can identify artwork to repair; when the blank
+is clean, check the live glyphs against the borders and angle of their owning
+surface. Keep an unreadable region open and report the scope of a local
+finding separately from the full-page verdict.
+
 1. Run `review_pack` for a current `cycle` and fresh output directory. Read the
    compact `view-index.json` first (`view_batches` in the full report retains measurements): the full page establishes meaning; each object group
    supplies separate original / blank / actual PPTX render crops. Absent original
