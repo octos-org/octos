@@ -95,6 +95,21 @@ pub(crate) fn unique(name: &str) -> SessionKey {
 }
 
 impl Fixture {
+    /// Stops this server. A turn's background work can hold the runtime a
+    /// little past its ended record, and `episodes.redb` admits one opener.
+    async fn stop(self) {
+        let runtime = ensure_session_profile_runtime(&self.state, Some(CHAT_PROFILE)).await;
+        let memory = Arc::downgrade(&runtime.unwrap().unwrap().memory);
+        drop(self);
+        for _ in 0..2000 {
+            if memory.strong_count() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the stopped server still holds episodes.redb");
+    }
+
     pub(crate) async fn chat(&self, key: &SessionKey) -> BoundChat {
         create_chat(&self.state, key.clone()).await.unwrap();
         BoundChat::verify(self.profile.clone(), key.clone()).unwrap()
@@ -312,6 +327,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         fx.entry.start(&chat, other.clone(), "other").await.unwrap();
         assert_eq!(fx.ended(&chat, &other).await, TurnRecord::Completed);
         unreadable_folder = folders().difference(&before).next().unwrap().clone();
+        fx.stop().await;
     }
     let files: Vec<PathBuf> = std::fs::read_dir(&unreadable_folder)
         .unwrap()
