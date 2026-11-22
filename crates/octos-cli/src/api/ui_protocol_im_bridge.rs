@@ -37,6 +37,10 @@ use super::*;
 /// one of them is a binding to whoever uses it.
 const SHARED_SENDERS: [i64; 3] = [777_000, 1_087_968_824, 136_817_688];
 
+/// Where a profile keeps the bridge's `/stop` decisions, one file each,
+/// while a delivery of the `/stop` could still be run.
+const STOPS_DIR: &str = "im_bridge_stops";
+
 /// A bot account on an IM platform: the channel a chat is on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ImChannelId {
@@ -103,6 +107,9 @@ pub(crate) enum Handled {
     /// A command, answered in the chat (a `/stop` by the stopped turn's
     /// result).
     Answered,
+    /// A `/stop` already decided; nothing was done again and nothing was
+    /// answered.
+    Repeated,
     /// A turn started; `delivery` ends once its result has gone out, or
     /// could not.
     Started(tokio::task::JoinHandle<Delivery>),
@@ -265,20 +272,17 @@ impl ServeImBridge {
     }
 
     async fn command(&self, binding: &ImBinding, message_id: i64, command: &str) -> Handled {
-        let running = self.running_turn(binding.target.session_id());
-        let reply = match (command.split_whitespace().next(), running) {
-            (Some("status"), Some(_)) => "A turn is running.",
-            (Some("status"), None) => "Nothing is running.",
-            // Only a turn an earlier message started: a redelivered /stop
-            // must not reach a turn started after it, before or after a
-            // restart. The stopped turn's result answers.
-            (Some("stop"), Some((turn_id, started_by))) if started_by < message_id => {
-                match self.turns.interrupt(&binding.target, turn_id).await {
-                    Ok(_) => return Handled::Answered,
-                    Err(_) => "Could not stop the turn.",
-                }
-            }
-            (Some("stop"), _) => "Nothing sent before this /stop is running.",
+        let reply = match command.split_whitespace().next() {
+            Some("status") => match self.running_turn(binding.target.session_id()) {
+                Some(_) => "A turn is running.",
+                None => "Nothing is running.",
+            },
+            Some("stop") => match self.stop(binding, message_id).await {
+                Ok(Some(reply)) => reply,
+                // Stopped: the stopped turn's result answers.
+                Ok(None) => return Handled::Answered,
+                Err(Repeated) => return Handled::Repeated,
+            },
             _ => {
                 return self
                     .refuse(binding.chat, Some(message_id), Refusal::UnknownCommand)
@@ -287,6 +291,42 @@ impl ServeImBridge {
         };
         self.send(binding.chat, reply, Some(message_id)).await;
         Handled::Answered
+    }
+
+    /// Decide what the /stop `message_id` stops, once: the decision is on
+    /// disk before it is acted on, and a delivery of the same /stop finds it
+    /// there and does nothing again, before or after a restart. Only a turn
+    /// an earlier message started can be stopped, so a /stop that arrives
+    /// late cannot reach a turn sent after it. Returns the reply, if any.
+    async fn stop(
+        &self,
+        binding: &ImBinding,
+        message_id: i64,
+    ) -> Result<Option<&'static str>, Repeated> {
+        let target = self
+            .running_turn(binding.target.session_id())
+            .filter(|(_, started_by)| *started_by < message_id)
+            .map(|(turn_id, _)| turn_id);
+        let decisions = binding.target.profile().data_dir().join(STOPS_DIR);
+        let decision = decisions.join(turn_id_for(binding, message_id).0.to_string());
+        match record_stop(&decisions, &decision, target.as_ref()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Repeated);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "IM /stop decision not recorded; nothing stopped");
+                return Ok(Some("Could not stop the turn."));
+            }
+        }
+        forget_expired_stops(&decisions, self.ttl);
+        let Some(turn_id) = target else {
+            return Ok(Some("Nothing sent before this /stop is running."));
+        };
+        match self.turns.interrupt(&binding.target, turn_id).await {
+            Ok(_) => Ok(None),
+            Err(_) => Ok(Some("Could not stop the turn.")),
+        }
     }
 
     async fn start(self: &Arc<Self>, binding: ImBinding, message_id: i64, text: &str) -> Handled {
@@ -397,6 +437,41 @@ impl ServeImBridge {
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) {
         if let Err(error) = self.channel.send(chat, text, reply_to).await {
             tracing::warn!(chat, %error, "IM reply send failed");
+        }
+    }
+}
+
+/// A `/stop` whose decision was already made.
+struct Repeated;
+
+/// Record a `/stop`'s decision: the turn it stops, or none. The file is
+/// created only if it does not exist, so of two deliveries only one decides.
+fn record_stop(dir: &Path, path: &Path, target: Option<&TurnId>) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let decision = target.map_or_else(|| "nothing".to_owned(), |turn| format!("stop {}", turn.0));
+    file.write_all(decision.as_bytes())?;
+    file.sync_all()
+}
+
+/// Forget decisions older than twice the time to live: a delivery of their
+/// `/stop` would now be refused as stale before it reached them (twice, for
+/// a platform clock ahead of this host's).
+fn forget_expired_stops(dir: &Path, ttl: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|made| made.elapsed().is_ok_and(|age| age > ttl * 2));
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

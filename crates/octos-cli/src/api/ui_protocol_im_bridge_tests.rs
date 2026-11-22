@@ -123,31 +123,31 @@ async fn a_bound_message_runs_once_and_its_result_goes_back_to_its_chat() {
         Handled::Answered
     ));
     assert!(matches!(
-        bridge.handle(message(4, "/stop")).await,
+        bridge.handle(message(6, "/stop")).await,
         Handled::Answered
     ));
     assert_eq!(delivered(held).await, Delivery::Sent);
+    // A message sent before the /stop arrives after it, then the /stop
+    // again: its decision stands.
+    let late = bridge.handle(message(5, "hold")).await;
     assert!(matches!(
-        bridge.handle(message(5, "/status")).await,
-        Handled::Answered
+        bridge.handle(message(6, "/stop")).await,
+        Handled::Repeated
     ));
-    // The same /stop again, after a later message started a turn: it does
-    // not reach that turn.
-    let later = bridge.handle(message(6, "hold")).await;
+    // A /stop sent before that message, arriving late: it does not reach it.
     assert!(matches!(
         bridge.handle(message(4, "/stop")).await,
         Handled::Answered
     ));
     llm.release.add_permits(1);
-    assert_eq!(delivered(later).await, Delivery::Sent);
+    assert_eq!(delivered(late).await, Delivery::Sent);
     assert_eq!(
         channel.take(),
         [
             (ME, "A turn is running.".into(), Some(3)),
             (ME, "Stopped.".into(), Some(2)),
-            (ME, "Nothing is running.".into(), Some(5)),
             (ME, STOP_TOO_LATE.into(), Some(4)),
-            (ME, "reply: hold".into(), Some(6)),
+            (ME, "reply: hold".into(), Some(5)),
         ]
     );
 }
@@ -278,17 +278,6 @@ async fn the_bridge_refuses_in_the_chat_what_it_cannot_tie_to_its_one_person() {
         }
         replies.push(chat);
     }
-    // The chat was deleted after it was bound: the start is refused.
-    assert!(
-        delete_session_as_admin(&fx.state, chat.session_id())
-            .await
-            .is_success()
-    );
-    assert!(matches!(
-        bridge.handle(message(12, "hi")).await,
-        Handled::Refused(Refusal::NotStarted(_))
-    ));
-    replies.push(ME);
     let sent = channel.take();
     assert_eq!(
         sent.iter().map(|(chat, ..)| *chat).collect::<Vec<_>>(),
@@ -352,6 +341,11 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
             Handled::Answered
         ));
         assert_eq!(delivered(stopped).await, Delivery::Sent);
+        // Nothing is running: this /stop decides to stop nothing.
+        assert!(matches!(
+            bridge.handle(message(8, "/stop")).await,
+            Handled::Answered
+        ));
         // Message 3's turn started, then the server stopped.
         let cut_off = turn_id_for(&binding(ME, ME, &chat), 3);
         let started = octos_core::ui_protocol::TurnStartedEvent {
@@ -381,25 +375,87 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
             other => panic!("message {id} handled again: {other:?}"),
         }
     }
-    // The /stop that stopped message 4's turn, delivered again: the turn
-    // a later message started keeps running.
-    let later = bridge.handle(message(6, "hold")).await;
-    assert!(matches!(
-        bridge.handle(message(5, "/stop")).await,
-        Handled::Answered
-    ));
+    // Both /stops delivered again after a message sent between them (and
+    // delayed) started a turn: their decisions stand, and it runs.
+    let late = bridge.handle(message(7, "hold")).await;
+    for stop in [5, 8] {
+        assert!(matches!(
+            bridge.handle(message(stop, "/stop")).await,
+            Handled::Repeated
+        ));
+    }
     llm.release.add_permits(1);
-    assert_eq!(delivered(later).await, Delivery::Sent);
-    assert_eq!(
-        channel.take(),
-        [
-            (ME, STOP_TOO_LATE.into(), Some(5)),
-            (ME, "reply: hold".into(), Some(6)),
-        ]
-    );
+    assert_eq!(delivered(late).await, Delivery::Sent);
+    assert_eq!(channel.take(), [(ME, "reply: hold".into(), Some(7))]);
     // Nothing ran twice; the stopped turn may end before it reaches the
     // model.
     let seen = prompts(&llm);
     assert_eq!(seen[..2], ["before", "lost"]);
     assert!(matches!(seen[2..].len(), 1 | 2) && seen[2..].iter().all(|p| p == "hold"));
+}
+
+#[tokio::test]
+async fn a_deleted_chat_runs_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = scripted();
+    let fx = serve(dir.path(), llm.clone()).await;
+    let (first, second) = (fx.chat(&unique("im")).await, fx.chat(&unique("im-2")).await);
+    // Another chat of mine.
+    const MINE: i64 = 4343;
+    let channel = Arc::new(FakeChannel::default());
+    let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
+    let bindings = vec![binding(ME, ME, &first), binding(MINE, ME, &second)];
+    let bridge = ServeImBridge::new(turns, channel.clone(), vec![ME], bindings, TTL).unwrap();
+    let in_chat = |chat, id, text| ImMessage {
+        chat,
+        ..message(id, text)
+    };
+    for chat in [ME, MINE] {
+        let handled = bridge.handle(in_chat(chat, 1, "hello")).await;
+        assert_eq!(delivered(handled).await, Delivery::Sent);
+    }
+
+    // Each chat deleted while its message 2 is under way: the first while
+    // its turn is admitted, the second after that and before it runs.
+    let mut racing = Vec::new();
+    for (chat, target, at) in [(ME, &first, ""), (MINE, &second, "/run")] {
+        let pause = || Arc::new(tokio::sync::Notify::new());
+        let (reached, release) = (pause(), pause());
+        let turn = turn_id_for(&binding(chat, ME, target), 2);
+        TURN_ADMISSION_TEST_PAUSES.lock().unwrap().insert(
+            format!("{}{at}", turn.0),
+            (reached.clone(), release.clone()),
+        );
+        let handled = tokio::spawn({
+            let bridge = bridge.clone();
+            async move { bridge.handle(in_chat(chat, 2, "racing")).await }
+        });
+        reached.notified().await;
+        assert!(
+            delete_session_as_admin(&fx.state, target.session_id())
+                .await
+                .is_success()
+        );
+        release.notify_one();
+        racing.push(handled.await.unwrap());
+    }
+    assert!(matches!(
+        racing[0],
+        Handled::Refused(Refusal::NotStarted(_))
+    ));
+    // Admitted, it ends before the model or a tool runs.
+    assert_eq!(delivered(racing.remove(1)).await, Delivery::Sent);
+    // A message after the delete is refused: its chat is gone.
+    match bridge.handle(in_chat(ME, 3, "later")).await {
+        Handled::Refused(Refusal::NotStarted(why)) => assert!(why.contains("not a chat"), "{why}"),
+        other => panic!("ran after the delete: {other:?}"),
+    }
+    assert_eq!(prompts(&llm), ["hello", "hello"]);
+    assert!(
+        channel
+            .take()
+            .contains(&(MINE, "The turn failed.".into(), Some(2)))
+    );
+    // Nothing stays recorded.
+    assert!(fx.entry.reconcile(&fx.profile).await.is_empty());
 }

@@ -171,7 +171,8 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
   - 没有平台 message id（按钮回调没有，bridge 不替它编一个）；
   - 没有平台发送时间，或按平台时间已超过 TTL（不用 bridge 收件时间）；
   - 带附件、空文本、未知命令。
-  命令只有 `/status` 和 `/stop`。`/stop` 只停 bridge 自己的、而且是比这条 `/stop` 更早的消息起的 turn。平台 message id 在一个 chat 里随发送顺序增长，所以重投的 `/stop` 停不到它之后才开始的 turn，重启前后都一样，不用另存状态。
+  命令只有 `/status` 和 `/stop`。`/stop` 只停 bridge 自己的、由比它更早的消息起的 turn。平台 message id 在一个 chat 里随发送顺序增长，所以迟到的 `/stop` 停不到它之后才发的消息。每条 `/stop` 的决定（停哪个 turn，或什么都不停）都先写进 profile 数据目录的 `im_bridge_stops/` 再执行，在 TTL 内保留。同一条 `/stop` 再来（包括重启后），bridge 看到已有决定就什么都不做；晚到的更早消息起的 turn 也不会被它停掉。
+- **删除的 Chat**：`ExternalTurns::start` 准入前重新确认 Chat 还在，删了就拒绝。准入之后、turn 建 runtime 之前才删的，由 `LedgerConnection` 的 `chats_only` 兜住：runtime 按当时的 chat 记录构建，不是 chat 就以 `runtime_unavailable` 结束，模型和工具都不跑，不会当普通 session 跑。
 - **幂等**：turn_id 由 channel、chat、sender 和平台 message id 哈希得出。重投的消息（重启前后都一样）对应已有的 turn，什么都不执行，也不回复。来源只留在 bridge，模型和 ledger 只看到文本。
 - **出站**：结果回复到原消息。binding 撤销后，结果不再发出。发送失败不重发；这时 turn 的记录保留，留给以后的 outbox 对账。发出或撤销后才 `acknowledge`。
 - serve 里还没有调用方。真实渠道（bus 带出平台时间、数字 id 和 sender 类别）、配置、附件、IM 审批、离线 outbox 和群聊都是后面的刀。

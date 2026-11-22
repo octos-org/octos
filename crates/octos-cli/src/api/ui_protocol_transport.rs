@@ -38463,6 +38463,27 @@ async fn run_standalone_turn(
         contracts.scopes.evict_turn(&session_id, &turn_id);
         return;
     }
+    // T-0653: the runtime was just built from the live chat record. A
+    // connection that may drive only chats does not run in a session that is
+    // no longer one, as a chat deleted after its turn was admitted is.
+    if ws.chats_only() && session_runtime.chat_root.is_none() {
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_unavailable", "the session is no longer a chat")),
+            None,
+            steer_buffer.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
     let turn_end_hooks = session_runtime.profile.hook_executor.clone();
     let turn_end_hook_ctx = octos_agent::HookContext {
         session_id: Some(session_id.to_string()),

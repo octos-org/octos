@@ -24,6 +24,13 @@ pub(crate) trait TurnConnection: Send + Sync {
     /// its turns keep only the external tool allowlist.
     fn is_external(&self) -> bool;
 
+    /// Whether this connection may drive only chats: its turns refuse to run
+    /// in a session that is not a chat when they start, as a deleted chat's
+    /// id becomes (T-0653).
+    fn chats_only(&self) -> bool {
+        false
+    }
+
     /// Whether a turn outlives this connection (see
     /// [`WsConnection::server_owns_turns`]).
     fn server_owns_turns(&self) -> bool;
@@ -125,6 +132,10 @@ impl<T: TurnConnection + ?Sized> TurnConnection for Arc<T> {
         (**self).is_external()
     }
 
+    fn chats_only(&self) -> bool {
+        (**self).chats_only()
+    }
+
     fn server_owns_turns(&self) -> bool {
         (**self).server_owns_turns()
     }
@@ -203,6 +214,10 @@ impl TurnConnection for LedgerConnection {
     }
 
     fn is_external(&self) -> bool {
+        true
+    }
+
+    fn chats_only(&self) -> bool {
         true
     }
 

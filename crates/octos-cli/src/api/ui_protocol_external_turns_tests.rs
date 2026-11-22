@@ -79,7 +79,7 @@ pub(crate) async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
 /// when they let go, so wait for its lock first.
 pub(crate) async fn restart(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
     let data_dir = dir.join("profiles").join(CHAT_PROFILE).join("data");
-    for _ in 0..1000 {
+    for _ in 0..3000 {
         let released = octos_memory::EpisodeStore::open(&data_dir).await.is_ok();
         if released {
             return serve(dir, llm).await;

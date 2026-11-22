@@ -20,10 +20,19 @@ Nothing on the wire changes:
   write the same ledger rows an external client's turn writes. Only the
   message text reaches the model and the ledger. The channel, chat, sender
   and platform message id stay in the bridge.
-- Internally, `BoundChat` gains a profile accessor, and `ExternalTurns`
-  gains a way to wait for a turn's end and read its last reply from the
-  ledger. A start that the chat refuses now removes the turn's
-  `external_turns/` record, because a turn that never ran leaves nothing to
-  reconcile. That file is server state, not protocol.
+- Internally, `BoundChat` and `BoundProfile` gain accessors, and
+  `ExternalTurns` gains a way to wait for a turn's end and read its last
+  reply from the ledger. A start that the chat refuses now removes the
+  turn's `external_turns/` record, because a turn that never ran leaves
+  nothing to reconcile.
+- `ExternalTurns::start` checks again that the chat still exists before it
+  admits a turn. `TurnConnection` gains `chats_only` (false unless
+  overridden; true for `LedgerConnection`). A turn on such a connection
+  whose session is no longer a chat when its runtime is built ends with
+  the existing `runtime_unavailable` turn error, before any model call.
+  WebSocket and stdio connections are not chats-only and behave as before.
+- The bridge keeps each `/stop` decision in the profile's
+  `im_bridge_stops/` directory while a redelivery could still run.
+  `external_turns/` and `im_bridge_stops/` are server state, not protocol.
 
 Cite this record elsewhere as `UPCR-2026-REF9D0516`.

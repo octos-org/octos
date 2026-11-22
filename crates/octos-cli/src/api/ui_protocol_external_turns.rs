@@ -54,6 +54,10 @@ impl BoundProfile {
             data_dir: runtime.data_dir.clone(),
         })
     }
+
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
 }
 
 /// An existing chat of a [`BoundProfile`], named by its own session id.
@@ -203,6 +207,8 @@ impl ExternalTurns {
         };
         let ledger = ledger_record(&self.ledger, session_id, turn_id)?;
         Ok(match registered {
+            // The ledger may have the end before the registry.
+            _ if !matches!(ledger, TurnRecord::NotStarted | TurnRecord::Running) => ledger,
             Some(TurnLifecycleState::Active | TurnLifecycleState::Interrupting) => {
                 TurnRecord::Running
             }
@@ -235,6 +241,10 @@ impl ExternalTurns {
             TurnRecord::NotStarted => {}
             existing => return Ok(Started::Already(existing)),
         }
+        // Still a chat now, not only when it was bound: a deleted chat's id
+        // would otherwise run as an ordinary session. Its turn checks again
+        // when it builds its runtime, for a delete that comes in between.
+        let chat = &BoundChat::verify(chat.profile.clone(), chat.session_id.clone())?;
         record_dispatch(&chat.profile.data_dir, &chat.session_id, &turn_id).map_err(|error| {
             RpcError::internal_error(format!("could not record the turn before it runs: {error}"))
         })?;
@@ -266,6 +276,8 @@ impl ExternalTurns {
             .await;
         match start.outcome {
             Ok(admitted) => {
+                #[cfg(test)]
+                run_test_pause(&turn_id).await;
                 admitted.start();
                 Ok(Started::Now)
             }
@@ -316,8 +328,7 @@ impl ExternalTurns {
                     ));
                 }
             }
-            // The ledger has the end before the turn registry may.
-            match ledger_record(&self.ledger, &chat.session_id, turn_id)? {
+            match self.record(chat, turn_id).await? {
                 TurnRecord::NotStarted | TurnRecord::Running => continue,
                 ended => break Ok((ended, self.reply(chat, turn_id)?)),
             }
@@ -439,6 +450,20 @@ impl ExternalTurns {
 
     fn caller(&self) -> ExternalCaller {
         ExternalCaller(self.connection.clone())
+    }
+}
+
+/// Tests pause an admitted turn here, before it runs, under the key
+/// `<turn id>/run` of [`TURN_ADMISSION_TEST_PAUSES`].
+#[cfg(test)]
+async fn run_test_pause(turn_id: &TurnId) {
+    let pause = TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&format!("{}/run", turn_id.0));
+    if let Some((reached, release)) = pause {
+        reached.notify_one();
+        release.notified().await;
     }
 }
 
