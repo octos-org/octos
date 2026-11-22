@@ -32,7 +32,8 @@ Nothing on the wire changes:
   the existing `runtime_unavailable` turn error, before any model call.
   WebSocket and stdio connections are not chats-only and behave as before.
 - The bridge keeps each `/stop` decision in the profile's
-  `im_bridge_stops/` directory while a redelivery could still run.
+  `im_bridge_stops/` directory, with the deadline after which its `/stop`
+  is no longer accepted.
   `external_turns/` and `im_bridge_stops/` are server state, not protocol.
 
 Cite this record elsewhere as `UPCR-2026-REF9D0516`.

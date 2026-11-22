@@ -459,3 +459,46 @@ async fn a_deleted_chat_runs_nothing_more() {
     // Nothing stays recorded.
     assert!(fx.entry.reconcile(&fx.profile).await.is_empty());
 }
+
+#[tokio::test]
+async fn a_stop_decision_lasts_while_its_stop_can_be_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = serve(dir.path(), scripted()).await;
+    let (first, second) = (fx.chat(&unique("im")).await, fx.chat(&unique("im-2")).await);
+    // Two bridges on one profile: mine, and another chat of mine on a bridge
+    // with a short time to live.
+    const MINE: i64 = 4343;
+    let short = Duration::from_millis(500);
+    let bridge = |chat, target, ttl| {
+        let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
+        let channel = Arc::new(FakeChannel::default());
+        let bindings = vec![binding(chat, ME, target)];
+        ServeImBridge::new(turns, channel, vec![ME], bindings, ttl).unwrap()
+    };
+    let (long, short) = (bridge(ME, &first, TTL), bridge(MINE, &second, short));
+    let stop = |chat, id, sent_at| ImMessage {
+        chat,
+        sent_at: Some(sent_at),
+        ..message(id, "/stop")
+    };
+    // A platform clock 5 s ahead of this host's.
+    let ahead = Utc::now() + Duration::from_secs(5);
+    let now = Utc::now();
+    for (bridge, message) in [
+        (&long, stop(ME, 1, now)),
+        (&short, stop(MINE, 1, ahead)),
+        (&short, stop(MINE, 2, now)),
+    ] {
+        assert!(matches!(bridge.handle(message).await, Handled::Answered));
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The short bridge's next /stop forgets only the decision whose /stop
+    // can no longer be accepted (its /stop 2).
+    let next = short.handle(stop(MINE, 3, ahead)).await;
+    assert!(matches!(next, Handled::Answered));
+    for (bridge, message) in [(&long, stop(ME, 1, now)), (&short, stop(MINE, 1, ahead))] {
+        assert!(matches!(bridge.handle(message).await, Handled::Repeated));
+    }
+    let decisions = std::fs::read_dir(fx.profile.data_dir().join(STOPS_DIR));
+    assert_eq!(decisions.unwrap().count(), 3);
+}

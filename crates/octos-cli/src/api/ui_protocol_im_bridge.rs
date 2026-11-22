@@ -264,20 +264,26 @@ impl ServeImBridge {
                 break 'checks Refusal::Empty;
             }
             return match text.strip_prefix('/') {
-                Some(command) => self.command(&binding, message_id, command).await,
+                Some(command) => self.command(&binding, message_id, sent_at, command).await,
                 None => self.start(binding, message_id, text).await,
             };
         };
         self.refuse(message.chat, message.message_id, refusal).await
     }
 
-    async fn command(&self, binding: &ImBinding, message_id: i64, command: &str) -> Handled {
+    async fn command(
+        &self,
+        binding: &ImBinding,
+        message_id: i64,
+        sent_at: DateTime<Utc>,
+        command: &str,
+    ) -> Handled {
         let reply = match command.split_whitespace().next() {
             Some("status") => match self.running_turn(binding.target.session_id()) {
                 Some(_) => "A turn is running.",
                 None => "Nothing is running.",
             },
-            Some("stop") => match self.stop(binding, message_id).await {
+            Some("stop") => match self.stop(binding, message_id, sent_at).await {
                 Ok(Some(reply)) => reply,
                 // Stopped: the stopped turn's result answers.
                 Ok(None) => return Handled::Answered,
@@ -297,11 +303,13 @@ impl ServeImBridge {
     /// disk before it is acted on, and a delivery of the same /stop finds it
     /// there and does nothing again, before or after a restart. Only a turn
     /// an earlier message started can be stopped, so a /stop that arrives
-    /// late cannot reach a turn sent after it. Returns the reply, if any.
+    /// late cannot reach a turn sent after it. The decision is kept until
+    /// its /stop can no longer be accepted. Returns the reply, if any.
     async fn stop(
         &self,
         binding: &ImBinding,
         message_id: i64,
+        sent_at: DateTime<Utc>,
     ) -> Result<Option<&'static str>, Repeated> {
         let target = self
             .running_turn(binding.target.session_id())
@@ -309,7 +317,12 @@ impl ServeImBridge {
             .map(|(turn_id, _)| turn_id);
         let decisions = binding.target.profile().data_dir().join(STOPS_DIR);
         let decision = decisions.join(turn_id_for(binding, message_id).0.to_string());
-        match record_stop(&decisions, &decision, target.as_ref()) {
+        // The last moment this bridge accepts the /stop (see `handle`).
+        let deadline = chrono::TimeDelta::from_std(self.ttl)
+            .ok()
+            .and_then(|ttl| sent_at.checked_add_signed(ttl))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        match record_stop(&decisions, &decision, deadline, target.as_ref()) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(Repeated);
@@ -319,7 +332,7 @@ impl ServeImBridge {
                 return Ok(Some("Could not stop the turn."));
             }
         }
-        forget_expired_stops(&decisions, self.ttl);
+        forget_expired_stops(&decisions);
         let Some(turn_id) = target else {
             return Ok(Some("Nothing sent before this /stop is running."));
         };
@@ -444,32 +457,46 @@ impl ServeImBridge {
 /// A `/stop` whose decision was already made.
 struct Repeated;
 
-/// Record a `/stop`'s decision: the turn it stops, or none. The file is
-/// created only if it does not exist, so of two deliveries only one decides.
-fn record_stop(dir: &Path, path: &Path, target: Option<&TurnId>) -> std::io::Result<()> {
+/// Record a `/stop`'s decision, the turn it stops or none, under the
+/// deadline after which its `/stop` is no longer accepted. The file is
+/// written whole and then linked into place, which fails if a decision is
+/// there already, so of two deliveries only one decides.
+fn record_stop(
+    dir: &Path,
+    path: &Path,
+    deadline: DateTime<Utc>,
+    target: Option<&TurnId>,
+) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
     let decision = target.map_or_else(|| "nothing".to_owned(), |turn| format!("stop {}", turn.0));
-    file.write_all(decision.as_bytes())?;
-    file.sync_all()
+    let draft = dir.join(format!(".{}.draft", uuid::Uuid::new_v4().simple()));
+    let mut file = std::fs::File::create(&draft)?;
+    let written = writeln!(file, "{}\n{decision}", deadline.to_rfc3339())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(&draft, path));
+    let _ = std::fs::remove_file(&draft);
+    written
 }
 
-/// Forget decisions older than twice the time to live: a delivery of their
-/// `/stop` would now be refused as stale before it reached them (twice, for
-/// a platform clock ahead of this host's).
-fn forget_expired_stops(dir: &Path, ttl: Duration) {
+/// Forget the decisions whose `/stop` can no longer be accepted: a delivery
+/// of it now is refused as stale before it reaches them. Each decision keeps
+/// its own deadline, from its platform time and the time to live of the
+/// bridge that made it, so the clocks and bridges of other decisions in the
+/// profile do not matter.
+fn forget_expired_stops(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let now = Utc::now();
     for entry in entries.flatten() {
-        let expired = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .is_ok_and(|made| made.elapsed().is_ok_and(|age| age > ttl * 2));
+        let expired = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|decision| {
+                let deadline = decision.lines().next()?;
+                DateTime::parse_from_rfc3339(deadline).ok()
+            })
+            .is_some_and(|deadline| deadline < now);
         if expired {
             let _ = std::fs::remove_file(entry.path());
         }
