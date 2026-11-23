@@ -46,3 +46,9 @@ T-0579 follow-up: the last two additions restore two independent contracts that 
 | 精确边界 | Explicit foreground override, podcast precedence, unknown/empty slug rejection, and normalization are retained. |
 | 协议帧 | No transport frame codec exists here; serde field-shape mirrors are excluded rather than mislabeled as protocol framing. |
 | 平台差异 | Pure Rust definitions have no OS branch. UTF-8 Chinese detection and ASCII case normalization remain covered without live/canary access. |
+
+## Receipt-driven peer dispatch
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| Receipt cursors handle worker replay, cancellation and obsolete stages. `src/activity.rs` | `independent_import_shards_and_page_review_share_the_same_lifecycle`<br>`cancelled_failed_and_obsolete_work_cannot_launch_a_worker`<br>`late_worker_observes_its_own_receipt_even_after_the_next_stage_advances`<br>`unrelated_and_rebased_receipts_cannot_settle_an_ordinary_wait`<br>`explicit_adoption_anchors_the_next_verified_receipt_to_the_existing_history` |
