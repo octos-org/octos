@@ -17,7 +17,7 @@
 //! deleted.
 
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
 use octos_core::SessionKey;
@@ -31,6 +31,10 @@ struct ChatWorkspaceLayout {
     /// Stable root known before the first sandbox is built. New runtime
     /// profiles create chats here; legacy profiles keep their old root.
     server_root: Option<PathBuf>,
+    /// Server-owned roots that are safe to recreate while wrapping a command.
+    /// Keeping this separate from the current root prevents a test or gateway
+    /// reconfigure from making another root look like a legacy root.
+    healable_server_roots: std::collections::BTreeSet<PathBuf>,
     /// Canonical profile data dir -> server-level profile root chosen for it.
     /// Keeping this separate from the current server root keeps unit-test
     /// states independent and preserves a profile across unrelated reconfigures.
@@ -282,7 +286,10 @@ pub(crate) fn configure_server_root(
     reserved_folders()
         .add(root.clone())
         .map_err(std::io::Error::other)?;
-    layout_write().server_root = Some(root.clone());
+    let mut layout = layout_write();
+    layout.server_root = Some(root.clone());
+    layout.healable_server_roots.insert(root.clone());
+    drop(layout);
     Ok(root)
 }
 
@@ -310,6 +317,43 @@ pub(crate) fn unregister_profile(data_dir: &Path) {
         drop(layout);
         reserved_folders().remove(&chats_root(&profile_dir));
     }
+}
+
+/// Let the shared hidden-folder list repair the server-owned Chat root at
+/// command wrap time. A legacy root is never healed from inside a sandboxed
+/// command: it may have been renamed by an earlier command, so its absence
+/// cannot prove that its contents are gone.
+pub(crate) fn install_missing_root_healer() {
+    reserved_folders().on_missing_folder(Arc::new(move |folder, command_roots| {
+        heal_missing_folder(folder, command_roots)
+    }));
+}
+
+fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool, String> {
+    let folder = canonical_dir(folder);
+    if layout_read().healable_server_roots.contains(&folder) {
+        if command_roots
+            .iter()
+            .any(|root| canonical_dir(root).starts_with(&folder))
+        {
+            return Err(format!(
+                "server chats root {} is inside a workspace/read root available to this command",
+                folder.display()
+            ));
+        }
+        private_dir(&folder, true).map_err(|error| {
+            format!(
+                "server chats root {} is missing and could not be recreated: {error}",
+                folder.display()
+            )
+        })?;
+        tracing::warn!(path = %folder.display(), "recreated missing server chats root");
+        return Ok(true);
+    }
+    Err(format!(
+        "hidden chats root {} is missing. Refusing to run the command; restore the directory, or have an operator verify its contents are deleted and unregister it with the repair flow.",
+        folder.display()
+    ))
 }
 
 #[cfg(all(test, feature = "api"))]
@@ -341,6 +385,9 @@ impl Drop for HiddenFixtureGuard {
         layout
             .profile_server_roots
             .retain(|data_dir, _| !data_dir.starts_with(&self.root));
+        layout
+            .healable_server_roots
+            .retain(|root| !root.starts_with(&self.root));
         if layout
             .server_root
             .as_ref()
@@ -902,6 +949,146 @@ mod server_root_tests {
         assert!(!reserved_folders().folders().contains(&failed_root));
     }
 
+    async fn run_hidden_command(root: &Path, command: &str) -> Option<std::process::Output> {
+        // Other tests share this process-global list. Drop only stale fixture
+        // roots outside this test's TempDir; a missing root under this fixture
+        // is the case under test and must reach the resolver.
+        let reserved = reserved_folders();
+        for folder in reserved.folders() {
+            if !folder.exists() && !folder.starts_with(root) {
+                reserved.remove(&folder);
+            }
+        }
+        for mode in [
+            octos_agent::SandboxMode::Bwrap,
+            octos_agent::SandboxMode::Macos,
+        ] {
+            let sandbox = octos_agent::create_sandbox(&octos_agent::SandboxConfig {
+                mode,
+                hidden_folders: Some(reserved_folders()),
+                ..octos_agent::SandboxConfig::default()
+            });
+            if sandbox.refusal().is_some() {
+                println!("{} unavailable on this host", sandbox.backend_name());
+                continue;
+            }
+            return sandbox.wrap_command(command, root).output().await.ok();
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn should_recreate_missing_server_root_before_command() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let (temp, _hidden) = tempdir_with_hidden_guard();
+        let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
+        install_missing_root_healer();
+        std::fs::remove_dir_all(&server_root).unwrap();
+        assert!(
+            reserved_folders()
+                .resolve_missing_folder(&server_root, &[temp.path().to_path_buf()])
+                .unwrap()
+        );
+        let marker = temp.path().join("ran");
+        let Some(output) = run_hidden_command(
+            temp.path(),
+            &format!("printf healed > \"{}\"", marker.display()),
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(server_root.is_dir());
+        let profile_dir = temp.path().join("profiles/new/data");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let chat = create(
+            &profile_dir,
+            "new",
+            &SessionKey::with_profile("new", "api", "healed"),
+        )
+        .unwrap();
+        assert!(chat.root.starts_with(&server_root));
+        std::fs::write(chat.root.join("secret.txt"), "server-secret").unwrap();
+        let output = run_hidden_command(
+            temp.path(),
+            &format!("cat \"{}\"", chat.root.join("secret.txt").display()),
+        )
+        .await
+        .unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_server_root_inside_command_roots() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let (temp, _hidden) = tempdir_with_hidden_guard();
+        let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
+        install_missing_root_healer();
+        std::fs::remove_dir_all(&server_root).unwrap();
+        let error = reserved_folders()
+            .resolve_missing_folder(&server_root, &[server_root.join("code-workspace")])
+            .expect_err("a command root inside the server root must not self-heal");
+        assert!(
+            error.contains(server_root.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.contains("inside a workspace/read root"), "{error}");
+        assert!(!server_root.exists());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_renamed_legacy_root_without_exposing_it() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let (temp, _hidden) = tempdir_with_hidden_guard();
+        let profile_dir = temp.path().join("profiles/live/data");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[]).unwrap();
+        register_existing_profile(&profile_dir).unwrap();
+        install_missing_root_healer();
+        let old_chat = create(
+            &profile_dir,
+            "live",
+            &SessionKey::with_profile("live", "api", "old"),
+        )
+        .unwrap();
+        std::fs::write(old_chat.root.join("secret.txt"), "old-secret").unwrap();
+        let legacy_root = canonical_dir(&chats_root(&profile_dir));
+        let moved_root = temp.path().join("renamed-chats");
+        let moved_secret = moved_root
+            .join(old_chat.root.strip_prefix(&legacy_root).unwrap())
+            .join("secret.txt");
+        std::fs::rename(&legacy_root, &moved_root).unwrap();
+        let error = reserved_folders()
+            .resolve_missing_folder(&legacy_root, &[temp.path().to_path_buf()])
+            .expect_err("a renamed legacy root stays fail-closed");
+        assert!(
+            error.contains(legacy_root.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.contains("restore the directory"), "{error}");
+        assert!(reserved_folders().folders().contains(&legacy_root));
+        let Some(output) =
+            run_hidden_command(temp.path(), &format!("cat \"{}\"", moved_secret.display())).await
+        else {
+            return;
+        };
+        assert!(
+            !output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(moved_secret.exists());
+    }
+
     #[tokio::test]
     async fn should_allow_main_profile_data_dir_equal_state_home() {
         let _guard = LAYOUT_TEST_LOCK.lock().await;
@@ -1029,7 +1216,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_unreserve_deleted_legacy_profile_root() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let root_dir = temp.path().to_path_buf();
         std::mem::forget(temp);

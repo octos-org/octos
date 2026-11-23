@@ -1211,18 +1211,28 @@ impl HiddenFolderGuard {
             .iter()
             .filter_map(|path| canonical(Path::new(path)))
             .collect();
+        let command_roots: Vec<PathBuf> = cwd.clone().into_iter().chain(read.clone()).collect();
         let hidden = self.hidden.folders();
-        if hidden
-            .iter()
-            .any(|folder| std::fs::canonicalize(folder).is_err())
-        {
-            // A registered hidden folder that cannot be resolved is not
-            // safely absent; do not let a non-hiding backend run around it.
-            return true;
+        let mut resolved = Vec::with_capacity(hidden.len());
+        for registered in hidden {
+            match std::fs::canonicalize(&registered) {
+                Ok(folder) => resolved.push(folder),
+                Err(_) => match self
+                    .hidden
+                    .resolve_missing_folder(&registered, &command_roots)
+                {
+                    Ok(true) => match std::fs::canonicalize(&registered) {
+                        Ok(folder) => resolved.push(folder),
+                        Err(_) => return true,
+                    },
+                    Ok(false) => {}
+                    Err(_) => return true,
+                },
+            }
         }
-        hidden.iter().filter_map(|f| canonical(f)).any(|folder| {
+        resolved.iter().any(|folder| {
             cwd.as_ref()
-                .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(&folder))
+                .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(folder))
                 || read.iter().any(|path| folder.starts_with(path))
         })
     }
@@ -1844,5 +1854,50 @@ mod tests {
         assert!(!output.status.success());
         assert!(stderr.contains("Refusing to run"), "{stderr}");
         assert!(!stderr.contains("must-not-run"), "{stderr}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_heal_when_a_non_hiding_backend_owner_unregisters_missing_folder() {
+        struct DirectShell;
+        impl Sandbox for DirectShell {
+            fn backend_name(&self) -> &'static str {
+                "direct-test"
+            }
+
+            fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+                let mut command = Command::new("sh");
+                command.arg("-c").arg(shell_command).current_dir(cwd);
+                command
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let hidden_path = temp.path().join("hidden");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(hidden_path.clone()).unwrap();
+        let healing = hidden.clone();
+        hidden.on_missing_folder(std::sync::Arc::new(move |folder, _roots| {
+            assert_eq!(folder, hidden_path);
+            healing.remove(folder);
+            Ok(false)
+        }));
+        let guard = HiddenFolderGuard {
+            inner: Box::new(DirectShell),
+            hidden,
+            read_allow_paths: Vec::new(),
+        };
+        let output = guard
+            .wrap_command("printf healed > healed.txt", &cwd)
+            .output()
+            .await
+            .expect("healed command runs");
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("healed.txt")).unwrap(),
+            "healed"
+        );
     }
 }

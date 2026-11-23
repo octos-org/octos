@@ -93,6 +93,7 @@
 | sandbox::tests::should_never_refuse_a_default_config_on_any_host | 3 | 默认配置在任何主机上不拒绝 |
 | sandbox::tests::refusing_sandbox_command_refuses_and_never_runs_the_original | 3 | 拒绝沙箱命令绝不执行原命令 |
 | sandbox::tests::should_refuse_when_a_non_hiding_backend_cannot_resolve_hidden_folder | 3 | 非隐藏后端遇到不可解析的隐藏目录时拒绝命令，不把缺失当安全 |
+| sandbox::tests::should_heal_when_a_non_hiding_backend_owner_unregisters_missing_folder | 3 | 非隐藏后端在 owner 证明缺失 root 可注销后执行命令，不自作主张放行 |
 | sandbox::bwrap::tests::test_bwrap_sandbox_env_sanitization | 3 | bwrap 环境变量脱敏 |
 | sandbox::bwrap::tests::should_refuse_when_hidden_folder_was_renamed | 3 | bwrap 隐藏目录启动前被改名时 fail closed，不静默跳过遮蔽 |
 | sandbox::macos::tests::should_refuse_rules_when_hidden_folder_was_deleted | 3 | macOS 隐藏目录规则生成失败时拒绝命令，不发只针对旧路径的策略 |

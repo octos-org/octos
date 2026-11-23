@@ -440,12 +440,30 @@ pub struct SessionScope {
     hidden: HiddenFolders,
 }
 
+/// Owner callback for a registered hidden folder that no longer resolves.
+/// The second argument is the command's workspace/read roots. Return `true`
+/// after restoring the path, or `false` after proving it is safe to skip it
+/// for this command. An error keeps the command fail-closed.
+pub type MissingHiddenFolderHandler =
+    std::sync::Arc<dyn Fn(&Path, &[PathBuf]) -> Result<bool, String> + Send + Sync>;
+
 /// Folders a scope keeps out of every zone. Clones share one list, so a
 /// folder added later reaches every scope already built with it
 /// (UPCR-2026-R1EFC56A3: a profile started after a session's scope was built
 /// still keeps its chats from that session).
-#[derive(Debug, Clone, Default)]
-pub struct HiddenFolders(std::sync::Arc<std::sync::RwLock<Vec<PathBuf>>>);
+#[derive(Clone, Default)]
+pub struct HiddenFolders {
+    folders: std::sync::Arc<std::sync::RwLock<Vec<PathBuf>>>,
+    missing_handler: std::sync::Arc<std::sync::RwLock<Option<MissingHiddenFolderHandler>>>,
+}
+
+impl std::fmt::Debug for HiddenFolders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HiddenFolders")
+            .field("folders", &self.folders())
+            .finish_non_exhaustive()
+    }
+}
 
 impl HiddenFolders {
     /// Hide `folder` (absolute and free of `..`) from every scope sharing
@@ -457,7 +475,7 @@ impl HiddenFolders {
         if !folder.is_absolute() || has_parent {
             return Err(SessionScopeError::HiddenFolderInvalid(folder));
         }
-        let mut folders = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut folders = self.folders.write().unwrap_or_else(|e| e.into_inner());
         if !folders.contains(&folder) {
             folders.push(folder);
         }
@@ -466,20 +484,60 @@ impl HiddenFolders {
 
     /// The folders hidden now.
     pub fn folders(&self) -> Vec<PathBuf> {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.folders
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install the handler consulted before a sandbox refuses a missing root.
+    /// `Ok(true)` means the handler restored the path and it stays registered;
+    /// `Ok(false)` means the handler proved it safe to unregister the path.
+    pub fn on_missing_folder(&self, handler: MissingHiddenFolderHandler) {
+        *self
+            .missing_handler
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+
+    /// Remove the missing-folder owner, returning to strict fail-closed.
+    pub fn clear_missing_folder_handler(&self) {
+        *self
+            .missing_handler
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Resolve a missing hidden folder through the registered owner, if any.
+    pub fn resolve_missing_folder(
+        &self,
+        folder: &Path,
+        command_roots: &[PathBuf],
+    ) -> Result<bool, String> {
+        let handler = self
+            .missing_handler
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        handler.ok_or_else(|| {
+            format!(
+                "no hidden-folder owner can account for missing path {}",
+                folder.display()
+            )
+        })?(folder, command_roots)
     }
 
     /// Stop hiding `folder`. Tests use this to drop fixture roots whose
     /// TempDir another test has already removed.
     pub fn remove(&self, folder: &Path) -> bool {
-        let mut folders = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut folders = self.folders.write().unwrap_or_else(|e| e.into_inner());
         let before = folders.len();
         folders.retain(|registered| registered != folder);
         folders.len() != before
     }
 
     fn any(&self, hides: impl FnMut(&PathBuf) -> bool) -> bool {
-        self.0
+        self.folders
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -487,7 +545,10 @@ impl HiddenFolders {
     }
 
     fn is_empty(&self) -> bool {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.folders
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 }
 

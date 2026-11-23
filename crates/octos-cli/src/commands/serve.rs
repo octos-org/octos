@@ -1344,6 +1344,7 @@ impl ServeCommand {
             &chats_root_workspace_roots,
         )
         .wrap_err("server chats root is unsafe")?;
+        crate::runtime::chat_workspace::install_missing_root_healer();
         tracing::info!(
             server_chats_root = %server_chats_root.display(),
             "reserved server chats root"

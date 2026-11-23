@@ -195,6 +195,7 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
 #[tokio::test]
 async fn chat_tools_cannot_leave_the_chat_folder() {
     let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
+    chat_workspace::install_missing_root_healer();
     let (mut state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
     with_profile_store(&mut state, &temp.path().join("store"), &profile);
     let (a, b) = (chat_key("a"), chat_key("b"));
