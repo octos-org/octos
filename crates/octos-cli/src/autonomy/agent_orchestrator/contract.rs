@@ -164,7 +164,13 @@ pub(crate) const PEER_SEND_INPUT_META_SLUG: &str = "peer_send_input_slug";
 /// dedupe identity (a genuine retry still collapses after re-target).
 pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurrence";
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
+pub(crate) const WORKFLOW_EXIT_META: &str = "workflow_worker_exit_v1";
+pub(crate) const WORKFLOW_ACTIVITY_META: &str = "workflow_activity_v1";
+pub(crate) const PPTX_ASSIGNMENT_GROUP: &str = "pptx-page-assignment";
 pub(crate) const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
+
+/// A staged peer explicitly published a checkpoint for its supervisor.
+pub(crate) const PEER_CHECKPOINT_HANDOFF_KIND: &str = "peer_checkpoint_handoff";
 
 /// T-0014 PR1 — scheduled serve delivery accepted into the durable session
 /// continuation queue. Occurrence dedupe includes job id + scheduled fire time.

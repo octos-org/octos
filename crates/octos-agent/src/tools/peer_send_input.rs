@@ -96,6 +96,7 @@ pub type PeerSendInputAnswerCallback = Arc<
 pub struct PeerSendInputTool {
     send_input: PeerSendInputCallback,
     assignment: bool,
+    page_batch: Option<Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>>,
     await_answer: Option<PeerSendInputAnswerCallback>,
 }
 
@@ -104,6 +105,7 @@ impl PeerSendInputTool {
         Self {
             send_input,
             assignment: false,
+            page_batch: None,
             await_answer: None,
         }
     }
@@ -112,6 +114,15 @@ impl PeerSendInputTool {
     /// the host callback. No new agent lifecycle is introduced.
     pub fn as_assignment(mut self) -> Self {
         self.assignment = true;
+        self
+    }
+
+    /// Install only where the host supports frozen, shared-workspace page peers.
+    pub fn with_page_batch(
+        mut self,
+        deliver: impl Fn(&str) -> Result<Value, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.page_batch = Some(Arc::new(deliver));
         self
     }
 
@@ -125,6 +136,8 @@ impl PeerSendInputTool {
 
 #[derive(Debug, Deserialize)]
 struct Input {
+    // peer_handoff returns a display name; the host already resolves either identifier.
+    #[serde(alias = "name")]
     slug: String,
     message: String,
 }
@@ -143,7 +156,7 @@ impl Tool for PeerSendInputTool {
         if self.assignment {
             return "Assign work to an existing workspace peer using its workspace agent_id as slug. Only the current coordinator can assign. Include the task, file ownership, acceptance criteria and context. The member keeps its own session and permissions; busy members queue the assignment. Use peer_gather for results.";
         }
-        "Send a message or task to a peer returned by peer_list. For automatic \
+        "Send a message or task with {slug, message} to a peer returned by peer_list. For automatic \
          same-workspace peers use its workspace agent_id as slug; the target may \
          be idle or busy (busy targets process it after their current turn). \
          The coordinator distributes tasks and gathers results; every member \
@@ -161,7 +174,7 @@ impl Tool for PeerSendInputTool {
     }
 
     fn input_schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "required": ["slug", "message"],
             "properties": {
@@ -177,7 +190,14 @@ impl Tool for PeerSendInputTool {
                     "description": "The message to inject as the peer's next turn. Include all needed context — the peer cannot see this conversation."
                 }
             }
-        })
+        });
+        if self.page_batch.is_some() {
+            schema.as_object_mut().unwrap().remove("required");
+            schema["properties"]["pptx_batch"] = json!({"type":"string","pattern":"^[a-f0-9]{64}$",
+                "description":"Send the prepared page assignments. Pass just the digest returned by pptx_tool(page_assignments). Retrying the same assignment is idempotent."});
+            schema["oneOf"] = json!([{"required":["slug","message"]},{"required":["pptx_batch"]}]);
+        }
+        schema
     }
 
     async fn execute(&self, args: &Value) -> Result<ToolResult> {
@@ -193,6 +213,38 @@ impl Tool for PeerSendInputTool {
         ctx: &super::ToolContext,
         args: &Value,
     ) -> Result<ToolResult> {
+        if let Some(batch) = args.get("pptx_batch") {
+            let result = (|| {
+                let deliver = self
+                    .page_batch
+                    .as_ref()
+                    .ok_or("PPTX batch delivery is unavailable on this host")?;
+                let digest = batch
+                    .as_str()
+                    .filter(|s| {
+                        s.len() == 64
+                            && s.bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+                    .ok_or("pptx_batch requires the 64-character SHA-256 from page_assignments")?;
+                if args.as_object().is_none_or(|o| o.len() != 1) {
+                    return Err("pptx_batch takes no other arguments".to_string());
+                }
+                deliver(digest)
+            })();
+            return Ok(match result {
+                Ok(receipt) => ToolResult {
+                    success: receipt["failed"].as_u64() == Some(0),
+                    output: receipt.to_string(),
+                    ..Default::default()
+                },
+                Err(error) => ToolResult {
+                    success: false,
+                    output: error,
+                    ..Default::default()
+                },
+            });
+        }
         let input: Input = match serde_json::from_value(args.clone()) {
             Ok(i) => i,
             Err(e) => {
@@ -296,5 +348,35 @@ impl Tool for PeerSendInputTool {
                 ..Default::default()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn peer_name_and_slug_reach_the_same_target_and_conflicting_keys_are_rejected() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let tool = PeerSendInputTool::new(Arc::new(move |req| {
+            assert_eq!(req.slug, "page-maker");
+            assert_eq!(req.message, "work");
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(PeerSendInputDelivery::Queued)
+        }));
+        for field in ["name", "slug"] {
+            let input = json!({(field): "page-maker", "message": "work"});
+            assert!(tool.execute(&input).await.unwrap().success);
+        }
+        assert!(
+            !tool
+                .execute(&json!({"slug":"page-maker","name":"other","message":"work"}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

@@ -1,3 +1,5 @@
+#[path = "ui_protocol_checkpoint_handoff_tests.rs"]
+mod checkpoint_handoff_tests;
 #[path = "ui_protocol_test_support.rs"]
 pub(crate) mod test_support;
 use self::test_support::*;
@@ -1857,6 +1859,93 @@ fn should_normalize_safe_tool_context_at_protocol_boundary() {
 
 mod corrupt_grants_tests {}
 
+fn peer_gather_execution_row(execution: &'static str, result: Option<&str>) -> PeerBlackboardRow {
+    let rounds_delivered = u32::from(result.is_some());
+    PeerBlackboardRow {
+        slug: "reviewer".into(),
+        name: "reviewer".into(),
+        brief: "Review the assigned candidate".into(),
+        brief_truncated: false,
+        result: result.map(str::to_owned),
+        result_truncated: false,
+        result_updated_unix: None,
+        has_worktree: false,
+        closed: execution == "closed",
+        turn_history: None,
+        model_lane: None,
+        originator: None,
+        execution_facet: PeerExecutionFacet {
+            execution,
+            last_outcome: None,
+            round: rounds_delivered + u32::from(matches!(execution, "queued" | "running")),
+            rounds_delivered,
+            master_session_id: None,
+            task_id: None,
+            generation: None,
+            turn_id: None,
+        },
+    }
+}
+
+#[test]
+fn should_show_peer_gather_execution_with_historical_results() {
+    for (execution, status) in [
+        ("queued", "queued"),
+        ("running", "running"),
+        ("idle", "done"),
+        ("failed", "failed"),
+        ("unknown", "result available; execution unknown"),
+        ("closed", "closed"),
+    ] {
+        let row = peer_gather_execution_row(execution, Some("Review from the previous turn"));
+        let (text, truncated) = compose_peer_gather_text_with_truncation(&[row]);
+        assert!(!truncated);
+        assert!(text.contains(&format!("Current execution: exec={execution}")));
+        assert!(text.contains("Latest delivered result (historical):"));
+        assert!(text.contains("Review from the previous turn"));
+        if matches!(execution, "queued" | "running") {
+            assert!(text.contains("round=2 rounds_delivered=1"));
+            assert!(text.contains(&format!(
+                "The current turn is {execution}; the result below is from an earlier turn."
+            )));
+        } else {
+            assert!(text.contains("round=1 rounds_delivered=1"));
+            assert!(!text.contains("The current turn is"));
+        }
+        assert_eq!(
+            text.lines().next(),
+            Some(format!("## peer reviewer ({status})").as_str())
+        );
+        if execution != "idle" {
+            assert!(!text.lines().next().unwrap().contains("(done)"));
+        }
+        assert!(!text.contains("available capacity"));
+        assert!(!text.contains("attached"));
+    }
+}
+
+#[test]
+fn should_show_peer_gather_execution_without_inferring_from_missing_results() {
+    for (execution, status) in [
+        ("unknown", "unknown"),
+        ("queued", "queued"),
+        ("running", "running"),
+        ("failed", "failed"),
+        ("closed", "closed"),
+    ] {
+        let row = peer_gather_execution_row(execution, None);
+        let (text, truncated) = compose_peer_gather_text_with_truncation(&[row]);
+        assert!(!truncated);
+        assert!(text.contains(&format!("## peer reviewer ({status})")));
+        assert!(text.contains(&format!("Current execution: exec={execution}")));
+        assert!(text.contains("(no delivered result recorded)"));
+        assert!(!text.contains("Latest delivered result (historical):"));
+        if execution != "running" {
+            assert!(!text.contains("still running"));
+        }
+    }
+}
+
 #[test]
 fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1895,6 +1984,238 @@ fn peer_checkpoint_is_owned_intermediate_and_never_consumed_as_a_final_result() 
     assert!(receipts.lock().unwrap().is_empty());
     std::fs::write(dir.join("closed"), "closed").unwrap();
     assert!(publish_peer_checkpoint(root, profile, &caller, "turn-b", "after close").is_err());
+    evict_peer_wire_session(&caller);
+}
+
+#[test]
+fn peer_checkpoint_handoff_survives_busy_parent_and_restart_and_deduplicates_after_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let profile = "test-checkpoint-handoff-durable";
+    let owner = SessionKey::with_profile(profile, "local", "master");
+    let peer = stage_peer_with_budget(
+        &root,
+        &workspace,
+        "maker",
+        Some("maker"),
+        Some(&owner.0),
+        "Make a page",
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let caller = SessionKey::with_profile_topic(profile, "local", "peer-wire", &peer.topic);
+    peer_wire_registry().register(peer_wire_key(profile, &peer.slug), caller.clone());
+    session_workspaces().set_resolved(
+        profile,
+        owner.clone(),
+        workspace.clone(),
+        Some(workspace.clone()),
+    );
+    let binding = PeerCheckpointHandoff::capture(&root, profile, &caller, &workspace).unwrap();
+    let store = tmp.path().join("supervisor");
+    let scheduler = InProcessAgentOrchestrator::default();
+    let publish = |scheduler: &InProcessAgentOrchestrator, message: &str, id: &str| {
+        binding.publish(scheduler, &root, &caller, "turn-1", message, id)
+    };
+    assert!(publish(&scheduler, "no store", "s2-r1").is_err());
+    assert!(!root.join(&peer.slug).join("checkpoint.json").exists());
+    scheduler.configure_supervisor_store(&store).unwrap();
+    publish_peer_checkpoint(&root, profile, &caller, "turn-1", "working").unwrap();
+    let idle = MasterContinuationRuntimeState::idle();
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(&owner, profile, idle, 8)
+            .is_empty()
+    );
+    assert!(
+        publish(&scheduler, "review/s2-r1.json", "s2-r1")
+            .unwrap()
+            .contains("queued")
+    );
+    assert!(
+        publish(&scheduler, "old retry", "s2-r1")
+            .unwrap()
+            .contains("already accepted")
+    );
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(
+                &owner,
+                profile,
+                idle.with_user_input_pending(true),
+                8
+            )
+            .is_empty()
+    );
+    static FRESH: OnceLock<InProcessAgentOrchestrator> = OnceLock::new();
+    let fresh = FRESH.get_or_init(InProcessAgentOrchestrator::default);
+    fresh.configure_supervisor_store(&store).unwrap();
+    assert!(
+        fresh
+            .drain_ready_continuations_for_session(&caller, profile, idle, 8)
+            .is_empty()
+    );
+    let (wakes, claim) =
+        fresh.drain_and_claim_ready_continuation_for_session(&owner, profile, idle, 1);
+    assert_eq!(wakes.len(), 1);
+    assert!(master_continuation_prompt(&wakes[0]).contains("review/s2-r1.json"));
+    publish(fresh, "old blocker already handled", "spent").unwrap();
+    let inbox = |scheduler: &InProcessAgentOrchestrator,
+                 target: &SessionKey,
+                 cwd: &Path,
+                 ids: &[String]| {
+        scheduler.peer_checkpoint_inbox(target, profile, cwd, ids, None)
+    };
+    let list = inbox(fresh, &owner, &workspace, &[]).unwrap();
+    let receipt = list["checkpoints"][0]["receipt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let ids = vec![receipt];
+    assert!(inbox(fresh, &caller, &workspace, &ids).is_err());
+    assert_eq!(
+        inbox(fresh, &owner, tmp.path(), &ids).unwrap()["acknowledged"],
+        0
+    );
+    let other = SessionKey::with_profile(profile, "local", "different-master");
+    assert_eq!(
+        inbox(fresh, &other, &workspace, &ids).unwrap()["acknowledged"],
+        0
+    );
+    assert_eq!(
+        inbox(fresh, &owner, &workspace, &ids).unwrap()["acknowledged"],
+        1
+    );
+    assert_eq!(
+        inbox(fresh, &owner, &workspace, &ids).unwrap()["acknowledged"],
+        0
+    );
+    publish(fresh, "review/s2-r2.json", "s2-r2").unwrap();
+    assert!(
+        fresh
+            .drain_and_claim_ready_continuation_for_session(&owner, profile, idle, 1)
+            .0
+            .is_empty()
+    );
+    fresh.mark_continuation_started(&wakes[0]);
+    fresh.mark_continuation_completed(&wakes[0], Some("processed".into()));
+    drop(claim);
+    let restarted = InProcessAgentOrchestrator::default();
+    restarted.configure_supervisor_store(&store).unwrap();
+    assert!(
+        publish(&restarted, "old retry", "s2-r1")
+            .unwrap()
+            .contains("already accepted")
+    );
+    assert!(
+        std::fs::read_to_string(root.join(&peer.slug).join("checkpoint.json"))
+            .unwrap()
+            .contains("review/s2-r2.json")
+    );
+    let wakes = restarted.drain_ready_continuations_for_session(&owner, profile, idle, 8);
+    assert_eq!(wakes.len(), 1);
+    assert!(master_continuation_prompt(&wakes[0]).contains("review/s2-r2.json"));
+    assert!(!root.join(&peer.slug).join("result.md").exists());
+    session_workspaces().remove(profile, &owner);
+    evict_peer_wire_session(&caller);
+}
+
+#[test]
+fn peer_checkpoint_handoff_rejects_stale_wire_owner_lifetime_workspace_and_app_peers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = "test-checkpoint-handoff-fences";
+    let root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let owner = SessionKey::with_profile(profile, "local", "master");
+    let peer = stage_peer_with_budget(
+        &root,
+        &workspace,
+        "maker",
+        Some("maker"),
+        Some(&owner.0),
+        "Make a page",
+        false,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let caller = SessionKey::with_profile_topic(profile, "local", "peer-wire", &peer.topic);
+    let stale = SessionKey::with_profile_topic(profile, "local", "obsolete-wire", &peer.topic);
+    let dir = root.join(&peer.slug);
+    let scheduler = InProcessAgentOrchestrator::default();
+    scheduler
+        .configure_supervisor_store(tmp.path().join("store"))
+        .unwrap();
+    peer_wire_registry().register(peer_wire_key(profile, &peer.slug), caller.clone());
+    let capture = || PeerCheckpointHandoff::capture(&root, profile, &caller, &workspace);
+    let binding = capture().unwrap();
+    let fire = |wire| binding.publish(&scheduler, &root, wire, "turn", "ready", "s1");
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    assert!(PeerCheckpointHandoff::capture(&root, profile, &stale, &workspace).is_none());
+    assert!(fire(&stale).is_err());
+    for bad_owner in [
+        "",
+        "other-profile:local:master",
+        "malformed",
+        &format!("{profile}:local:master#peer-sibling"),
+        &format!("{profile}:local:master#peerctx-app.1"),
+    ] {
+        std::fs::write(dir.join("originator"), bad_owner).unwrap();
+        assert!(capture().is_none());
+        assert!(fire(&caller).is_err());
+    }
+    std::fs::write(dir.join("originator"), &owner.0).unwrap();
+    for leaf in ["closed", crate::peers::app_binding::HOST_BINDING_LEAF] {
+        std::fs::write(dir.join(leaf), "present").unwrap();
+        assert!(capture().is_none());
+        assert!(fire(&caller).is_err());
+        std::fs::remove_file(dir.join(leaf)).unwrap();
+    }
+    session_workspaces().set_resolved(profile, owner.clone(), tmp.path().join("other"), None);
+    assert!(fire(&caller).is_err());
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    std::fs::remove_file(dir.join("checkpoint-stage-id")).unwrap();
+    assert_ne!(capture().unwrap().stage_id, binding.stage_id);
+    assert!(fire(&caller).is_err());
+    assert!(PeerCheckpointHandoff::capture(&root, profile, &caller, tmp.path()).is_none());
+    record_peer_lifetime_binding(&root, profile, &peer.slug, &owner.0, "task-1").unwrap();
+    let supervised = capture().unwrap();
+    assert!(
+        supervised
+            .publish(&scheduler, &root, &caller, "old-turn", "ready", "s1")
+            .is_err()
+    );
+    begin_peer_lifetime_turn(&root, &caller, "actual-turn").unwrap();
+    assert!(
+        supervised
+            .publish(&scheduler, &root, &caller, "old-turn", "ready", "s1")
+            .is_err()
+    );
+    // Replacing only the plain originator marker cannot transfer the supervised task.
+    std::fs::write(dir.join("originator"), format!("{profile}:local:other")).unwrap();
+    assert!(capture().is_none());
+    peer_task_registry().take(&peer_wire_key(profile, &peer.slug));
+    assert!(!dir.join("checkpoint.json").exists());
+    assert!(
+        scheduler
+            .drain_ready_continuations_for_session(
+                &owner,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                8
+            )
+            .is_empty()
+    );
+    session_workspaces().remove(profile, &owner);
     evict_peer_wire_session(&caller);
 }
 
@@ -2784,4 +3105,810 @@ async fn should_stamp_peer_wake_as_automated_event_and_dedupe_replays() {
         0,
         "drain closes the wake gap exactly once"
     );
+}
+
+#[test]
+fn pptx_table_dispatch_targets_real_peers_and_replays_across_restart() {
+    run_pptx_table_dispatch(false);
+}
+
+#[test]
+fn pptx_worker_return_automatically_resumes_missing_candidate() {
+    run_pptx_table_dispatch(true);
+}
+
+fn run_pptx_table_dispatch(test_worker_exit: bool) {
+    use sha2::{Digest, Sha256};
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("work");
+    let controls = workspace.join(".octos");
+    std::fs::create_dir_all(&controls).unwrap();
+    let peers = tmp.path().join("peers");
+    let profile = if test_worker_exit {
+        "pptx-worker-exit"
+    } else {
+        "test-pptx-table-dispatch"
+    };
+    let owner = SessionKey::with_profile(profile, "local", "master");
+    let mut sessions = Vec::new();
+    for name in ["maker", "reviewer"] {
+        let staged = stage_peer_with_budget(
+            &peers,
+            &workspace,
+            name,
+            Some(name),
+            Some(&owner.0),
+            "Available",
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let session = SessionKey::with_profile_topic(profile, "local", "master", &staged.topic);
+        peer_wire_registry().register(peer_wire_key(profile, &staged.slug), session.clone());
+        sessions.push(session);
+    }
+    let put = |file: &str, data: serde_json::Value| {
+        let bytes = serde_json::to_vec(&data).unwrap();
+        std::fs::write(controls.join(file), &bytes).unwrap();
+        format!("{:x}", Sha256::digest(bytes))
+    };
+    let hash = put(
+        "pptx-page-plan.json",
+        json!({"schema_version":2,"coordinator_session":owner.0,"pages":[
+        {"id":"p1","maker_session":sessions[0].0,"reviewer_session":sessions[1].0,"candidate":"page/candidate.json","review":"page/verdict.json"}]}),
+    );
+    let plan = json!({"path":".octos/pptx-page-plan.json","sha256":hash});
+    put(
+        "pptx-verification-plan.json",
+        json!({"mode":"per_page","page_plan":plan}),
+    );
+    let jobs = json!([{"page":"p1","phase":"make","peer":sessions[0].0,"message":"make page p1"}]);
+    let batch = |jobs: &serde_json::Value| {
+        let kind = if jobs
+            .get(0)
+            .is_some_and(|j| j.get("resume_after_round").is_some())
+        {
+            "pptx-peer-resume-v1"
+        } else {
+            "pptx-peer-batch-v1"
+        };
+        put(
+            "pptx-peer-batch.json",
+            json!({"kind":kind,"coordinator":owner.0,"plan":plan,"jobs":jobs}),
+        )
+    };
+    let id = batch(&jobs);
+    let store = tmp.path().join("supervisor");
+    let scheduler = InProcessAgentOrchestrator::default();
+    scheduler.configure_supervisor_store(&store).unwrap();
+    let send = |s: &InProcessAgentOrchestrator, o: &SessionKey, id: &str| {
+        pptx_dispatch::deliver(s, &workspace, &peers, profile, o, id)
+    };
+    assert!(send(&scheduler, &sessions[0], &id).is_err());
+    assert!(send(&scheduler, &owner, &"0".repeat(64)).is_err());
+    let first = send(&scheduler, &owner, &id).unwrap();
+    assert_eq!(first["failed"], 0, "{first}");
+    if test_worker_exit {
+        use octos_workflows::activity::WorkerExit;
+        use workflow_activity::PeerActivity;
+        session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+        let drain = || {
+            scheduler.drain_ready_continuations_for_session(
+                &sessions[0],
+                profile,
+                MasterContinuationRuntimeState::idle().with_workflow_activities(),
+                8,
+            )
+        };
+        let [worker]: [_; 1] = drain().try_into().unwrap();
+        let contract = PeerActivity::from_item(&worker).unwrap().unwrap();
+        assert_eq!(
+            contract.preflight(tmp.path(), &worker, &scheduler).unwrap(),
+            None
+        );
+        contract
+            .record_exit(
+                &worker,
+                &scheduler,
+                &workflow_activity::WorkerReturn {
+                    exit: WorkerExit::Returned,
+                    turn_id: "fixture-turn".into(),
+                },
+            )
+            .unwrap();
+        scheduler.mark_continuation_completed(&worker, None);
+        let [event]: [_; 1] = drain().try_into().unwrap();
+        assert_eq!(
+            contract.preflight(tmp.path(), &event, &scheduler).unwrap(),
+            Some("workflow_successor_durable")
+        );
+        scheduler.mark_continuation_completed(&event, None);
+        let [retry]: [_; 1] = drain().try_into().unwrap();
+        assert_eq!(master_continuation_prompt(&retry), jobs[0]["message"]);
+        assert!(
+            PeerActivity::from_item(&retry)
+                .unwrap()
+                .unwrap()
+                .preflight(tmp.path(), &retry, &scheduler)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .drain_ready_continuations_for_session(
+                    &owner,
+                    profile,
+                    MasterContinuationRuntimeState::idle(),
+                    1
+                )
+                .is_empty()
+        );
+        session_workspaces().remove(profile, &owner);
+        for s in &sessions {
+            evict_peer_wire_session(s);
+        }
+        return;
+    }
+    assert_eq!(first["assignments"].as_array().unwrap().len(), 1);
+    assert_eq!(first["assignments"][0]["peer"], sessions[0].0);
+    assert_eq!(first["assignments"][0]["status"], "queued");
+    let drain = |peer: &SessionKey| {
+        scheduler.drain_ready_continuations_for_session(
+            peer,
+            profile,
+            MasterContinuationRuntimeState::idle().with_workflow_activities(),
+            8,
+        )
+    };
+    assert!(drain(&sessions[1]).is_empty());
+    let [turn]: [_; 1] = drain(&sessions[0]).try_into().unwrap();
+    assert_eq!(master_continuation_prompt(&turn), jobs[0]["message"]);
+    let dir = staged_peer_dir(&peers, "maker").unwrap();
+    std::fs::write(
+        dir.join("result-1.md"),
+        "---\nslug: maker\noutcome: completed\nturn: 1\n---\n\npartial",
+    )
+    .unwrap();
+    std::fs::write(dir.join("turns.txt"), "1 completed 42\n").unwrap();
+    let mut recovery = jobs.clone();
+    recovery[0]["resume_after_round"] = json!(1);
+    assert_eq!(
+        send(&scheduler, &owner, &batch(&recovery)).unwrap()["failed"],
+        1
+    );
+    scheduler.mark_continuation_completed(&turn, None);
+    let fresh = InProcessAgentOrchestrator::default();
+    fresh.configure_supervisor_store(&store).unwrap();
+    let retry = send(&fresh, &owner, &batch(&jobs)).unwrap();
+    assert_eq!(retry["assignments"][0]["status"], "already_dispatched");
+    let mut recovery = json!([jobs[0].clone()]);
+    recovery[0]["resume_after_round"] = json!(2);
+    assert_eq!(
+        send(&fresh, &owner, &batch(&recovery)).unwrap()["failed"],
+        1
+    );
+    recovery[0]["resume_after_round"] = json!(1);
+    let recovery_id = batch(&recovery);
+    let resumed = send(&fresh, &owner, &recovery_id).unwrap();
+    assert_eq!(resumed["assignments"][0]["status"], "queued", "{resumed}");
+    assert_eq!(
+        send(&fresh, &owner, &recovery_id).unwrap()["assignments"][0]["status"],
+        "already_dispatched"
+    );
+    let mut wrong = jobs.clone();
+    wrong[0]["peer"] = json!(sessions[1].0);
+    wrong.as_array_mut().unwrap().push(jobs[0].clone());
+    let bad = send(&fresh, &owner, &batch(&wrong)).unwrap();
+    assert_eq!(bad["failed"], 1);
+    assert_eq!(bad["assignments"][1]["status"], "already_dispatched");
+    std::fs::create_dir(workspace.join("page")).unwrap();
+    std::fs::write(workspace.join("page/candidate.json"), b"new").unwrap();
+    assert_eq!(send(&fresh, &owner, &batch(&jobs)).unwrap()["failed"], 1);
+    // The master takes no turn between the native result and the first reviewer turn.
+    // Its ordinary batch and a replay share the same durable review occurrence.
+    session_workspaces().set_resolved(
+        profile,
+        owner.clone(),
+        workspace.clone(),
+        Some(workspace.clone()),
+    );
+    let router = pptx_dispatch::PublicationRouter {
+        root: peers.clone(),
+        profile: profile.to_owned(),
+        caller: sessions[0].clone(),
+        stage: PeerCheckpointHandoff::capture(&peers, profile, &sessions[0], &workspace).unwrap(),
+        turn: "maker-turn".into(),
+    };
+    let publish = json!({"action":"page_publish"});
+    let cycle = json!({"action":"cycle","publish_candidate":true});
+    let native_result = |bytes: &[u8]| {
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let id = format!(
+            "candidate-{}",
+            (0..8)
+                .map(|i| &hash[8 * i..8 * i + 8])
+                .collect::<Vec<_>>()
+                .join("-")
+        );
+        let bound = json!({"path":"page/candidate.json","sha256":hash});
+        json!({"candidate_id":id,"candidate":bound,"ready_for_independent_review":true,"notification_sent":false,
+            "handoff":{"kind":"page_candidate_ready","maker_session":sessions[0].0,"page_id":"p1",
+                "candidate_id":id,"candidate":bound,"review_request_template":{}}})
+    };
+    let native = native_result(b"new");
+    let maker = format!("session:{}", sessions[0].0);
+    let mut not_ready = native.clone();
+    not_ready["ready_for_independent_review"] = json!(false);
+    assert!(!router.observe(&fresh, &maker, &publish, &mut not_ready));
+    assert!(!router.observe(&fresh, &sessions[1].0, &publish, &mut native.clone()));
+    let mut stale = native_result(b"superseded");
+    assert!(router.observe(&fresh, &maker, &publish, &mut stale));
+    assert_eq!(stale["review_dispatch"]["status"], "superseded");
+    assert_eq!(stale["notification_sent"], false);
+    let mut ready =
+        json!({"page_publication":native, "peer_review_handoff":{"notification_sent":false}});
+    let start = std::time::Instant::now();
+    assert!(router.observe(&fresh, &maker, &cycle, &mut ready));
+    assert_eq!(
+        ready["page_publication"]["review_dispatch"]["status"], "queued",
+        "{ready}"
+    );
+    assert_eq!(
+        ready["page_publication"]["review_dispatch"]["supervisor_notified"], true,
+        "{ready}"
+    );
+    assert_eq!(ready["peer_review_handoff"]["notification_sent"], true);
+    let turns = fresh.drain_ready_continuations_for_session(
+        &sessions[1],
+        profile,
+        MasterContinuationRuntimeState::idle().with_workflow_activities(),
+        8,
+    );
+    assert_eq!(turns.len(), 1);
+    assert!(
+        master_continuation_prompt(&turns[0]).contains(native["candidate_id"].as_str().unwrap())
+    );
+    eprintln!(
+        "native publication to available reviewer turn (local JIT): {:?}",
+        start.elapsed()
+    );
+    fresh.mark_continuation_completed(&turns[0], None);
+    let restored = InProcessAgentOrchestrator::default();
+    restored.configure_supervisor_store(&store).unwrap();
+    let mut again = native.clone();
+    assert!(router.observe(&restored, &maker, &publish, &mut again));
+    assert_eq!(
+        again["review_dispatch"]["status"], "already_dispatched",
+        "{again}"
+    );
+    let review_job = json!([{"page":"p1","phase":"review","peer":sessions[1].0,"message":"review page p1",
+        "candidate_sha256":native["candidate"]["sha256"]}]);
+    assert_eq!(
+        send(&restored, &owner, &batch(&review_job)).unwrap()["assignments"][0]["status"],
+        "already_dispatched"
+    );
+    let verdict = serde_json::to_vec(
+        &json!({"kind":"page-review-v1","candidate_sha256":native["candidate"]["sha256"],
+        "page_id":"p1","reviewer_session":sessions[1].0}),
+    )
+    .unwrap();
+    std::fs::write(workspace.join("page/verdict.json"), &verdict).unwrap();
+    std::fs::create_dir(controls.join("page-verdicts")).unwrap();
+    let verdict_hash = format!("{:x}", Sha256::digest(&verdict));
+    std::fs::write(
+        controls
+            .join("page-verdicts")
+            .join(format!("{verdict_hash}.json")),
+        &verdict,
+    )
+    .unwrap();
+    assert!(router.observe(&restored, &maker, &publish, &mut again));
+    assert_eq!(again["review_dispatch"]["status"], "already_reviewed");
+    // Start a fresh supervisor ledger with an existing deck and only a repair assignment.
+    let adopted = InProcessAgentOrchestrator::default();
+    adopted
+        .configure_supervisor_store(&tmp.path().join("adopted"))
+        .unwrap();
+    assert!(router.observe(&adopted, &maker, &publish, &mut again));
+    assert_eq!(again["review_dispatch"]["status"], "coordinator_required");
+    let repair = json!([{"page":"p1","phase":"repair","peer":sessions[0].0,"message":"repair p1",
+        "candidate_sha256":native["candidate"]["sha256"],"review_sha256":verdict_hash}]);
+    assert_eq!(
+        send(&adopted, &owner, &batch(&repair)).unwrap()["assignments"][0]["status"],
+        "queued"
+    );
+    std::fs::write(workspace.join("page/candidate.json"), b"repaired").unwrap();
+    let repaired = native_result(b"repaired");
+    let ops = json!({"action":"operations","steps":[publish,{"action":"qa_check"}]});
+    let mut partial = json!({"tool_success":false,"completed_steps":1,"failed_step":1,"results":[
+        {"step":0,"action":"page_publish","result":repaired}]});
+    assert!(router.observe(&adopted, &maker, &ops, &mut partial));
+    assert_eq!(
+        partial["results"][0]["result"]["review_dispatch"]["status"], "queued",
+        "{partial}"
+    );
+    assert!(router.observe(&adopted, &maker, &publish, &mut again));
+    assert_eq!(again["review_dispatch"]["status"], "superseded");
+    let turns = adopted.drain_ready_continuations_for_session(
+        &sessions[1],
+        profile,
+        MasterContinuationRuntimeState::idle().with_workflow_activities(),
+        8,
+    );
+    assert_eq!(turns.len(), 1);
+    assert!(
+        master_continuation_prompt(&turns[0]).contains(repaired["candidate_id"].as_str().unwrap())
+    );
+    session_workspaces().remove(profile, &owner);
+    for s in &sessions {
+        evict_peer_wire_session(s);
+    }
+}
+
+#[test]
+fn pptx_repair_events_route_signed_findings_without_a_coordinator_turn() {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("deck");
+    let controls = workspace.join(".octos");
+    let peers = temp.path().join("peers");
+    let store = temp.path().join("ledger");
+    let profile = "test-pptx-repair-events";
+    let owner = SessionKey::with_profile(profile, "local", "deck");
+    for path in [
+        controls.join("page-verdicts"),
+        controls.join("page-repair-decisions"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    let stage_peer = |name: &str| {
+        let staged = stage_peer_with_budget(
+            &peers,
+            &workspace,
+            name,
+            Some(name),
+            Some(&owner.0),
+            "Available",
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let caller = SessionKey::with_profile_topic(profile, "local", "deck", &staged.topic);
+        peer_wire_registry().register(peer_wire_key(profile, &staged.slug), caller.clone());
+        pptx_dispatch::PublicationRouter {
+            root: peers.clone(),
+            profile: profile.to_owned(),
+            stage: PeerCheckpointHandoff::capture(&peers, profile, &caller, &workspace).unwrap(),
+            caller,
+            turn: format!("{name}-turn"),
+        }
+    };
+    let maker = stage_peer("maker");
+    let reviewer = stage_peer("reviewer");
+    let arbiter = stage_peer("arbiter");
+    fn hash(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+    let put = |path: &str, value: &serde_json::Value| {
+        let bytes = serde_json::to_vec(value).unwrap();
+        std::fs::write(workspace.join(path), &bytes).unwrap();
+        json!({"path":path,"sha256":hash(&bytes)})
+    };
+    let row = json!({"id":"p1","maker_session":maker.caller.0,"reviewer_session":reviewer.caller.0,
+        "candidate":"candidate.json","review":"verdict.json"});
+    let plan = put(
+        ".octos/pptx-page-plan.json",
+        &json!({"schema_version":2,"coordinator_session":owner.0,"pages":[row]}),
+    );
+    let mut route = json!({"mode":"per_page","page_plan":plan,"repair_gate":"verified-findings-v1","arbiter_agent":arbiter.caller.0});
+    put(".octos/pptx-verification-plan.json", &route);
+    let batch = |phase: &str, peer: &SessionKey, c: &serde_json::Value, v: &serde_json::Value| {
+        let result = put(
+            ".octos/pptx-peer-batch.json",
+            &json!({"kind":"pptx-peer-batch-v1","plan":plan,
+            "coordinator":owner.0,"jobs":[{"page":"p1","phase":phase,"peer":peer.0,"candidate_sha256":c["sha256"],
+                "review_sha256":v["sha256"],"message":"page assignment"}]}),
+        );
+        result["sha256"].as_str().unwrap().to_owned()
+    };
+    let scheduler = InProcessAgentOrchestrator::default();
+    scheduler.configure_supervisor_store(&store).unwrap();
+    let drain = |s: &InProcessAgentOrchestrator, peer: &SessionKey| {
+        let turns = s.drain_ready_continuations_for_session(
+            peer,
+            profile,
+            MasterContinuationRuntimeState::idle().with_workflow_activities(),
+            8,
+        );
+        for t in &turns {
+            s.mark_continuation_completed(t, None);
+        }
+        turns.len()
+    };
+    let initial = batch("make", &maker.caller, &json!(null), &json!(null));
+    let assigned =
+        pptx_dispatch::deliver(&scheduler, &workspace, &peers, profile, &owner, &initial).unwrap();
+    assert_eq!(assigned["failed"], 0, "{assigned}");
+    assert_eq!(drain(&scheduler, &maker.caller), 1);
+    let candidate = put(
+        "candidate.json",
+        &json!({"page_id":"p1","maker_session":maker.caller.0}),
+    );
+    let token = |name: &str, item: &serde_json::Value| {
+        let hash = item["sha256"].as_str().unwrap();
+        format!(
+            "{name}-{}",
+            (0..8)
+                .map(|i| &hash[i * 8..i * 8 + 8])
+                .collect::<Vec<_>>()
+                .join("-")
+        )
+    };
+    let reject = |kind: &str, label: &str| {
+        let verdict = json!({"kind":"page-review-v1","page_id":"p1","accepted":false,"repair_gate":"verified-findings-v1",
+            "reviewer_session":reviewer.caller.0,"candidate":candidate,"candidate_sha256":candidate["sha256"],
+            "open_required_findings":[{"kind":kind,"id":label}]});
+        let review = put("verdict.json", &verdict);
+        put(
+            &format!(
+                ".octos/page-verdicts/{}.json",
+                review["sha256"].as_str().unwrap()
+            ),
+            &verdict,
+        );
+        json!({"kind":"page_repair_transition","page":"p1","phase":if kind=="native_qa" {"repair"}else{"arbitrate"},
+            "candidate":candidate,"candidate_id":token("candidate",&candidate),"review":review,"verdict_id":token("verdict",&review),"decision":null})
+    };
+    let observe = |s: &InProcessAgentOrchestrator,
+                   peer: &pptx_dispatch::PublicationRouter,
+                   action: &str,
+                   event: &serde_json::Value| {
+        let mut result = json!({"repair_event":event});
+        assert!(peer.observe(s, &peer.caller.0, &json!({"action":action}), &mut result));
+        result["repair_dispatch"].clone()
+    };
+    let confirm = |event: &serde_json::Value, decision: &str| {
+        let mut e = event.clone();
+        let path = format!(
+            ".octos/page-repair-decisions/{}.json",
+            e["review"]["sha256"].as_str().unwrap()
+        );
+        e["decision"] = put(
+            &path,
+            &json!({"peer":arbiter.caller.0,"candidate_id":e["candidate_id"],
+            "verdict_id":e["verdict_id"],"page":"p1","decision":decision}),
+        );
+        e["phase"] = json!(if decision == "confirm" {
+            "repair"
+        } else {
+            "review"
+        });
+        e
+    };
+    let review_action = "page_review_submit";
+    let decision_action = "page_repair_decide";
+    let native = reject("native_qa", "overflow");
+    let first = observe(&scheduler, &reviewer, review_action, &native);
+    assert_eq!(first["status"], "queued", "{first}");
+    assert_eq!(first["peer"], maker.caller.0);
+    assert_eq!(first["supervisor_notified"], true);
+    assert_eq!(drain(&scheduler, &maker.caller), 1);
+    let manual = reject("visible", "clipped");
+    let mut premature = manual.clone();
+    premature["phase"] = json!("repair");
+    assert_eq!(
+        observe(&scheduler, &reviewer, review_action, &premature)["status"],
+        "coordinator_required"
+    );
+    assert_eq!(
+        observe(&scheduler, &maker, review_action, &manual)["status"],
+        "coordinator_required"
+    );
+    assert_eq!(drain(&scheduler, &maker.caller), 0);
+    let first = observe(&scheduler, &reviewer, review_action, &manual);
+    assert_eq!(first["peer"], arbiter.caller.0, "{first}");
+    let id = batch("arbitrate", &arbiter.caller, &candidate, &manual["review"]);
+    assert_eq!(
+        pptx_dispatch::deliver(&scheduler, &workspace, &peers, profile, &owner, &id).unwrap()["assignments"]
+            [0]["status"],
+        "already_dispatched"
+    );
+    assert_eq!(drain(&scheduler, &arbiter.caller), 1);
+    let confirmed = confirm(&manual, "confirm");
+    assert_eq!(
+        observe(&scheduler, &reviewer, decision_action, &confirmed)["status"],
+        "coordinator_required"
+    );
+    assert_eq!(
+        observe(&scheduler, &arbiter, decision_action, &confirmed)["status"],
+        "queued"
+    );
+    assert_eq!(
+        observe(&scheduler, &reviewer, review_action, &manual)["status"],
+        "superseded"
+    );
+    assert_eq!(drain(&scheduler, &maker.caller), 1);
+    let restored = InProcessAgentOrchestrator::default();
+    restored.configure_supervisor_store(&store).unwrap();
+    assert_eq!(
+        observe(&restored, &arbiter, decision_action, &confirmed)["status"],
+        "already_dispatched"
+    );
+    assert_eq!(drain(&restored, &maker.caller), 0);
+    assert_eq!(
+        observe(&restored, &reviewer, review_action, &native)["status"],
+        "superseded"
+    );
+    let disputed = reject("visible", "low-contrast");
+    assert_eq!(
+        observe(&restored, &reviewer, review_action, &disputed)["status"],
+        "queued"
+    );
+    assert_eq!(drain(&restored, &arbiter.caller), 1);
+    let ruling = confirm(&disputed, "dispute");
+    assert_eq!(
+        observe(&restored, &arbiter, decision_action, &ruling)["peer"],
+        reviewer.caller.0
+    );
+    assert_eq!(drain(&restored, &maker.caller), 0);
+    assert_eq!(drain(&restored, &reviewer.caller), 1);
+    let replacement = stage_peer("replacement");
+    route["arbiter_agent"] = json!(replacement.caller.0);
+    put(".octos/pptx-verification-plan.json", &route);
+    let altered = reject("visible", "after-route-edit");
+    assert_eq!(
+        observe(&restored, &reviewer, review_action, &altered)["status"],
+        "coordinator_required"
+    );
+    assert_eq!(drain(&restored, &replacement.caller), 0);
+    let mut accepted = json!({"accepted":true,"quality_approved":false});
+    assert!(!reviewer.observe(
+        &restored,
+        &reviewer.caller.0,
+        &json!({"action":review_action}),
+        &mut accepted
+    ));
+    session_workspaces().remove(profile, &owner);
+    for p in [maker, reviewer, arbiter, replacement] {
+        evict_peer_wire_session(&p.caller);
+    }
+}
+
+#[test]
+fn workflow_activity_import_shards_recover_independently_across_restart() {
+    use octos_workflows::activity::{ActivityAttempt, WorkerExit};
+    use workflow_activity::PeerActivity;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let workspace = root.join("dataset");
+    std::fs::create_dir(&workspace).unwrap();
+    let peers = root.join("peers");
+    let profile = "workflow-activity-import-test";
+    let owner = SessionKey::with_profile(profile, "local", "batch-import");
+    session_workspaces().set_resolved(profile, owner.clone(), workspace.clone(), None);
+    let open = || {
+        let host = InProcessAgentOrchestrator::default();
+        host.configure_supervisor_store(&root.join("supervisor"))
+            .unwrap();
+        host
+    };
+    let host = open();
+    let drain = |host: &InProcessAgentOrchestrator, session: &SessionKey| {
+        host.drain_ready_continuations_for_session(
+            session,
+            profile,
+            MasterContinuationRuntimeState::idle().with_workflow_activities(),
+            8,
+        )
+    };
+    let mut shards = Vec::new();
+    for name in ["shard-a", "shard-b"] {
+        let staged = stage_peer_with_budget(
+            &peers,
+            &workspace,
+            name,
+            Some(name),
+            Some(&owner.0),
+            "Available",
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let peer = SessionKey::with_profile_topic(profile, "local", "batch-import", &staged.topic);
+        peer_wire_registry().register(peer_wire_key(profile, &staged.slug), peer.clone());
+        let stage = PeerCheckpointHandoff::capture(&peers, profile, &peer, &workspace).unwrap();
+        let stream = PathBuf::from(format!("{name}.json"));
+        std::fs::write(root.join(&stream), br#"{"next":"import","events":[]}"#).unwrap();
+        let operation = format!("dataset-v1/{name}");
+        let contract = PeerActivity::bind(
+            root,
+            &stage,
+            ActivityAttempt {
+                operation: operation.clone(),
+                attempt: 0,
+                max_resumes: 1,
+            },
+            stream,
+            "import",
+            "committed",
+            octos_workflows::activity::Admission::Awaited,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        host.enqueue_peer_assignment(
+            "dataset-import",
+            &peer,
+            profile,
+            &stage.slug,
+            &operation,
+            "Import your assigned shard",
+            [],
+            Some(serde_json::to_string(&contract).unwrap()),
+            || Ok(()),
+        )
+        .into_callback_result(name)
+        .unwrap();
+        assert!(
+            host.drain_ready_continuations_for_session(
+                &peer,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                1
+            )
+            .is_empty()
+        );
+        let [work]: [_; 1] = drain(&host, &peer).try_into().unwrap();
+        assert_eq!(contract.preflight(root, &work, &host).unwrap(), None);
+        contract
+            .record_exit(
+                &work,
+                &host,
+                &workflow_activity::WorkerReturn {
+                    exit: WorkerExit::Returned,
+                    turn_id: "fixture-turn".into(),
+                },
+            )
+            .unwrap();
+        contract
+            .record_exit(
+                &work,
+                &host,
+                &workflow_activity::WorkerReturn {
+                    exit: WorkerExit::Returned,
+                    turn_id: "fixture-turn".into(),
+                },
+            )
+            .unwrap();
+        shards.push((peer, contract, work));
+    }
+    // Simulate a verified storage-commit receipt for B while A is outstanding.
+    std::fs::write(
+        root.join("shard-b.json"),
+        br#"{"next":"done","events":[{"kind":"committed","id":"tx-b"}]}"#,
+    )
+    .unwrap();
+    drop(host); // Crash between persisting the return event and acknowledging the worker.
+    let host = open();
+    for (index, (session, _contract, _work)) in shards.iter().enumerate() {
+        let items = drain(&host, session);
+        assert_eq!(
+            items.len(),
+            2,
+            "one original delivery plus one durable worker exit"
+        );
+        for item in items {
+            let contract = PeerActivity::from_item(&item).unwrap().unwrap();
+            let reason = contract.preflight(root, &item, &host).unwrap().unwrap();
+            if item
+                .metadata
+                .contains_key(crate::autonomy::agent_orchestrator::WORKFLOW_EXIT_META)
+            {
+                assert_eq!(
+                    reason,
+                    if index == 0 {
+                        "workflow_successor_durable"
+                    } else {
+                        "workflow_receipt_accepted"
+                    }
+                );
+                assert_eq!(
+                    contract.preflight(root, &item, &host).unwrap(),
+                    Some(reason)
+                );
+            } else {
+                assert_eq!(reason, "workflow_worker_exit_durable");
+            }
+            host.mark_continuation_completed(&item, Some(reason.into()));
+        }
+    }
+    assert!(drain(&host, &shards[1].0).is_empty());
+    assert!(drain(&host, &owner).is_empty());
+    let [retry]: [_; 1] = drain(&host, &shards[0].0).try_into().unwrap();
+    let contract = PeerActivity::from_item(&retry).unwrap().unwrap();
+    assert_eq!(contract.preflight(root, &retry, &host).unwrap(), None);
+    contract
+        .record_exit(
+            &retry,
+            &host,
+            &workflow_activity::WorkerReturn {
+                exit: WorkerExit::Returned,
+                turn_id: "fixture-turn".into(),
+            },
+        )
+        .unwrap();
+    host.mark_continuation_completed(&retry, None);
+    let [end]: [_; 1] = drain(&host, &shards[0].0).try_into().unwrap();
+    let contract = PeerActivity::from_item(&end).unwrap().unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            contract.preflight(root, &end, &host).unwrap(),
+            Some("workflow_activity_blocked")
+        );
+    }
+    host.mark_continuation_completed(&end, None);
+    let [notice]: [_; 1] = drain(&host, &owner).try_into().unwrap();
+    assert!(notice.metadata["envelope"].contains("dataset-v1/shard-a"));
+    assert!(drain(&host, &shards[0].0).is_empty());
+    for (peer, _, _) in shards {
+        evict_peer_wire_session(&peer);
+    }
+    session_workspaces().remove(profile, &owner);
+}
+
+#[test]
+fn workflow_activity_ready_events_target_all_twenty_concurrent_sessions() {
+    use std::{collections::HashSet, sync::Barrier, thread};
+    let root = tempfile::tempdir().unwrap();
+    let host = InProcessAgentOrchestrator::default();
+    host.configure_supervisor_store(root.path()).unwrap();
+    let profile = "ready-event-test";
+    let peers: Vec<_> = (0..20)
+        .map(|n| SessionKey::with_profile(profile, "local", &format!("worker-{n}")))
+        .collect();
+    let mut ready = host.subscribe_ready();
+    let start = Barrier::new(peers.len());
+    thread::scope(|scope| {
+        for peer in &peers {
+            let host = &host;
+            let start = &start;
+            scope.spawn(move || {
+                start.wait();
+                for _ in 0..2 {
+                    host.enqueue_peer_assignment(
+                        "index-partitions",
+                        peer,
+                        profile,
+                        "fixture",
+                        "reindex",
+                        "Index the assigned partition",
+                        [],
+                        None,
+                        || Ok(()),
+                    )
+                    .into_callback_result("fixture")
+                    .unwrap();
+                }
+            });
+        }
+    });
+    let mut signalled = HashSet::new();
+    while let Ok((session, notified_profile)) = ready.try_recv() {
+        assert_eq!(notified_profile, profile);
+        assert!(
+            signalled.insert(session),
+            "duplicate publication woke the same consumer"
+        );
+    }
+    assert_eq!(signalled, peers.into_iter().collect());
 }
