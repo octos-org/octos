@@ -1040,6 +1040,7 @@ fn send_input_request(message: &str, occurrence: &str) -> octos_agent::PeerSendI
         slug: "news".into(),
         message: message.into(),
         occurrence_id: occurrence.into(),
+        inputs: Vec::new(),
     }
 }
 

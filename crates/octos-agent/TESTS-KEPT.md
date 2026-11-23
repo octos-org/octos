@@ -213,3 +213,4 @@
 | `task_inputs::tests::should_report_an_image_no_model_request_can_carry_instead_of_attaching_it` | 5 | An image over the request limit, or in a format models cannot view, is reported unsupported and never called delivered. |
 | `tools::peer_handoff::tests::should_hand_declared_inputs_to_the_host_when_the_handoff_names_them` | 2 | `peer_handoff` offers `inputs` in its schema and passes the parsed declaration to the host. |
 | `tools::peer_handoff::tests::should_stage_nothing_when_the_declared_inputs_are_malformed` | 5 | A malformed declaration fails the handoff before the host stages anything. |
+| `tools::peer_send_input::tests::should_hand_a_messages_declared_inputs_to_the_host_and_send_nothing_malformed` | 2 | `peer_send_input` passes a message's declared inputs to the host and says in its result that they go with the message; a malformed declaration sends nothing. |

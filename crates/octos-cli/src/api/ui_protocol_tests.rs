@@ -413,6 +413,7 @@ async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
         slug,
         "call-x",
         "resume work",
+        Some(r#"["review/round-2.md"]"#.to_owned()),
     );
     assert_eq!(outcome, PeerSendInputEnqueueOutcome::Queued);
     assert_eq!(
@@ -446,6 +447,14 @@ async fn peer_send_input_rehomes_to_reopened_peer_wire_on_reconnect() {
     );
     assert_eq!(drained.len(), 1);
     assert_eq!(master_continuation_prompt(&drained[0]), "resume work");
+    // ...and still carries the files its task declared.
+    assert_eq!(
+        drained[0]
+            .metadata
+            .get(crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_META_INPUTS)
+            .map(String::as_str),
+        Some(r#"["review/round-2.md"]"#)
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -114,6 +114,14 @@ fn has(body: &Value, need: &Need) -> bool {
 /// best a model without the files can do), and answers when it has it all.
 async fn model_needing(needs: Vec<Need>) -> MockServer {
     let server = MockServer::start().await;
+    now_needing(&server, needs).await;
+    server
+}
+
+/// From here on the model behind `server` needs `needs`, and the requests it
+/// has had so far are forgotten.
+async fn now_needing(server: &MockServer, needs: Vec<Need>) {
+    server.reset().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(move |request: &wiremock::Request| {
@@ -163,9 +171,8 @@ async fn model_needing(needs: Vec<Need>) -> MockServer {
                 }))
             }
         })
-        .mount(&server)
+        .mount(server)
         .await;
-    server
 }
 
 /// The chat requests the provider sent, one by one. A provider may also ask
@@ -373,10 +380,11 @@ async fn peer_turn(fx: &Fx, peer: &PeerStagedEvent, text: &str) {
     }
 }
 
-/// What the peer's first message was recorded to carry.
+/// What the peer's latest message that was due inputs was recorded to carry.
 fn recorded(fx: &Fx, peer: &PeerStagedEvent) -> (bool, InputReport) {
-    crate::peers::first_inputs::delivery_record(&fx.data_dir.join("peers"), &peer.slug)
-        .expect("the first turn recorded what it delivered")
+    crate::peers::first_inputs::delivery_records(&fx.data_dir.join("peers"), &peer.slug)
+        .pop()
+        .expect("the turn recorded what it delivered")
 }
 
 fn omit_reason(report: &InputReport, path: &str) -> Option<OmitReason> {
@@ -660,5 +668,248 @@ async fn should_not_read_for_a_peer_what_its_own_session_may_not_read() {
     assert_eq!(
         omit_reason(&report, &outside.to_string_lossy()),
         Some(OmitReason::Denied)
+    );
+}
+
+const PAGE_DATA_V2: &str =
+    r#"{"page":3,"title":"Roadmap","bullets":["Q1 pilot","Q2 rollout in two regions"]}"#;
+
+/// The slide rendered again after that edit: a 1×1 PNG of another colour.
+const PAGE_IMAGE_V2: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xb8, 0x60, 0x60, 0xf0,
+    0x1f, 0x00, 0x05, 0x34, 0x02, 0x30, 0x85, 0xe7, 0x51, 0xa2, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+const REVIEW: &str = "R2-1: the Q2 bullet is cut off at the right edge; R2-2: the title \
+                      overlaps the logo.";
+const REPAIR: &str = "Repair slide 3: fix what review/round-2.md lists, against the current \
+                      pages/page-03.json and renders/page-03.png.";
+
+fn repair_needs() -> Vec<Need> {
+    vec![
+        Need {
+            path: "pages/page-03.json",
+            evidence: PAGE_DATA_V2.to_owned(),
+            image: false,
+        },
+        Need {
+            path: "renders/page-03.png",
+            evidence: image_url(PAGE_IMAGE_V2),
+            image: true,
+        },
+        Need {
+            path: "review/round-2.md",
+            evidence: REVIEW.to_owned(),
+            image: false,
+        },
+    ]
+}
+
+/// A peer named `name` that has made its first draft of the page, from the
+/// data and render its handoff declared, and is open for more input.
+async fn drafted(fx: &Fx, name: &str) -> (PeerStagedEvent, SessionKey) {
+    page_workspace(fx);
+    let (result, peer) = hand_off(
+        fx,
+        name,
+        Some(json!(["pages/page-03.json", "renders/page-03.png"])),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    let peer = peer.unwrap();
+    peer_turn(fx, &peer, BRIEF).await;
+    let session = SessionKey(format!("{}#{}", fx.master.base_key(), peer.topic));
+    register_peer_wire_session(&fx.state, &session);
+    (peer, session)
+}
+
+/// Send `message` to an existing peer as its master's model would: through
+/// the `peer_send_input` tool and the host's delivery.
+async fn send_input(
+    fx: &Fx,
+    peer: &PeerStagedEvent,
+    message: &str,
+    inputs: Value,
+) -> octos_agent::ToolResult {
+    let peers_root = fx.data_dir.join("peers");
+    let origin = fx.master.to_string();
+    let turn = TurnId::new();
+    let tool = octos_agent::PeerSendInputTool::new(Arc::new(move |request| {
+        deliver_peer_send_input("dev", &peers_root, &origin, &turn, request)
+    }));
+    tool.execute(&json!({ "slug": peer.slug, "message": message, "inputs": inputs }))
+        .await
+        .unwrap()
+}
+
+/// Run the peer's queued input as its next turn, as the server's continuation
+/// tick does, and wait until that turn wrote the peer's second result.
+async fn run_queued_input(fx: &Fx, session: &SessionKey, peer: &PeerStagedEvent) {
+    let (ws, mut rx) = ws_connection_for_test(256);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let deadline = std::time::Instant::now() + TURN_BUDGET;
+    // The previous turn's result is on disk a moment before its slot is free.
+    while !maybe_spawn_appui_master_continuation_runner(
+        &ws,
+        &fx.state,
+        &Arc::new(UiProtocolLedger::new(256)),
+        &Arc::new(UiProtocolContractStores::default()),
+        &fx.active,
+        &connection_turns,
+        session.clone(),
+        session.clone(),
+        "dev".to_owned(),
+        ConnectionUiFeatures::stdio_defaults(),
+    )
+    .await
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queued input was never run"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let result = fx
+        .data_dir
+        .join("peers")
+        .join(&peer.slug)
+        .join("result-2.md");
+    while !result.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the input's turn never wrote the peer's result"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// One page's repair round: the peer has made its first draft, the page was
+/// edited and rendered again, a review came back, and the master sends the
+/// repair to the same peer, declaring `inputs`. Returns the requests the
+/// repair's turn made.
+async fn repair_round(name: &str, inputs: Value) -> (Fx, PeerStagedEvent, Vec<Value>) {
+    let fx = fixture(Vec::new(), None).await;
+    let (peer, session) = drafted(&fx, name).await;
+    write(&fx.workspace, "pages/page-03.json", PAGE_DATA_V2);
+    write(&fx.workspace, "renders/page-03.png", PAGE_IMAGE_V2);
+    write(&fx.workspace, "review/round-2.md", REVIEW);
+    now_needing(&fx.server, repair_needs()).await;
+
+    let queued = send_input(&fx, &peer, REPAIR, inputs).await;
+    assert!(queued.success, "{}", queued.output);
+    run_queued_input(&fx, &session, &peer).await;
+    let requests = sent(&fx.server).await;
+    (fx, peer, requests)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_put_a_repair_rounds_new_files_in_the_first_request_of_an_existing_peers_turn() {
+    // Before: the message names the files and the peer's model fetches them.
+    let (_old, _, fetched) = repair_round("Repair Old", Value::Null).await;
+    assert_eq!(rounds_to_have(&fetched, &repair_needs()), Some(2));
+    assert_eq!(read_file_calls(&fetched), 3);
+
+    // Now: the message declares them.
+    let (new, peer, requests) = repair_round(
+        "Repair New",
+        json!([
+            "pages/page-03.json",
+            "renders/page-03.png",
+            "review/round-2.md"
+        ]),
+    )
+    .await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "one model round, and no file fetched: {requests:#?}"
+    );
+    assert_eq!(read_file_calls(&requests), 0);
+    let first = &requests[0];
+    // The first draft's render stays as it was read then; the repair's
+    // message brings the new one, not the old one again.
+    assert_eq!(
+        request_images(first),
+        [image_url(PAGE_IMAGE), image_url(PAGE_IMAGE_V2)]
+    );
+    let text = request_text(first);
+    assert!(text.contains(REPAIR));
+    assert!(text.contains(PAGE_DATA_V2), "the page as it is now");
+    assert!(text.contains(REVIEW), "the review, not its path");
+
+    let records =
+        crate::peers::first_inputs::delivery_records(&new.data_dir.join("peers"), &peer.slug);
+    assert_eq!(records.len(), 2, "the draft's inputs, then the repair's");
+    assert!(records[1].0);
+    assert_eq!(
+        records[1].1.delivered().count(),
+        3,
+        "{}",
+        records[1].1.summary()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_refuse_a_message_whose_required_input_is_missing_and_tell_the_peer_if_it_goes_later()
+ {
+    let fx = fixture(Vec::new(), None).await;
+    let (peer, session) = drafted(&fx, "Repair Missing").await;
+    let pending = || {
+        default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&session, "dev")
+    };
+
+    // Not there when the message is sent: refused, and nothing is queued.
+    let refused = send_input(&fx, &peer, REPAIR, json!(["review/round-2.md"])).await;
+    assert!(!refused.success);
+    assert!(
+        refused.output.contains("input not sent")
+            && refused
+                .output
+                .contains("`review/round-2.md`: NOT ready (required, missing)"),
+        "{}",
+        refused.output
+    );
+    assert_eq!(pending(), 0);
+    // A host app runs its peer's turns itself; nothing would bring the files.
+    let peer_dir = fx.data_dir.join("peers").join(&peer.slug);
+    write(
+        &peer_dir,
+        crate::peers::app_binding::HOST_BINDING_LEAF,
+        "{}",
+    );
+    let refused = send_input(&fx, &peer, REPAIR, json!(["pages/page-03.json"])).await;
+    assert!(
+        refused.output.contains("run by its host app"),
+        "{}",
+        refused.output
+    );
+    assert_eq!(pending(), 0);
+    std::fs::remove_file(peer_dir.join(crate::peers::app_binding::HOST_BINDING_LEAF)).unwrap();
+
+    // There when sent, gone when the peer gets to it: the turn runs, and says so.
+    write(&fx.workspace, "review/round-2.md", REVIEW);
+    let queued = send_input(&fx, &peer, REPAIR, json!(["review/round-2.md"])).await;
+    assert!(queued.success, "{}", queued.output);
+    std::fs::remove_file(fx.workspace.join("review/round-2.md")).unwrap();
+    run_queued_input(&fx, &session, &peer).await;
+
+    let requests = sent(&fx.server).await;
+    assert_eq!(requests.len(), 2, "the draft's turn and the repair's");
+    let text = request_text(&requests[1]);
+    assert!(text.contains(REPAIR));
+    assert!(
+        text.contains("`review/round-2.md` — NOT delivered (required, missing)"),
+        "{text}"
+    );
+    let (delivered, report) = recorded(&fx, &peer);
+    assert!(!delivered);
+    assert_eq!(
+        omit_reason(&report, "review/round-2.md"),
+        Some(OmitReason::Missing)
     );
 }

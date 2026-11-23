@@ -1,11 +1,14 @@
-//! A staged peer's declared task inputs ([`octos_core::task_inputs`]).
+//! A peer's declared task inputs ([`octos_core::task_inputs`]).
 //!
-//! `peer_handoff` may name the files its peer needs to begin. They are checked
-//! against the peer's working directory and recorded beside the brief at
-//! staging; the server then puts them into the first message of the peer's
-//! conversation, whichever client sends that first turn. The reading, the
-//! budget and the report are [`octos_agent::task_inputs`]'s — the resolver a
-//! fleet task's worker uses.
+//! `peer_handoff` may name the files its peer needs to begin, and
+//! `peer_send_input` the files the task in its message needs. Either
+//! declaration is checked against the peer's working directory when it is
+//! made, and travels with what it belongs to: beside the brief, or in the
+//! queue with the message. The server then puts the files into the message
+//! that starts the work — the first of the peer's conversation, or the one
+//! that delivers the input — whichever client sends that turn. The reading,
+//! the budget and the report are [`octos_agent::task_inputs`]'s, the resolver
+//! a fleet task's worker uses.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,8 +30,9 @@ use super::peer_io;
 
 /// The declaration, as the handoff gave it. Written before `brief.md`.
 const DECLARED_LEAF: &str = "inputs.json";
-/// What the peer's first message carried of the declaration.
-const REPORT_LEAF: &str = "inputs-report.json";
+/// What each message that was due inputs carried of them: one JSON line per
+/// turn, oldest first.
+const REPORT_LEAF: &str = "inputs-report.jsonl";
 
 /// Check `inputs` against the peer's working directory and record them in
 /// `peer_dir`. Returns what the check found, or `None` when nothing is
@@ -47,6 +51,57 @@ pub(super) fn record_at_staging(
     if inputs.is_empty() {
         return Ok(None);
     }
+    let report = check_in_working_dir(cwd, fenced, inputs)
+        .map_err(|why| RpcError::invalid_params(format!("peer not staged: {why}")))?;
+    let body = serde_json::to_string(inputs)
+        .map_err(|err| RpcError::internal_error(format!("failed to encode peer inputs: {err}")))?;
+    peer_io::write_peer_file_atomic(peer_dir, DECLARED_LEAF, &body)
+        .map_err(|err| RpcError::internal_error(format!("failed to record peer inputs: {err}")))?;
+    Ok(Some(report))
+}
+
+/// Check the inputs a message to an existing peer declares against that
+/// peer's working directory, and encode them for the queue that carries the
+/// message. `Ok(None)` when it declares none.
+///
+/// As at staging, a required input that is not there refuses the send, while
+/// the sender can still fix it. A peer with no recorded working directory
+/// (staged before the binding was kept) is not checked here; the turn that
+/// delivers the message decides.
+pub(crate) fn check_for_message(
+    peer_dir: &Path,
+    inputs: &[DeclaredInput],
+) -> Result<Option<String>, String> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    if let Some((cwd, fenced)) = working_dir(peer_dir) {
+        check_in_working_dir(&cwd, fenced, inputs)
+            .map_err(|why| format!("input not sent: {why}"))?;
+    }
+    serde_json::to_string(inputs)
+        .map(Some)
+        .map_err(|err| format!("failed to encode the declared inputs: {err}"))
+}
+
+/// Where a staged peer works, and whether that is its own git worktree.
+fn working_dir(peer_dir: &Path) -> Option<(PathBuf, bool)> {
+    let read = |leaf| peer_io::read_peer_file(peer_dir, leaf, peer_io::PEER_FILE_READ_CAP_SMALL);
+    if read("workspace-mode").as_deref().map(str::trim) == Some("fenced") {
+        return Some((peer_dir.join("wt"), true));
+    }
+    let root = read("workspace-root")?;
+    let root = root.trim();
+    (!root.is_empty()).then(|| (PathBuf::from(root), false))
+}
+
+/// What a declaration finds in the working directory of the peer it is for,
+/// or why it cannot go: a required input is not there to deliver.
+fn check_in_working_dir(
+    cwd: &Path,
+    fenced: bool,
+    inputs: &[DeclaredInput],
+) -> Result<InputReport, String> {
     let report = check_declared_inputs(
         inputs,
         InputAuthority::Filesystem {
@@ -63,18 +118,14 @@ pub(super) fn record_at_staging(
         } else {
             ""
         };
-        return Err(RpcError::invalid_params(format!(
-            "peer not staged: a required input cannot be delivered from the peer's working \
-             directory ({}).{fence} Fix the declaration, or mark the input optional.\n{}",
+        return Err(format!(
+            "a required input cannot be delivered from the peer's working directory ({}).{fence} \
+             Fix the declaration, or mark the input optional.\n{}",
             cwd.display(),
             staging_note(&report),
-        )));
+        ));
     }
-    let body = serde_json::to_string(inputs)
-        .map_err(|err| RpcError::internal_error(format!("failed to encode peer inputs: {err}")))?;
-    peer_io::write_peer_file_atomic(peer_dir, DECLARED_LEAF, &body)
-        .map_err(|err| RpcError::internal_error(format!("failed to record peer inputs: {err}")))?;
-    Ok(Some(report))
+    Ok(report)
 }
 
 fn left_to_the_peers_reach(outcome: &InputOutcome) -> bool {
@@ -148,14 +199,18 @@ fn read_declared(peer_dir: &Path) -> Declared {
         Ok(Some(body)) => body,
         Err(err) => return Declared::Unreadable(err.to_string()),
     };
-    let parsed = serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|err| err.to_string())
-        .and_then(|value| parse_declared_inputs(Some(&value)));
-    match parsed {
+    match decode(&body) {
         Ok(inputs) if inputs.is_empty() => Declared::None,
         Ok(inputs) => Declared::Inputs(inputs),
         Err(err) => Declared::Unreadable(err),
     }
+}
+
+/// A recorded or queued declaration, validated again as it is read back.
+fn decode(encoded: &str) -> Result<Vec<DeclaredInput>, String> {
+    serde_json::from_str::<serde_json::Value>(encoded)
+        .map_err(|err| err.to_string())
+        .and_then(|value| parse_declared_inputs(Some(&value)))
 }
 
 /// Whose reach decides what a peer may be given: its own session's, as its
@@ -168,19 +223,30 @@ pub(crate) enum PeerReadAuthority {
     },
 }
 
-/// Put the declared inputs of the peer behind `session` into `message`, the
-/// first message of its conversation.
+/// Which declarations a turn of a peer's session is due.
+pub(crate) struct Due {
+    /// The turn's message is the first of the conversation: the inputs the
+    /// peer was staged with go with it.
+    pub(crate) staged: bool,
+    /// The declaration queued with the `peer_send_input` message this turn
+    /// delivers ([`check_for_message`]); `None` when it declared none.
+    pub(crate) with_message: Option<String>,
+}
+
+/// Put the declared inputs `due` to this turn of the peer behind `session`
+/// into `message`, the message that starts the work.
 ///
-/// A session that is not a staged peer's, or whose peer declared nothing,
+/// A session that is not a staged peer's, or a turn that is due nothing,
 /// leaves `message` as it is. Otherwise `message` gains either the inputs
 /// (each whole, with a manifest of what was delivered and what was left out
 /// and why) or, when a required one could not be delivered, a notice saying
 /// that none were — a peer has no way to report back but to run. What was
 /// decided is recorded beside the peer's brief.
-pub(crate) async fn attach_to_first_message(
+pub(crate) async fn attach_to_message(
     peers_root: &Path,
     session: &SessionKey,
     turn_id: &str,
+    due: Due,
     authority: PeerReadAuthority,
     llm: &Arc<dyn LlmProvider>,
     message: &mut Message,
@@ -194,15 +260,29 @@ pub(crate) async fn attach_to_first_message(
     let Some(peer_dir) = super::staged_peer_dir(peers_root, slug) else {
         return;
     };
-    let inputs = match read_declared(&peer_dir) {
-        Declared::None => return,
-        Declared::Inputs(inputs) => inputs,
-        Declared::Unreadable(error) => {
-            warn!(peer = slug, %error, "peer inputs declaration is unreadable; none delivered");
-            message.content.push_str(&undeclared_notice(&error));
-            return;
+    let mut inputs = Vec::new();
+    let mut unreadable = None;
+    if due.staged {
+        match read_declared(&peer_dir) {
+            Declared::None => {}
+            Declared::Inputs(staged) => inputs.extend(staged),
+            Declared::Unreadable(error) => unreadable = Some(error),
         }
-    };
+    }
+    if let Some(encoded) = &due.with_message {
+        match decode(encoded) {
+            Ok(declared) => inputs.extend(declared),
+            Err(error) => unreadable = Some(error),
+        }
+    }
+    if let Some(error) = unreadable {
+        warn!(peer = slug, %error, "peer inputs declaration is unreadable; none delivered");
+        message.content.push_str(&undeclared_notice(&error));
+        return;
+    }
+    if inputs.is_empty() {
+        return;
+    }
 
     llm.ensure_ready().await;
     let budget_tokens = input_budget_tokens(llm.context_window());
@@ -247,14 +327,14 @@ pub(crate) async fn attach_to_first_message(
         info!(
             peer = slug,
             turn = turn_id,
-            "peer first-turn inputs:\n{}",
+            "peer task inputs:\n{}",
             report.summary()
         );
     } else {
         warn!(
             peer = slug,
             turn = turn_id,
-            "peer first-turn inputs withheld, a required one is undeliverable:\n{}",
+            "peer task inputs withheld, a required one is undeliverable:\n{}",
             report.summary()
         );
     }
@@ -263,8 +343,7 @@ pub(crate) async fn attach_to_first_message(
         "delivered": delivered,
         "report": report,
     });
-    if let Err(error) = peer_io::write_peer_file_atomic(&peer_dir, REPORT_LEAF, &record.to_string())
-    {
+    if let Err(error) = peer_io::append_peer_line(&peer_dir, REPORT_LEAF, &format!("{record}\n")) {
         warn!(peer = slug, %error, "failed to record the peer's input report");
     }
 }
@@ -278,17 +357,23 @@ fn undeclared_notice(why: &str) -> String {
     )
 }
 
-/// What the first message of `slug`'s conversation carried of its declared
-/// inputs: `(delivered, report)`. `None` until that message was composed.
+/// What each message of `slug`'s conversation that was due declared inputs
+/// carried of them, oldest first: `(delivered, report)`.
 #[cfg(test)]
-pub(crate) fn delivery_record(peers_root: &Path, slug: &str) -> Option<(bool, InputReport)> {
-    let dir = super::staged_peer_dir(peers_root, slug)?;
-    let body = peer_io::read_peer_file(&dir, REPORT_LEAF, peer_io::PEER_FILE_READ_CAP_LARGE)?;
-    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
-    Some((
-        value["delivered"].as_bool()?,
-        serde_json::from_value(value["report"].clone()).ok()?,
-    ))
+pub(crate) fn delivery_records(peers_root: &Path, slug: &str) -> Vec<(bool, InputReport)> {
+    let body = super::staged_peer_dir(peers_root, slug).and_then(|dir| {
+        peer_io::read_peer_file(&dir, REPORT_LEAF, peer_io::PEER_FILE_READ_CAP_LARGE)
+    });
+    body.iter()
+        .flat_map(|body| body.lines())
+        .map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            (
+                value["delivered"].as_bool().unwrap(),
+                serde_json::from_value(value["report"].clone()).unwrap(),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
