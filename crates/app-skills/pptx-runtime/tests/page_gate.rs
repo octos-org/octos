@@ -1471,25 +1471,42 @@ fn image_only_roster_shares_the_physical_canvas_before_any_page_is_rendered() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = Context::new(tmp.path()).unwrap();
     ctx.continuation_owner = Some("session:outer".into());
-    image::RgbImage::from_pixel(96, 72, image::Rgb([210, 222, 225])).save_with_format(tmp.path().join("ref.png"), image::ImageFormat::Jpeg).unwrap();
+    image::RgbImage::from_pixel(96, 72, image::Rgb([210, 222, 225]))
+        .save_with_format(tmp.path().join("ref.png"), image::ImageFormat::Jpeg)
+        .unwrap();
     let rows: Vec<_> = ["a", "b"].into_iter().map(|id| json!({"id":id,"spec":format!("{id}.json"),"reference":"ref.png",
         "candidate":format!("{id}-candidate.json"),"review":format!("{id}-review.json"),"maker_session":format!("maker-{id}"),"reviewer_session":format!("review-{id}")})).collect();
     ctx.write_json(".octos/pptx-page-plan.json", &json!({"schema_version":2,"coordinator_session":"outer","rubric":{"visual":100},"pages":rows})).unwrap();
     ctx.execute(json!({"action":"evidence_init","task_id":"image-canvas","stagnant_attempts":3,"deliverables":["final.pptx","qa.json"]})).unwrap();
     let canvas = ctx.json(".octos/pptx-verification-plan.json").unwrap()["canvas"].clone();
-    assert_eq!((canvas["width_px"].as_f64(),canvas["height_px"].as_f64()), (Some(96.),Some(72.)));
+    assert_eq!(
+        (canvas["width_px"].as_f64(), canvas["height_px"].as_f64()),
+        (Some(96.), Some(72.))
+    );
     ctx.execute(json!({"action":"page_assignments"})).unwrap();
     let batch = ctx.json(".octos/pptx-peer-batch.json").unwrap();
     for job in batch["jobs"].as_array().unwrap() {
-        let (_, payload) = job["message"].as_str().unwrap().split_once("Page assignment\n").unwrap();
-        assert_eq!(serde_json::from_str::<Value>(payload).unwrap()["canvas"], canvas);
+        let (_, payload) = job["message"]
+            .as_str()
+            .unwrap()
+            .split_once("Page assignment\n")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).unwrap()["canvas"],
+            canvas
+        );
     }
     ctx.continuation_owner = Some("maker-a".into());
     let mut spec = json!({"schema_version":1,"canvas":{"width_px":96,"height_px":72,"width_in":4,"height_in":3},"styles":{"title":{"font":"Inter","size_pt":10}},
         "pages":[{"id":"a","background":"ref.png","copy":{"title":"Life"},"texts":[{"id":"title","text":"Life","style":"title","box":[0,0,96,60]}]}]});
     ctx.write_json("a.json", &spec).unwrap();
     let run = json!({"action":"cycle","spec":"a.json","page":"a","width":96,"output":"one","freeze_inputs":true,"publish_candidate":true});
-    assert!(ctx.execute(run.clone()).unwrap_err().to_string().contains("frozen deck canvas"));
+    assert!(
+        ctx.execute(run.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("frozen deck canvas")
+    );
     assert!(!tmp.path().join("one").exists());
     spec["canvas"] = canvas;
     ctx.replace_json("a.json", &spec).unwrap();
@@ -1541,19 +1558,30 @@ fn run_twenty_pages(per_page: bool) {
         for (i, job) in prepared["jobs"].as_array().unwrap().iter().enumerate() {
             assert_eq!(job["phase"], "make");
             assert_eq!(job["peer"], format!("maker-{i}"));
-            let (_, data) = job["message"].as_str().unwrap().split_once("Page assignment\n").unwrap();
+            let (_, data) = job["message"]
+                .as_str()
+                .unwrap()
+                .split_once("Page assignment\n")
+                .unwrap();
             let row: Value = serde_json::from_str(data).unwrap();
             assert_eq!(row["page"], format!("slide-{i}"));
             assert_eq!(row["spec"], format!("slide-{i}.json"));
         }
         assert_eq!(ctx.execute(request).unwrap(), batch);
-        let resume = json!({"action":"page_assignments","only_page":"slide-3","resume_after_round":1});
-        assert!(ctx.execute(json!({"action":"page_assignments","resume_after_round":1})).is_err());
+        let resume =
+            json!({"action":"page_assignments","only_page":"slide-3","resume_after_round":1});
+        assert!(
+            ctx.execute(json!({"action":"page_assignments","resume_after_round":1}))
+                .is_err()
+        );
         assert_eq!(ctx.execute(resume.clone()).unwrap()["assignments"], 1);
         let recovery = &ctx.json(path).unwrap()["jobs"][0];
         assert_eq!(recovery["peer"], "maker-3");
         assert_eq!(recovery["resume_after_round"], 1);
-        assert_ne!(ctx.execute(resume).unwrap()["peer_send_input"],batch["peer_send_input"]);
+        assert_ne!(
+            ctx.execute(resume).unwrap()["peer_send_input"],
+            batch["peer_send_input"]
+        );
         let mut wrong = Context::new(root).unwrap();
         wrong.continuation_owner = Some("maker-1".into());
         assert!(wrong.execute(json!({"action":"page_assignments"})).is_err());
@@ -1814,16 +1842,28 @@ fn regional_measurements_use_one_pair_of_originals_without_creating_probe_images
     let req = json!({"action":"compare","before":"source.png","after":"render.png",
         "regions":[{"id":"ink","box":[1,0,1,1]},{"id":"background","box":[0,1,4,1]}],"receipt":"measure.json"});
     let result = ctx.execute(req.clone()).unwrap();
-    assert_eq!(result["regions"][0]["mean_absolute_rgb_error"], json!([30.0,30.0,30.0]));
+    assert_eq!(
+        result["regions"][0]["mean_absolute_rgb_error"],
+        json!([30.0, 30.0, 30.0])
+    );
     assert_eq!(result["regions"][1]["mean_channel_error"], 0.0);
     assert_eq!(result["quality_approved"], false);
     assert_eq!(result["before"], ctx.binding("source.png").unwrap());
-    assert_eq!(ctx.json("measure.json").unwrap()["regions"], result["regions"]);
+    assert_eq!(
+        ctx.json("measure.json").unwrap()["regions"],
+        result["regions"]
+    );
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
-    for regions in [json!([]),json!([{"id":"bad","box":[3,2,1,1]}]),
-        json!([{"id":"bad","box":[4294967295_u32,0,2,1]}]),json!([{"id":"bad","box":[0,0,0,1]}]),
-        json!([{"id":"same","box":[0,0,1,1]},{"id":"same","box":[0,0,1,1]}])] {
-        let mut bad=req.clone(); bad.as_object_mut().unwrap().remove("receipt"); bad["regions"]=regions;
+    for regions in [
+        json!([]),
+        json!([{"id":"bad","box":[3,2,1,1]}]),
+        json!([{"id":"bad","box":[4294967295_u32,0,2,1]}]),
+        json!([{"id":"bad","box":[0,0,0,1]}]),
+        json!([{"id":"same","box":[0,0,1,1]},{"id":"same","box":[0,0,1,1]}]),
+    ] {
+        let mut bad = req.clone();
+        bad.as_object_mut().unwrap().remove("receipt");
+        bad["regions"] = regions;
         assert!(ctx.execute(bad).is_err());
     }
 }
@@ -1833,24 +1873,40 @@ fn verified_repair_requires_a_reproduced_failure_of_the_published_page() {
     let tmp = tempfile::tempdir().unwrap();
     let mut ctx = Context::new(tmp.path()).unwrap();
     image::RgbImage::from_pixel(640, 360, image::Rgb([255, 255, 255]))
-        .save(tmp.path().join("paper.png")).unwrap();
-    ctx.write_json("years.json", &json!({"schema_version":1,
+        .save(tmp.path().join("paper.png"))
+        .unwrap();
+    ctx.write_json(
+        "years.json",
+        &json!({"schema_version":1,
         "canvas":{"width_px":640,"height_px":360,"width_in":12.8,"height_in":7.2},
         "styles":{"body":{"font":"Inter","size_pt":32}},
         "pages":[{"id":"years","background":"paper.png","copy":{"label":"1953 to 1961"},
-            "texts":[{"id":"label","text":"1953 to 1961","style":"body","box":[620,60,280,80]}]}]})).unwrap();
+            "texts":[{"id":"label","text":"1953 to 1961","style":"body","box":[620,60,280,80]}]}]}),
+    )
+    .unwrap();
     ctx.write_json(".octos/pptx-page-plan.json", &json!({"schema_version":2,
         "coordinator_session":"outer","rubric":{"readability":100},"repair_requirements":{"years":"Include both years"},
         "pages":[{"id":"years","maker_session":"maker","reviewer_session":"reviewer","spec":"years.json","candidate":"candidate.json","review":"review.json"}]})).unwrap();
     ctx.continuation_owner = Some("outer".into());
-    ctx.execute(json!({"action":"evidence_init","task_id":"year-overflow","verification_mode":"per_page",
-        "arbiter_agent":"other","deliverables":["final.pptx"],"stagnant_attempts":2})).unwrap();
+    ctx.execute(
+        json!({"action":"evidence_init","task_id":"year-overflow","verification_mode":"per_page",
+        "arbiter_agent":"other","deliverables":["final.pptx"],"stagnant_attempts":2}),
+    )
+    .unwrap();
     ctx.continuation_owner = Some("maker".into());
     let built = ctx.execute(json!({"action":"cycle","spec":"years.json","page":"years","output":"made","publish_candidate":true})).unwrap();
-    let report = ctx.json(ctx.verify(&built["native_qa"]["report"]).unwrap()).unwrap();
+    let report = ctx
+        .json(ctx.verify(&built["native_qa"]["report"]).unwrap())
+        .unwrap();
     let findings = report["findings"].as_array().unwrap();
-    let overflow = findings.iter().find(|f| f["code"]=="INK_OUTSIDE_SLIDE" && f["status"]=="fail").expect("year label crosses the actual slide edge");
-    let unknown = findings.iter().find(|f| f["status"]=="unknown").expect("unverified owner");
+    let overflow = findings
+        .iter()
+        .find(|f| f["code"] == "INK_OUTSIDE_SLIDE" && f["status"] == "fail")
+        .expect("year label crosses the actual slide edge");
+    let unknown = findings
+        .iter()
+        .find(|f| f["status"] == "unknown")
+        .expect("unverified owner");
     let mut rejected = built["peer_review_handoff"]["review_request_template"].clone();
     let v = &mut rejected["verdict"];
     v["accepted"] = json!(false);
@@ -1859,13 +1915,19 @@ fn verified_repair_requires_a_reproduced_failure_of_the_published_page() {
     v["evidence"] = json!([built["native_qa"]["report"]]);
     v["open_required_findings"] = json!([{"kind":"native_qa","id":unknown["id"]}]);
     ctx.continuation_owner = Some("reviewer".into());
-    assert!(ctx.execute(rejected.clone()).unwrap_err().to_string().contains("failed native check"));
+    assert!(
+        ctx.execute(rejected.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("failed native check")
+    );
     assert!(!tmp.path().join("review.json").exists());
     rejected["verdict"]["open_required_findings"] = json!([{"id":"both-years","kind":"requirement","rule":"years","impact":"Second year extends beyond the edge"}]);
     let referred = ctx.execute(rejected.clone()).unwrap();
     assert_eq!(gate(&ctx)["pages"][0]["confirmation_peer"], "other");
     rejected["replaces_verdict_id"] = referred["verdict_id"].clone();
-    rejected["verdict"]["open_required_findings"] = json!([{"kind":"native_qa","id":overflow["id"]}]);
+    rejected["verdict"]["open_required_findings"] =
+        json!([{"kind":"native_qa","id":overflow["id"]}]);
     let current = ctx.execute(rejected).unwrap();
     assert_eq!(current["accepted"], false);
     assert_eq!(referred["repair_event"]["phase"], "arbitrate");
@@ -1886,19 +1948,29 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = Context::new(dir.path()).unwrap();
     image::RgbImage::from_pixel(96, 72, image::Rgb([255, 255, 255]))
-        .save(dir.path().join("paper.png")).unwrap();
+        .save(dir.path().join("paper.png"))
+        .unwrap();
     let spec = |title: &str, labels: &[(&str, &str)]| {
         let mut texts = Vec::new();
         let mut copy = json!({});
-        for (i, (id, text)) in std::iter::once(("title", title)).chain(labels.iter().copied()).enumerate() {
+        for (i, (id, text)) in std::iter::once(("title", title))
+            .chain(labels.iter().copied())
+            .enumerate()
+        {
             texts.push(json!({"id":id,"text":text,"style":"body","box":[2,2+i*15,80,12]}));
             copy[id] = json!(text);
         }
         json!({"schema_version":1,"canvas":{"width_px":96,"height_px":72,"width_in":4,"height_in":3},
             "styles":{"body":{"font":"Inter","size_pt":10}},"pages":[{"id":"p","background":"paper.png","copy":copy,"texts":texts}]})
     };
-    ctx.write_json("original.json", &spec("First", &[("key1", "Alpha"), ("key2", "Beta")])).unwrap();
-    let original = ctx.execute(json!({"action":"cycle","spec":"original.json","output":"original","width":96})).unwrap();
+    ctx.write_json(
+        "original.json",
+        &spec("First", &[("key1", "Alpha"), ("key2", "Beta")]),
+    )
+    .unwrap();
+    let original = ctx
+        .execute(json!({"action":"cycle","spec":"original.json","output":"original","width":96}))
+        .unwrap();
     let reference = &original["renders"]["editable"]["pages"][0];
     ctx.verify(reference).unwrap();
     ctx.write_json("page.json", &spec("First", &[])).unwrap();
@@ -1906,10 +1978,16 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
         "coordinator_session":"outer","rubric":{"content":100},"repair_requirements":{"labels":"Source legend entries must be editable text"},
         "pages":[{"id":"p","maker_session":"maker","reviewer_session":"reviewer","spec":"page.json","reference":reference,"editable_copy":{},"candidate":"candidate.json","review":"review.json"}]})).unwrap();
     ctx.continuation_owner = Some("outer".into());
-    ctx.execute(json!({"action":"evidence_init","task_id":"labels","verification_mode":"per_page",
-        "arbiter_agent":"other","deliverables":["final.pptx"],"stagnant_attempts":2})).unwrap();
-    let cycle = |ctx: &Context, name: &str| ctx.execute(json!({"action":"cycle","spec":"page.json","page":"p",
-        "output":name,"freeze_inputs":true,"publish_candidate":true})).unwrap();
+    ctx.execute(
+        json!({"action":"evidence_init","task_id":"labels","verification_mode":"per_page",
+        "arbiter_agent":"other","deliverables":["final.pptx"],"stagnant_attempts":2}),
+    )
+    .unwrap();
+    let cycle = |ctx: &Context, name: &str| {
+        ctx.execute(json!({"action":"cycle","spec":"page.json","page":"p",
+        "output":name,"freeze_inputs":true,"publish_candidate":true}))
+            .unwrap()
+    };
     ctx.continuation_owner = Some("maker".into());
     let first = cycle(&ctx, "initial");
     let mut reject = first["peer_review_handoff"]["review_request_template"].clone();
@@ -1924,7 +2002,12 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
     v["open_required_findings"] = json!([{"id":"legend","kind":"requirement","rule":"labels",
         "impact":"Diagram labels must remain editable","native_text":{"title":"First"}}]);
     ctx.continuation_owner = Some("reviewer".into());
-    assert!(ctx.execute(reject.clone()).unwrap_err().to_string().contains("already meets"));
+    assert!(
+        ctx.execute(reject.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("already meets")
+    );
     reject["verdict"]["open_required_findings"][0]["native_text"] = json!({"a":"Alpha","b":"Beta"});
     let prior = ctx.execute(reject).unwrap();
     let reviewed = ctx.binding("candidate.json").unwrap();
@@ -1932,46 +2015,93 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
     ctx.execute(json!({"action":"page_repair_decide","page":"p","candidate_id":prior["candidate_id"],
         "verdict_id":prior["verdict_id"],"decision":"confirm","finding_observations":{"legend":"The approved key has both labels, and neither is editable."}})).unwrap();
     ctx.continuation_owner = Some("maker".into());
-    ctx.replace_json("page.json", &spec("Different title", &[])).unwrap();
+    ctx.replace_json("page.json", &spec("Different title", &[]))
+        .unwrap();
     let unrelated = cycle(&ctx, "unrelated");
     let obs = &unrelated["page_publication"]["repair_observation"];
     assert!(unrelated["peer_review_handoff"].is_null());
-    assert_eq!(obs["findings"]["legend"], json!({"changed_from_reviewed":[],"changed_this_attempt":[],"remaining":["a","b"]}));
+    assert_eq!(
+        obs["findings"]["legend"],
+        json!({"changed_from_reviewed":[],"changed_this_attempt":[],"remaining":["a","b"]})
+    );
     assert_eq!(ctx.binding("candidate.json").unwrap(), reviewed);
-    let retry = ctx.execute(json!({"action":"page_publish","page":"p","cycle":"unrelated/cycle.json"})).unwrap();
+    let retry = ctx
+        .execute(json!({"action":"page_publish","page":"p","cycle":"unrelated/cycle.json"}))
+        .unwrap();
     assert_eq!(&retry["repair_observation"], obs);
-    let scope = ctx.execute(json!({"action":"page_gate","only_page":"p"})).unwrap();
-    let receipts = ctx.path(scope["pages"][0]["repair_observations_dir"].as_str().unwrap()).unwrap();
+    let scope = ctx
+        .execute(json!({"action":"page_gate","only_page":"p"}))
+        .unwrap();
+    let receipts = ctx
+        .path(
+            scope["pages"][0]["repair_observations_dir"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
     assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 1);
 
     // Simulate other pages holding both shared locks. Use a bounded wait so that
     // accidentally acquiring the blocking assembly lock fails without hanging CI.
     let (done, done_rx) = std::sync::mpsc::channel();
-    let locks: Vec<_> = [".octos/pptx-progress/publish.lock", ".octos/pptx-peer-batch.lock"]
-        .iter().map(|name| {
-            let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
-                .open(ctx.path(name).unwrap()).unwrap();
-            fs2::FileExt::lock_exclusive(&f).unwrap();
-            f
-        }).collect();
+    let locks: Vec<_> = [
+        ".octos/pptx-progress/publish.lock",
+        ".octos/pptx-peer-batch.lock",
+    ]
+    .iter()
+    .map(|name| {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(ctx.path(name).unwrap())
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&f).unwrap();
+        f
+    })
+    .collect();
     let guard = std::thread::spawn(move || {
-        let local_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let local_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
         drop(locks);
         local_finished
     });
-    ctx.replace_json("page.json", &spec("Different title", &[("a","Alpha"),("b","Wrong")])).unwrap();
+    ctx.replace_json(
+        "page.json",
+        &spec("Different title", &[("a", "Alpha"), ("b", "Wrong")]),
+    )
+    .unwrap();
     let partial = cycle(&ctx, "partial");
-    assert_eq!(partial["page_publication"]["repair_observation"]["findings"]["legend"],
-        json!({"changed_from_reviewed":["a","b"],"changed_this_attempt":["a","b"],"remaining":["b"]}));
+    assert_eq!(
+        partial["page_publication"]["repair_observation"]["findings"]["legend"],
+        json!({"changed_from_reviewed":["a","b"],"changed_this_attempt":["a","b"],"remaining":["b"]})
+    );
     assert!(partial["peer_review_handoff"].is_null());
     assert_eq!(ctx.binding("candidate.json").unwrap(), reviewed);
-    ctx.replace_json("page.json", &spec("Different title", &[("a","Alpha"),("b","Beta")])).unwrap();
+    ctx.replace_json(
+        "page.json",
+        &spec("Different title", &[("a", "Alpha"), ("b", "Beta")]),
+    )
+    .unwrap();
     let fixed = cycle(&ctx, "fixed");
     let _ = done.send(());
-    assert!(guard.join().unwrap(), "repair waited for a different page's shared lock");
-    assert_eq!(fixed["page_publication"]["repair_observation"]["native_text_met"], true);
-    assert_eq!(fixed["page_publication"]["repair_observation"]["findings"]["legend"]["changed_this_attempt"],json!(["b"]));
-    assert_eq!(fixed["page_publication"]["ready_for_independent_review"], true);
+    assert!(
+        guard.join().unwrap(),
+        "repair waited for a different page's shared lock"
+    );
+    assert_eq!(
+        fixed["page_publication"]["repair_observation"]["native_text_met"],
+        true
+    );
+    assert_eq!(
+        fixed["page_publication"]["repair_observation"]["findings"]["legend"]["changed_this_attempt"],
+        json!(["b"])
+    );
+    assert_eq!(
+        fixed["page_publication"]["ready_for_independent_review"],
+        true
+    );
     assert_eq!(fixed["page_publication"]["quality_approved"], false);
     assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 3);
     assert_eq!(gate(&ctx)["pages"][0]["work_stage"], "review");
@@ -1981,16 +2111,28 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
     v["score"] = json!(98);
     v["component_scores"] = json!({"content":98});
     v["source_detail_review"]["scope"] = json!("whole_page");
-    v["source_detail_review"]["resolved_findings"]["legend"] = json!("Both restored native labels are present in the current render.");
-    v["evidence"].as_array_mut().unwrap().push(fixed["native_qa"]["report"].clone());
+    v["source_detail_review"]["resolved_findings"]["legend"] =
+        json!("Both restored native labels are present in the current render.");
+    v["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(fixed["native_qa"]["report"].clone());
     for check in v["delivery_checks"].as_object_mut().unwrap().values_mut() {
         *check = json!({"status":"pass","basis":"Synthetic reviewer observation"});
     }
     ctx.continuation_owner = Some("reviewer".into());
     let accepted = ctx.execute(accept).unwrap();
     assert_eq!(accepted["accepted"], true);
-    let receipt = ctx.json(ctx.verify(&fixed["page_publication"]["repair_observation"]["receipt"]).unwrap()).unwrap();
-    assert_eq!(ctx.json(ctx.verify(&accepted["archive"]).unwrap()).unwrap()["artifact"]["sha256"],receipt["proposed_artifact_sha256"]);
+    let receipt = ctx
+        .json(
+            ctx.verify(&fixed["page_publication"]["repair_observation"]["receipt"])
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        ctx.json(ctx.verify(&accepted["archive"]).unwrap()).unwrap()["artifact"]["sha256"],
+        receipt["proposed_artifact_sha256"]
+    );
 }
 
 #[test]

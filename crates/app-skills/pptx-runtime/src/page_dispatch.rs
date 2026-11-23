@@ -165,7 +165,10 @@ fn audit(gate: &Value, request: &Value) -> Result<Value> {
                     );
                 }
                 if assignment.phase == "arbitrate" {
-                    if let Some(arbiter) = row["confirmation_peer"].as_str().or(gate["arbiter_agent"].as_str()) {
+                    if let Some(arbiter) = row["confirmation_peer"]
+                        .as_str()
+                        .or(gate["arbiter_agent"].as_str())
+                    {
                         ensure!(
                             peer_id == identity(arbiter),
                             "use the frozen arbiter session"

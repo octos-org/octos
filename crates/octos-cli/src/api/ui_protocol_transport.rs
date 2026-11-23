@@ -2,6 +2,8 @@
 
 use octos_core::ui_protocol::user_question_cancelled_reasons;
 
+#[path = "ui_protocol_cover_workflow.rs"]
+mod cover_workflow;
 #[path = "ui_protocol_transport/dto.rs"]
 mod dto;
 #[path = "ui_protocol_durable_delivery.rs"]
@@ -18,20 +20,18 @@ mod im_telegram;
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
+#[path = "ui_protocol_pptx_dispatch.rs"]
+mod pptx_dispatch;
 #[path = "ui_protocol_session_turn_service.rs"]
 mod session_turn_service;
 #[path = "ui_protocol_turn_connection.rs"]
 mod turn_connection;
 #[path = "ui_protocol_persistence.rs"]
 mod ui_protocol_persistence;
-#[path = "ui_protocol_workspace_team.rs"]
-mod workspace_team_rpc;
-#[path = "ui_protocol_pptx_dispatch.rs"]
-mod pptx_dispatch;
 #[path = "ui_protocol_workflow_activity.rs"]
 mod workflow_activity;
-#[path = "ui_protocol_cover_workflow.rs"]
-mod cover_workflow;
+#[path = "ui_protocol_workspace_team.rs"]
+mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
 pub(crate) use dto::*;
 pub(crate) use im_config::start_serve_im;
@@ -6181,7 +6181,8 @@ fn appui_session_keepalive_interval(idle_ttl: std::time::Duration) -> std::time:
 }
 
 #[cfg(test)]
-static TEST_WORKFLOW_EVENTS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEST_WORKFLOW_EVENTS_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn appui_recovery_tick() -> tokio::time::Interval {
     let period = Duration::from_secs(2);
@@ -41448,9 +41449,21 @@ async fn run_standalone_turn(
             let dispatch_profile = session_runtime.profile.profile_id.clone();
             let dispatch_workspace = session_runtime.workspace_root.clone();
             let dispatch_master = session_id.clone();
-            tool_registry.register(octos_agent::PeerSendInputTool::new(send_input).with_answer(answer)
-                .with_page_batch(move |digest| pptx_dispatch::deliver(default_agent_orchestrator(), &dispatch_workspace, &dispatch_root,
-                    &dispatch_profile, &dispatch_master, digest).map_err(|e| e.to_string())));
+            tool_registry.register(
+                octos_agent::PeerSendInputTool::new(send_input)
+                    .with_answer(answer)
+                    .with_page_batch(move |digest| {
+                        pptx_dispatch::deliver(
+                            default_agent_orchestrator(),
+                            &dispatch_workspace,
+                            &dispatch_root,
+                            &dispatch_profile,
+                            &dispatch_master,
+                            digest,
+                        )
+                        .map_err(|e| e.to_string())
+                    }),
+            );
 
             // `peer_close` — retire a running peer the caller created (#1842:
             // the close STOPS it — the callback interrupts its in-flight turn).

@@ -154,11 +154,15 @@ fn slide_count(ctx: &Context, path: &Path) -> Result<usize> {
                 b"sldId" if in_list => count += 1,
                 b"sldSz" if expected.is_some() => {
                     let emu = |key: &str| -> Result<i64> {
-                        let attribute = e.try_get_attribute(key)?.context("PPTX slide size lacks an extent")?;
+                        let attribute = e
+                            .try_get_attribute(key)?
+                            .context("PPTX slide size lacks an extent")?;
                         Ok(std::str::from_utf8(attribute.value.as_ref())?.parse()?)
                     };
                     let actual = [emu("cx")?, emu("cy")?];
-                    size_matches = expected.as_ref().is_some_and(|c| c.physical_emu() == actual);
+                    size_matches = expected
+                        .as_ref()
+                        .is_some_and(|c| c.physical_emu() == actual);
                 }
                 _ => {}
             },
@@ -167,7 +171,10 @@ fn slide_count(ctx: &Context, path: &Path) -> Result<usize> {
             _ => {}
         }
     }
-    ensure!(expected.is_none() || size_matches, "candidate PPTX physical slide size differs from the frozen deck canvas; correct its size before independent review");
+    ensure!(
+        expected.is_none() || size_matches,
+        "candidate PPTX physical slide size differs from the frozen deck canvas; correct its size before independent review"
+    );
     Ok(count)
 }
 fn source_matches(ctx: &Context, actual: &Value, expected: &Value) -> bool {
@@ -326,20 +333,30 @@ pub(crate) fn maker_row<'a>(ctx: &Context, plan: &'a Value, id: &str) -> Result<
 /// Also used before building, so a delayed maker does not write a throwaway deck.
 pub(crate) fn admit_maker_change(ctx: &Context, p: &Value, row: &Value) -> Result<()> {
     let dest = ctx.path(nonempty(row, "candidate")?)?;
-    if !dest.try_exists()? { return Ok(()); }
+    if !dest.try_exists()? {
+        return Ok(());
+    }
     let previous = ctx.binding(dest)?;
     let review_path = ctx.path(nonempty(row, "review")?)?;
     if review_path.try_exists()? {
         let (review, binding) = read_review_head(ctx, p, row)?;
         if review["candidate_sha256"] == previous["sha256"] {
-            ensure!(review["accepted"] != true, "accepted candidate is pinned; independent reviewer must release it before replacement");
-            ensure!(crate::page_verdict::disposition(&review).is_none()
-                && crate::repair_gate::phase(ctx, p, row, &review, &binding)? == "repair",
-                "the rejection has not authorized a maker repair of this candidate");
+            ensure!(
+                review["accepted"] != true,
+                "accepted candidate is pinned; independent reviewer must release it before replacement"
+            );
+            ensure!(
+                crate::page_verdict::disposition(&review).is_none()
+                    && crate::repair_gate::phase(ctx, p, row, &review, &binding)? == "repair",
+                "the rejection has not authorized a maker repair of this candidate"
+            );
             return Ok(());
         }
     }
-    ensure!(page_state(ctx, p, row)["work_stage"] == "make", "the current candidate is awaiting its assigned reviewer; relay the existing handoff and end this assignment");
+    ensure!(
+        page_state(ctx, p, row)["work_stage"] == "make",
+        "the current candidate is awaiting its assigned reviewer; relay the existing handoff and end this assignment"
+    );
     Ok(())
 }
 
@@ -458,13 +475,17 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
                 let (signed, binding) = read_review_head(ctx, &p, row)?;
                 observation = crate::repair_text::observe(ctx, &signed, &binding, &candidate)?;
                 if observation["native_text_met"] == false {
-                    return Ok(json!({"page":id,"candidate_id":null,"ready_for_independent_review":false,
+                    return Ok(
+                        json!({"page":id,"candidate_id":null,"ready_for_independent_review":false,
                         "quality_approved":false,"notification_sent":false,"work_stage":"repair","handoff":null,
-                        "repair_observation":observation,"next":"Fix the remaining native text IDs together on this page, then publish. Keep this assignment."}));
+                        "repair_observation":observation,"next":"Fix the remaining native text IDs together on this page, then publish. Keep this assignment."}),
+                    );
                 }
             }
             ensure!(
-                unchanged || !(review["accepted"] == true && review["candidate_sha256"] == previous["sha256"]),
+                unchanged
+                    || !(review["accepted"] == true
+                        && review["candidate_sha256"] == previous["sha256"]),
                 "accepted candidate is pinned; independent reviewer must release it before replacement"
             );
         }
@@ -493,12 +514,21 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
         publication["handoff"]["review_request_template"] =
             crate::page_verdict::submission_template(&p, id, &candidate_id, prior.as_deref())?;
         crate::source_detail_review::template(
-            ctx, row, &candidate, head.as_ref().map(|h| &h.0),
+            ctx,
+            row,
+            &candidate,
+            head.as_ref().map(|h| &h.0),
             &mut publication["handoff"]["review_request_template"]["verdict"],
         )?;
-        crate::page_source_lines::template(ctx,&candidate,&mut publication["handoff"]["review_request_template"])?;
+        crate::page_source_lines::template(
+            ctx,
+            &candidate,
+            &mut publication["handoff"]["review_request_template"],
+        )?;
     }
-    if !observation.is_null() { publication["repair_observation"] = observation; }
+    if !observation.is_null() {
+        publication["repair_observation"] = observation;
+    }
     Ok(publication)
 }
 
@@ -535,16 +565,17 @@ fn review_for_candidate(
     );
     crate::page_verdict::verify_scores(p, &review)?;
     if review["accepted"] == true
-        && crate::page_source_lines::check_accepted_scope(ctx, &ctx.json(ctx.verify(candidate)?)?)? > 0
+        && crate::page_source_lines::check_accepted_scope(ctx, &ctx.json(ctx.verify(candidate)?)?)?
+            > 0
     {
-            let digest = nonempty(&binding, "sha256")?;
-            ensure!(
-                review["kind"] == crate::page_verdict::KIND
-                    && ctx
-                        .read(format!(".octos/page-verdicts/{digest}.json"))
-                        .is_ok_and(|bytes| crate::fs::digest(&bytes) == digest),
-                "source-line acceptance requires the independent peer's archived page_review_submit receipt"
-            );
+        let digest = nonempty(&binding, "sha256")?;
+        ensure!(
+            review["kind"] == crate::page_verdict::KIND
+                && ctx
+                    .read(format!(".octos/page-verdicts/{digest}.json"))
+                    .is_ok_and(|bytes| crate::fs::digest(&bytes) == digest),
+            "source-line acceptance requires the independent peer's archived page_review_submit receipt"
+        );
     }
     crate::assembly_evidence::validate_page_checks(ctx, &review)?;
     review["score"]
@@ -692,7 +723,10 @@ pub(crate) fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
     }
     state["candidate_current"] = json!(true);
     let result = read_review_head(ctx, p, row).and_then(|head| {
-        if p["schema_version"] == 2 && (head.0["candidate_sha256"] != binding["sha256"] || head.0["source_line_coverage"].is_object()) {
+        if p["schema_version"] == 2
+            && (head.0["candidate_sha256"] != binding["sha256"]
+                || head.0["source_line_coverage"].is_object())
+        {
             // Source discovery can reopen review even on the same candidate.
             state["replaces_verdict_id"] = json!(crate::page_verdict::token("verdict", &head.1)?);
         }
@@ -825,13 +859,23 @@ pub(crate) fn check_scope(ctx: &Context, only_page: Option<&str>) -> Result<Valu
                 prior,
             )?;
             let (candidate, binding) = load_candidate(ctx, row)?;
-            ensure!(binding == state["candidate"], "page changed while preparing the review");
+            ensure!(
+                binding == state["candidate"],
+                "page changed while preparing the review"
+            );
             let head = read_review_head(ctx, &p, row).ok();
             crate::source_detail_review::template(
-                ctx, row, &candidate, head.as_ref().map(|h| &h.0),
+                ctx,
+                row,
+                &candidate,
+                head.as_ref().map(|h| &h.0),
                 &mut result["review_request_template"]["verdict"],
             )?;
-            crate::page_source_lines::template(ctx,&candidate,&mut result["review_request_template"])?;
+            crate::page_source_lines::template(
+                ctx,
+                &candidate,
+                &mut result["review_request_template"],
+            )?;
         }
         return Ok(result);
     }

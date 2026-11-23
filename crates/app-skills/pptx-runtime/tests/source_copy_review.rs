@@ -42,7 +42,10 @@ fn reconstruction_starts_its_makers_without_a_source_review() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = setup(tmp.path(), &["chart", "photo"]);
     let mut plan = ctx.json(PLAN).unwrap();
-    plan["pages"][1].as_object_mut().unwrap().remove("editable_copy");
+    plan["pages"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("editable_copy");
     ctx.replace_json(PLAN, &plan).unwrap();
     init(&ctx).unwrap();
     ctx.execute(json!({"action":"page_assignments"})).unwrap();

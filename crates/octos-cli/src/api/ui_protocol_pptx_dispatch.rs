@@ -429,9 +429,15 @@ impl AssignmentQueue<'_> {
         // cannot mint a new grant when another peer is resumed or re-staged.
         let stage_grants = self.grants(row);
         let grants = stage_grants.as_ref().filter(|_| armed_stage.is_none());
-        if job.phase == "make" && armed_stage.is_none() && let Some((pair,_))=&grants {
-            let intent=super::cover_workflow::advance(root,pair,&job.page,"start","","")?;
-            ensure!(intent=="make","cover page workflow already expects {intent}");
+        if job.phase == "make"
+            && armed_stage.is_none()
+            && let Some((pair, _)) = &grants
+        {
+            let intent = super::cover_workflow::advance(root, pair, &job.page, "start", "", "")?;
+            ensure!(
+                intent == "make",
+                "cover page workflow already expects {intent}"
+            );
         }
         let activity = if job.phase == "prepare_review" {
             None
@@ -607,9 +613,13 @@ impl PublicationRouter {
                 return Ok(json!({"status":"already_reviewed","peer":reviewer_name}));
             }
         }
-        let pair=review_grant(page,&binding,&self.stage,&stage);
-        let phase=super::cover_workflow::advance(&self.root,&pair,page,"candidate",id,"published")?;
-        ensure!(phase=="review","unexpected candidate continuation: {phase}");
+        let pair = review_grant(page, &binding, &self.stage, &stage);
+        let phase =
+            super::cover_workflow::advance(&self.root, &pair, page, "candidate", id, "published")?;
+        ensure!(
+            phase == "review",
+            "unexpected candidate continuation: {phase}"
+        );
         let message = format!(
             "Apply the PPTX skill, shared brief, page instructions and frozen rubric from the bound plan. Use page_gate(only_page) and verify the candidate_id. Inspect this exact editable PPTX and its render. For reconstruction, compare the render directly with the original reference. Record material discrepancies with their location, expected result and actual result, including items absent from the production checklist. On repair, verify the previous findings and check for regressions. Sign using the review_request_template. Return if the candidate has been superseded.\n\nPage assignment\n{}",
             json!({"page":page,"phase":"review","candidate_id":id,"plan":binding})
@@ -794,22 +804,46 @@ impl PublicationRouter {
         );
         let manual = findings.any(|finding| finding["kind"] != "native_qa");
         let decision = decision.as_ref().and_then(|d| d["decision"].as_str());
-        let (kind,outcome,receipt_id) = if action == "page_repair_decide" {
-            ("decision",decision.ok_or_else(||eyre!("missing decision"))?,event["decision"]["sha256"].as_str().ok_or_else(||eyre!("missing decision hash"))?)
+        let (kind, outcome, receipt_id) = if action == "page_repair_decide" {
+            (
+                "decision",
+                decision.ok_or_else(|| eyre!("missing decision"))?,
+                event["decision"]["sha256"]
+                    .as_str()
+                    .ok_or_else(|| eyre!("missing decision hash"))?,
+            )
         } else {
-            ("verdict", if manual {"manual"} else {"native"}, id.as_str())
+            (
+                "verdict",
+                if manual { "manual" } else { "native" },
+                id.as_str(),
+            )
         };
-        let required_phase=match (manual,decision) {
-            (false,None) | (true,Some("confirm")) => "repair",
-            (true,None) => "arbitrate",
-            (true,Some("dispute")) => "review",
+        let required_phase = match (manual, decision) {
+            (false, None) | (true, Some("confirm")) => "repair",
+            (true, None) => "arbitrate",
+            (true, Some("dispute")) => "review",
             _ => eyre::bail!("invalid verified decision"),
         };
-        ensure!(phase==required_phase,"native disposition differs from signed evidence");
-        let cid=revision_id("candidate",&candidate);
-        let intent=super::cover_workflow::advance_bound(&self.root,&pair,page,kind,receipt_id,outcome,Some((&cid,Some(&id))))?;
-        ensure!(intent==phase,"native gate and cover workflow disagree: {phase} vs {intent}");
-        let phase=intent.as_str();
+        ensure!(
+            phase == required_phase,
+            "native disposition differs from signed evidence"
+        );
+        let cid = revision_id("candidate", &candidate);
+        let intent = super::cover_workflow::advance_bound(
+            &self.root,
+            &pair,
+            page,
+            kind,
+            receipt_id,
+            outcome,
+            Some((&cid, Some(&id))),
+        )?;
+        ensure!(
+            intent == phase,
+            "native gate and cover workflow disagree: {phase} vs {intent}"
+        );
+        let phase = intent.as_str();
         let (name, target, instruction) = match (phase, manual, decision) {
             ("repair", false, None) | ("repair", true, Some("confirm")) => (
                 maker_name,
@@ -862,31 +896,92 @@ impl PublicationRouter {
         Ok(json!({"status":status,"phase":phase,"peer":name,"supervisor_notified":notified}))
     }
 
-    fn accept_cover(&self,scheduler:&InProcessAgentOrchestrator,result:&Value)->Result<Value>{
+    fn accept_cover(
+        &self,
+        scheduler: &InProcessAgentOrchestrator,
+        result: &Value,
+    ) -> Result<Value> {
         self.check_caller()?;
-        let workspace=&self.stage.workspace;let master=&self.stage.master;
-        let (plan,binding,route)=frozen_plan(workspace,master)?;
-        let queue=AssignmentQueue{scheduler,workspace,root:&self.root,profile:&self.profile,master,binding:&binding,plan:&plan,route:&route};
-        let page=result["page"].as_str().ok_or_else(||eyre!("missing page"))?;
-        let row=plan["pages"].as_array().and_then(|v|v.iter().find(|r|r["id"]==page)).ok_or_else(||eyre!("missing roster row"))?;
-        let reviewer=queue.stage_for(row["reviewer_session"].as_str().ok_or_else(||eyre!("missing reviewer"))?).ok_or_else(||eyre!("missing reviewer stage"))?;
-        ensure!(reviewer==self.stage,"wrong reviewer");
-        let maker=queue.stage_for(row["maker_session"].as_str().ok_or_else(||eyre!("missing maker"))?).ok_or_else(||eyre!("missing maker stage"))?;
-        let pair=review_grant(page,&binding,&maker,&reviewer);
-        ensure!(maker!=reviewer && scheduler.pptx_review_route_admitted(&pair)?,"unarmed page");
-        let bytes=head_bytes(workspace,&row["review"])?.ok_or_else(||eyre!("missing review"))?;
-        let hash=digest(&bytes); let verdict:Value=serde_json::from_slice(&bytes)?;
-        let candidate=current_head(workspace,&row["candidate"])?.ok_or_else(||eyre!("missing candidate"))?;
-        let id=revision_id("verdict",&hash);
-        ensure!(result["verdict_id"]==id && result["candidate_id"]==revision_id("candidate",&candidate)
-            && verdict["accepted"]==true && verdict["page_id"]==page && verdict["candidate_sha256"]==candidate
-            && verdict["reviewer_session"].as_str().map(identity)==Some(self.caller.0.as_str())
-            && current_head(workspace,&json!(format!(".octos/page-verdicts/{hash}.json")))?.as_ref()==Some(&hash),"stale or unbound verdict");
-        let cid=revision_id("candidate",&candidate);
-        let next=super::cover_workflow::advance_bound(&self.root,&pair,page,"verdict",&id,"approved",Some((&cid,None)))?;
-        ensure!(next=="complete","workflow expected {next}");
-        let note=format!("OctoScript page workflow complete for {page}; independent native verdict {id}. Assemble and verify the requested delivery.");
-        let notice=self.stage.publish(scheduler,&self.root,&self.caller,&self.turn,&note,&id);
+        let workspace = &self.stage.workspace;
+        let master = &self.stage.master;
+        let (plan, binding, route) = frozen_plan(workspace, master)?;
+        let queue = AssignmentQueue {
+            scheduler,
+            workspace,
+            root: &self.root,
+            profile: &self.profile,
+            master,
+            binding: &binding,
+            plan: &plan,
+            route: &route,
+        };
+        let page = result["page"]
+            .as_str()
+            .ok_or_else(|| eyre!("missing page"))?;
+        let row = plan["pages"]
+            .as_array()
+            .and_then(|v| v.iter().find(|r| r["id"] == page))
+            .ok_or_else(|| eyre!("missing roster row"))?;
+        let reviewer = queue
+            .stage_for(
+                row["reviewer_session"]
+                    .as_str()
+                    .ok_or_else(|| eyre!("missing reviewer"))?,
+            )
+            .ok_or_else(|| eyre!("missing reviewer stage"))?;
+        ensure!(reviewer == self.stage, "wrong reviewer");
+        let maker = queue
+            .stage_for(
+                row["maker_session"]
+                    .as_str()
+                    .ok_or_else(|| eyre!("missing maker"))?,
+            )
+            .ok_or_else(|| eyre!("missing maker stage"))?;
+        let pair = review_grant(page, &binding, &maker, &reviewer);
+        ensure!(
+            maker != reviewer && scheduler.pptx_review_route_admitted(&pair)?,
+            "unarmed page"
+        );
+        let bytes =
+            head_bytes(workspace, &row["review"])?.ok_or_else(|| eyre!("missing review"))?;
+        let hash = digest(&bytes);
+        let verdict: Value = serde_json::from_slice(&bytes)?;
+        let candidate = current_head(workspace, &row["candidate"])?
+            .ok_or_else(|| eyre!("missing candidate"))?;
+        let id = revision_id("verdict", &hash);
+        ensure!(
+            result["verdict_id"] == id
+                && result["candidate_id"] == revision_id("candidate", &candidate)
+                && verdict["accepted"] == true
+                && verdict["page_id"] == page
+                && verdict["candidate_sha256"] == candidate
+                && verdict["reviewer_session"].as_str().map(identity)
+                    == Some(self.caller.0.as_str())
+                && current_head(
+                    workspace,
+                    &json!(format!(".octos/page-verdicts/{hash}.json"))
+                )?
+                .as_ref()
+                    == Some(&hash),
+            "stale or unbound verdict"
+        );
+        let cid = revision_id("candidate", &candidate);
+        let next = super::cover_workflow::advance_bound(
+            &self.root,
+            &pair,
+            page,
+            "verdict",
+            &id,
+            "approved",
+            Some((&cid, None)),
+        )?;
+        ensure!(next == "complete", "workflow expected {next}");
+        let note = format!(
+            "OctoScript page workflow complete for {page}; independent native verdict {id}. Assemble and verify the requested delivery."
+        );
+        let notice =
+            self.stage
+                .publish(scheduler, &self.root, &self.caller, &self.turn, &note, &id);
         Ok(json!({"status":"complete","supervisor_notified":notice.is_ok()}))
     }
 
@@ -925,9 +1020,15 @@ impl PublicationRouter {
         request: &Value,
         result: &mut Value,
     ) -> bool {
-        if request["action"]=="page_review_submit" && result["accepted"]==true && result["verdict_id"].is_string() && result["candidate_id"].is_string() {
-            let receipt=self.accept_cover(scheduler,result).unwrap_or_else(|e|json!({"status":"coordinator_required","reason":e.to_string()}));
-            result["cover_workflow"]=receipt;
+        if request["action"] == "page_review_submit"
+            && result["accepted"] == true
+            && result["verdict_id"].is_string()
+            && result["candidate_id"].is_string()
+        {
+            let receipt = self.accept_cover(scheduler, result).unwrap_or_else(
+                |e| json!({"status":"coordinator_required","reason":e.to_string()}),
+            );
+            result["cover_workflow"] = receipt;
             return true;
         }
         if let Some(action @ ("page_review_submit" | "page_repair_decide")) =

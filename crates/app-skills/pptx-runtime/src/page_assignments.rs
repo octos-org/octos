@@ -30,7 +30,10 @@ pub(crate) fn should_snapshot_build(
         return Ok(false);
     }
     let plan = page_gate::plan(ctx)?;
-    let Some(row) = plan["pages"].as_array().and_then(|rows| rows.iter().find(|row| row["id"] == id)) else {
+    let Some(row) = plan["pages"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+    else {
         return Ok(false);
     };
     if row["maker_session"].as_str().map(page_gate::identity) != Some(page_gate::identity(owner)) {
@@ -123,7 +126,7 @@ pub(crate) fn prepare(ctx: &Context, request: &Value) -> Result<Value> {
                     referral["peer"] = peer.clone();
                     referral["request"] = json!({"action":"page_repair_decide","page":id,"candidate_id":state["candidate_id"],"verdict_id":state["verdict_id"]});
                     referral["review_path"] = row["review"].clone();
-                    referral["required"] = json!(["decision","finding_observations"]);
+                    referral["required"] = json!(["decision", "finding_observations"]);
                 }
                 specialist.push(referral);
                 continue;
@@ -174,7 +177,8 @@ pub(crate) fn prepare(ctx: &Context, request: &Value) -> Result<Value> {
             let message = format!(
                 "{}\n\nPage assignment\n{}",
                 match *phase {
-                    "arbitrate" => "Independently inspect every manual finding against the current candidate. Check page_gate(only_page) and sign page_repair_decide with both revision IDs and a finding_observations entry per manual finding. Follow the host dispatch receipt.",
+                    "arbitrate" =>
+                        "Independently inspect every manual finding against the current candidate. Check page_gate(only_page) and sign page_repair_decide with both revision IDs and a finding_observations entry per manual finding. Follow the host dispatch receipt.",
                     _ if maker => MAKER.trim(),
                     _ => REVIEWER.trim(),
                 },
@@ -212,7 +216,9 @@ pub(crate) fn prepare(ctx: &Context, request: &Value) -> Result<Value> {
     let mut receipt = json!({"peer_send_input":{"pptx_batch":fs::digest(&bytes)},"assignments":jobs.len(),"specialist_pages":specialist,"dispatched":false});
     if let Some(id) = only {
         receipt["only_page"] = json!(id);
-        receipt["before_wait"] = json!("Reconcile with page_assignments without only_page and dispatch its batch before waiting. This receipt covers one page.");
+        receipt["before_wait"] = json!(
+            "Reconcile with page_assignments without only_page and dispatch its batch before waiting. This receipt covers one page."
+        );
     }
     Ok(receipt)
 }

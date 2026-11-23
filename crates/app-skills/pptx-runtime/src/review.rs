@@ -703,7 +703,9 @@ pub fn compare(ctx: &Context, r: &Value) -> Result<Value> {
 /// A source can have a PNG filename and a JPEG payload. Inspect the header
 /// without allocating a decoded page when only pixel dimensions are needed.
 pub(crate) fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
-    Ok(image::ImageReader::open(path)?.with_guessed_format()?.into_dimensions()?)
+    Ok(image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .into_dimensions()?)
 }
 
 pub fn load_image(ctx: &Context, path: &Path) -> Result<image::DynamicImage> {
