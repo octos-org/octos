@@ -2785,3 +2785,42 @@ async fn should_stamp_peer_wake_as_automated_event_and_dedupe_replays() {
         "drain closes the wake gap exactly once"
     );
 }
+
+/// A restarted server knows the folder scope of a session — it is restored
+/// from the scopes file at boot — but not the folder itself, which only a
+/// `session/open` publishes. A keeper waiting on that session must still get
+/// its folder back, or it never runs while nobody is connected.
+#[test]
+fn should_seed_a_keepers_folder_only_when_it_agrees_with_the_scope_of_its_session() {
+    let workspaces = SessionWorkspaceStore::default();
+    let orchestrator = InProcessAgentOrchestrator::default();
+    let seed = |wire: &SessionKey, scope: &str, root: &str| FleetKeeperSeed {
+        wire: wire.clone(),
+        scope: Some(scope.to_owned()),
+        root: root.to_owned(),
+        workspace_has_runtime_hint: None,
+    };
+    let folder = |wire: &SessionKey| workspaces.get(&workspace_profile_scope(None, wire), wire);
+
+    // What a restart leaves behind: the scope, and no folder.
+    let restored = SessionKey("_main:api:restored".to_owned());
+    orchestrator.set_goal_scope(&restored, Some("aaaa".to_owned()));
+    // The keeper of another folder does not bring its folder to this session.
+    let other = vec![seed(&restored, "bbbb", "/b")];
+    reseed_fleet_keeper_candidates(&workspaces, &orchestrator, other);
+    assert_eq!(folder(&restored), None);
+    // The keeper of the session's own folder does.
+    let own = vec![seed(&restored, "aaaa", "/a")];
+    reseed_fleet_keeper_candidates(&workspaces, &orchestrator, own);
+    assert_eq!(folder(&restored), Some(PathBuf::from("/a")));
+    assert_eq!(orchestrator.goal_scope(&restored).as_deref(), Some("aaaa"));
+
+    // A session that already has a folder is never given a scope.
+    let live = SessionKey("_main:api:live".to_owned());
+    let profile = workspace_profile_scope(None, &live);
+    workspaces.set_resolved(&profile, live.clone(), PathBuf::from("/live"), None);
+    let scoped = vec![seed(&live, "aaaa", "/a")];
+    reseed_fleet_keeper_candidates(&workspaces, &orchestrator, scoped);
+    assert_eq!(folder(&live), Some(PathBuf::from("/live")));
+    assert_eq!(orchestrator.goal_scope(&live), None);
+}
