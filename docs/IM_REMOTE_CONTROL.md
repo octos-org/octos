@@ -155,7 +155,27 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
   - 每个调用都带 `BoundChat`：`BoundProfile` 是本 server 服务的 profile；session 必须是这个 profile 的、已存在且可用的 Chat，带 profile 前缀、不带 topic。Code session 不能绑定。没有 `Option` profile，不退到 `_main`，不跨 profile 查找，也不改开别的 session。
   - turn_id 由调用方给。`start` 先在 profile 数据目录（`external_turns/`）落盘这个 id，再启动 turn；同一 id 再来时，返回第一次的结果，不再执行。重启后 `reconcile` 按精确 turn_id 报告每个已记录的 turn：未开始、运行中、已结束，或被重启打断（ledger 重载时补的 `orphaned_by_restart`，不重跑）。不按摘要或时间窗猜测。
   - turn 是 external（UPCR-2026-036）：只保留 external 工具白名单；别处授予的 session 级批准对它不生效；它只能停、只能批自己的 turn 和审批，批准时请求的 scope 一律丢弃。
-- 还没有调用方。fake Channel 绑定核心是 T-0653，配置和单 owner 是 T-0654；附件、IM 审批 UI、持久 outbox 都不在这一刀。
+- 第一个调用方是第二刀 b 的 bridge 核心（T-0653）；配置和单 owner 是 T-0654。附件、IM 审批 UI 和持久 outbox 都不在这一刀。
+
+第二刀 b（T-0653，按 T-0633 评审的 B1–B5 和 P2 出站归属、撤销收窄）：
+
+- **`ServeImBridge`**（`ui_protocol_im_bridge.rs`）：一个 bot 账号（`ImChannelId`：平台加 bot 的数字 id）上，与 bot 的私聊驱动一个既有 Chat。turn 都经 `ExternalTurns` 启动，所以是 external、只写 ledger。
+- **binding**：binding 写死 channel、chat、sender 和目标 `BoundChat`（`BoundProfile` 加规范 SessionKey），id 都是平台的数字 id。构造 bridge 时拒绝以下配置：
+  - 允许名单为空，或 binding 的 sender 不在名单里；
+  - sender 是 Telegram 的共享账号（777000、GroupAnonymousBot、Channel_Bot）；
+  - binding 在别的 channel 上；
+  - 同一 chat 绑两次，或同一 session 绑给两个 chat。
+- **消息**：以下情况都在 chat 里回复拒绝，什么都不执行：
+  - chat 未知（包括已撤销的）、不是私聊；
+  - sender 不是 binding 的那个人，或不是一个人（bot、以 chat 名义发的消息）；
+  - 没有平台 message id（按钮回调没有，bridge 不替它编一个）；
+  - 没有平台发送时间，或按平台时间已超过 TTL（不用 bridge 收件时间）；
+  - 带附件、空文本、未知命令。
+  命令只有 `/status` 和 `/stop`。`/stop` 只停 bridge 自己的、由比它更早的消息起的 turn。平台 message id 在一个 chat 里随发送顺序增长，所以迟到的 `/stop` 停不到它之后才发的消息。每条 `/stop` 的决定（停哪个 turn，或什么都不停）都先写进 profile 数据目录的 `im_bridge_stops/` 再执行。bridge 的 TTL 最多 24 小时（Telegram 未确认的 update 保留 24 小时），超过就拒绝建 bridge。每个决定保留到它的平台时间加 24 小时，过了才清掉。这样无论哪个 bridge、TTL 多长、重启前后或 TTL 调大，都不会接受一条决定已被清掉的 `/stop`；平台与本机的时钟差也不影响。同一条 `/stop` 再来（包括重启后），bridge 看到已有决定就什么都不做；晚到的更早消息起的 turn 也不会被它停掉。
+- **删除的 Chat**：`ExternalTurns::start` 准入前重新确认 Chat 还在，删了就拒绝。准入之后、turn 建 runtime 之前才删的，由 `LedgerConnection` 的 `chats_only` 兜住：runtime 按当时的 chat 记录构建，不是 chat 就以 `runtime_unavailable` 结束，模型和工具都不跑，不会当普通 session 跑。
+- **幂等**：turn_id 由 channel、chat、sender 和平台 message id 哈希得出。重投的消息（重启前后都一样）对应已有的 turn，什么都不执行，也不回复。来源只留在 bridge，模型和 ledger 只看到文本。
+- **出站**：结果回复到原消息。binding 撤销后，结果不再发出。发送失败不重发；这时 turn 的记录保留，留给以后的 outbox 对账。发出或撤销后才 `acknowledge`。
+- serve 里还没有调用方。真实渠道（bus 带出平台时间、数字 id 和 sender 类别）、配置、附件、IM 审批、离线 outbox 和群聊都是后面的刀。
 
 ## 15. 待 Claude / shu 定（本文不擅自决定）
 

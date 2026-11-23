@@ -8,6 +8,8 @@ mod dto;
 mod durable_delivery;
 #[path = "ui_protocol_external_turns.rs"]
 mod external_turns;
+#[path = "ui_protocol_im_bridge.rs"]
+mod im_bridge;
 #[path = "ui_protocol_memory_entries.rs"]
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
@@ -38539,6 +38541,27 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             Some(("session_binding_closed", &reason)),
+            None,
+            steer_buffer.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_or_else(report_terminal_delivery_error);
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
+    // T-0653: the runtime was just built from the live chat record. A
+    // connection that may drive only chats does not run in a session that is
+    // no longer one, as a chat deleted after its turn was admitted is.
+    if ws.chats_only() && session_runtime.chat_root.is_none() {
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_unavailable", "the session is no longer a chat")),
             None,
             steer_buffer.as_ref(),
             None,
