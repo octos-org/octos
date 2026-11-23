@@ -145,3 +145,12 @@
 | 删除的重复测试 | 等价保留覆盖 | 场景级等价依据 |
 |---|---|---|
 | `secret_redaction::tests::should_keep_env_references_and_empty_strings_when_key_is_credential_named` | `secret_redaction::tests::should_keep_symbolic_reference_when_key_is_credential_named` | 守护维度同为「credential 命名字段下的符号/占位/空值引用必须原样保留」；被删测试的 4 个单元（`${VAR}`、`$VAR`、空串、`<your-*>`）与保留测试表中同类单元（`apiKey: ${OPENAI_API_KEY}`、`secret: $GITHUB_TOKEN`、`private_key: ""`、`passwd: <your-api-key>`）覆盖相同的行为维度，是严格子集。 |
+
+## Declared task inputs (UPCR-2026-RBC0874AA)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `task_inputs::tests::should_read_a_bare_path_as_a_required_input_when_parsing_a_declaration` | 5 | A bare path is a required input; the object form sets kind, optionality and the content pin. |
+| `task_inputs::tests::should_refuse_a_declaration_when_it_is_malformed` | 3 | A declaration that is not a list, lacks a path, or has an unknown field or a bad pin is refused naming the entry, never read as "no inputs". |
+| `task_inputs::tests::should_persist_a_plain_required_input_as_its_path_alone` | 4 | A persisted declaration round-trips, and a plain required input stays a bare path. |
+| `task_inputs::tests::should_name_every_input_and_its_reason_in_the_report_summary` | 5 | The report names every declared input as delivered or with its omission reason; none is dropped from it. |

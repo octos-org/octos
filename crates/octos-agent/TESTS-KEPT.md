@@ -195,3 +195,21 @@
 | tests/spawn_only_interrupt_cancellation.rs::supervisor_cancel_aborts_running_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/spawn_only_interrupt_cancellation.rs::cancel_runs_terminal_teardown_for_routed_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/validator_runner.rs::windows_command_validator_fails_closed_when_appcontainer_helper_vanished | 4 | Windows AppContainer helper 缺失时 fail-closed，marker 证明不 raw host spawn |
+
+## Declared task inputs (UPCR-2026-RBC0874AA)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `task_inputs::tests::should_deliver_text_data_and_an_image_whole_when_they_fit` | 5 | Text, data and an image are each delivered whole, with a digest and a manifest line; the image as frozen media. |
+| `task_inputs::tests::should_deny_a_path_the_worker_may_not_read` | 3 | A path outside the worker's filesystem authority is left out as denied and never read. |
+| `task_inputs::tests::should_hold_a_session_worker_to_its_session_scope` | 3 | A session worker's inputs are held to that session's scope, as its file tools are. |
+| `task_inputs::tests::should_leave_out_whole_optional_inputs_when_the_budget_runs_out` | 5 | Over budget, an optional input is left out whole with the reason; nothing is cut to fit. |
+| `task_inputs::tests::should_say_an_image_is_unsupported_when_the_model_takes_no_images` | 5 | An image for a model that takes none is reported unsupported, not attached. |
+| `task_inputs::tests::should_deliver_a_file_once_when_it_is_declared_twice` | 4 | A file declared twice is delivered once; the repeat is reported as a duplicate. |
+| `task_inputs::tests::should_require_a_file_when_any_of_its_declarations_does` | 5 | A file is required when any declaration of it is. |
+| `task_inputs::tests::should_refuse_what_it_cannot_deliver_in_the_declared_form` | 5 | A file that cannot be delivered as the declared kind is refused with the reason, not coerced. |
+| `task_inputs::tests::should_fence_a_file_so_its_own_fences_cannot_end_it` | 3 | A delivered file's own code fences cannot close its block and pass as instructions. |
+| `task_inputs::tests::should_append_inputs_to_the_brief_when_attaching` | 4 | Attaching leaves the brief intact and adds the inputs and their media after it. |
+| `task_inputs::tests::should_report_an_image_no_model_request_can_carry_instead_of_attaching_it` | 5 | An image over the request limit, or in a format models cannot view, is reported unsupported and never called delivered. |
+| `tools::peer_handoff::tests::should_hand_declared_inputs_to_the_host_when_the_handoff_names_them` | 2 | `peer_handoff` offers `inputs` in its schema and passes the parsed declaration to the host. |
+| `tools::peer_handoff::tests::should_stage_nothing_when_the_declared_inputs_are_malformed` | 5 | A malformed declaration fails the handoff before the host stages anything. |
