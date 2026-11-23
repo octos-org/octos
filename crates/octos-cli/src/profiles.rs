@@ -3031,6 +3031,8 @@ pub(crate) fn config_from_profile(
         // Startup CLI-flag defaults are not sourced from profile JSON — a
         // flattened profile Config always starts with an empty `cli` block.
         cli: Default::default(),
+        // `serve.im` is the serve config's alone; a profile has no say in it.
+        serve: None,
     }
 }
 

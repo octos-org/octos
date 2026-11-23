@@ -11,6 +11,8 @@ use std::sync::atomic::AtomicBool;
 use octos_bus::{ChannelManager, SessionManager};
 use tokio::sync::{Mutex, Notify};
 
+#[cfg(feature = "telegram")]
+use crate::bot_owner::BotOwner;
 use crate::config::ChannelEntry;
 
 #[cfg(feature = "api")]
@@ -75,6 +77,15 @@ pub type TaskCancelCb = Arc<dyn Fn(&str) -> octos_bus::TaskCancelOutcome + Send 
 pub type TaskRelaunchCb =
     Arc<dyn Fn(&str, Option<&str>) -> octos_bus::TaskRelaunchOutcome + Send + Sync>;
 
+/// The bots a gateway's channels consume (T-0654): where their locks are,
+/// who this gateway is, and the locks it holds while it runs.
+#[cfg(feature = "telegram")]
+pub struct BotOwners<'a> {
+    pub dir: Option<&'a Path>,
+    pub holder: &'a str,
+    pub held: &'a mut Vec<BotOwner>,
+}
+
 /// Context needed by adapters that require extra parameters beyond the common set.
 #[allow(dead_code)]
 pub struct ChannelRegistrationCtx<'a> {
@@ -101,6 +112,8 @@ pub struct ChannelRegistrationCtx<'a> {
     pub on_session_deleted: Option<SessionDeletedCallback>,
     #[cfg(feature = "matrix")]
     pub matrix_channel: &'a mut Option<Arc<octos_bus::MatrixChannel>>,
+    #[cfg(feature = "telegram")]
+    pub bot_owners: BotOwners<'a>,
 }
 
 /// Register all configured channels with the channel manager.
@@ -119,7 +132,13 @@ pub fn register_all(
         match entry.channel_type.as_str() {
             "cli" => cli::register(channel_mgr, entry, ctx.shutdown, ctx.shutdown_notify)?,
             #[cfg(feature = "telegram")]
-            "telegram" => telegram::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
+            "telegram" => telegram::register(
+                channel_mgr,
+                entry,
+                ctx.shutdown,
+                ctx.media_dir,
+                &mut ctx.bot_owners,
+            )?,
             #[cfg(feature = "discord")]
             "discord" => discord::register(channel_mgr, entry, ctx.shutdown, ctx.media_dir)?,
             #[cfg(feature = "dingtalk")]

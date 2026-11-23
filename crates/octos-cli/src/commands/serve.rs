@@ -2196,6 +2196,17 @@ impl ServeCommand {
             crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
         }
 
+        // T-0654: `serve.im` bots are this serve's alone. Take them and check
+        // every binding before a gateway starts or a request arrives; held
+        // until serve exits. Without `serve.im` nothing here runs.
+        let _serve_im = match config.serve.as_ref().filter(|serve| !serve.im.is_empty()) {
+            Some(serve) => Some(
+                crate::api::ui_protocol_transport::start_serve_im(&state, &serve.im, &data_dir)
+                    .await?,
+            ),
+            None => None,
+        };
+
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");

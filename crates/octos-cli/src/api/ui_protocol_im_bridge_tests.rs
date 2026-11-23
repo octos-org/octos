@@ -6,15 +6,15 @@ use super::*;
 
 const BOT: i64 = 900;
 /// A person, and their direct chat with the bot (Telegram gives both one id).
-const ME: i64 = 4242;
-const SOMEONE: i64 = 5151;
+pub(crate) const ME: i64 = 4242;
+pub(crate) const SOMEONE: i64 = 5151;
 const TTL: Duration = Duration::from_secs(600);
 const STOP_TOO_LATE: &str = "Nothing sent before this /stop is running.";
 
 /// A channel that keeps what it was asked to send, and fails sends while
 /// `fail` is set.
 #[derive(Default)]
-struct FakeChannel {
+pub(crate) struct FakeChannel {
     sent: StdMutex<Vec<(i64, String, Option<i64>)>>,
     fail: std::sync::atomic::AtomicBool,
 }
@@ -40,13 +40,13 @@ impl ImChannel for FakeChannel {
 }
 
 impl FakeChannel {
-    fn take(&self) -> Vec<(i64, String, Option<i64>)> {
+    pub(crate) fn take(&self) -> Vec<(i64, String, Option<i64>)> {
         std::mem::take(&mut self.sent.lock().unwrap())
     }
 }
 
 /// A text message from me in my chat, sent now.
-fn message(id: i64, text: &str) -> ImMessage {
+pub(crate) fn message(id: i64, text: &str) -> ImMessage {
     ImMessage {
         chat: ME,
         direct: true,

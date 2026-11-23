@@ -16,6 +16,10 @@ pub mod api;
 pub mod embedded;
 pub use octos_store::approvals_audit;
 pub mod auth;
+// One consumer per IM bot account: `serve.im` (api) or a gateway's Telegram
+// channel.
+#[cfg(any(feature = "api", feature = "telegram"))]
+pub(crate) mod bot_owner;
 // Build-cache pool (outer-loop #3, design docs/build-cache-pool.md):
 // per-repository reusable cargo target-dir slots with flock exclusivity,
 // holder metadata for crash recovery, and a fail-closed space gate.

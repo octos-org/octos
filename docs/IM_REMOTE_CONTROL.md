@@ -74,8 +74,16 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 ## 7. 渠道单 owner
 
-- serve 与 gateway 子进程**不得同时轮询/消费同一渠道账号**。引入渠道 owner 声明：渠道配置带 `owner: "gateway" | "serve"`，启用 serve IM 的渠道在 gateway 注册表中被拒绝启动（反向亦然）；owner 判定在渠道启动时 fail-fast。
-- 配置只有一个来源（见 §11 迁移）；运行时再用一个每渠道文件锁防双进程互踩。
+- serve 与 gateway 子进程**不得同时轮询/消费同一个 bot 账号**。owner 按 bot 身份判定，不按配置段名：Telegram bot 的 id 就是 token 开头那串数字，`getMe` 报的也是它。
+- 谁要消费一个 bot，先拿 `~/.octos/bot-owners/telegram-<id>.lock` 的文件锁：serve 为 `serve.im` 里的每个 bot 拿，gateway 的 Telegram 渠道在启动前拿。
+  - 两个 profile，或一个 profile 和 `serve.im`，就算用不同的 env 名指向同一个 bot，也会撞在同一把锁上。
+  - 锁目录按用户放，不按数据目录，所以两个 serve 实例之间也互斥。
+  - 拿不到就拒绝，并写明谁占着（进程说明加 pid）。锁随进程退出释放；gateway 重启时等旧进程放锁，最多等 3 秒。
+- 没有单独的 `owner` 字段：列进 `serve.im` 就是声明这个 bot 归 serve，其余渠道照旧归 gateway。再加一个字段就多了一个来源，两边可能写得不一致。某个 gateway 渠道还写着同一个 bot 时，锁会拒绝那个 gateway，因为 serve 在自动拉起 gateway 之前就先拿了锁。
+- gateway 的默认行为不变：
+  - token 里没有 bot id 的，照旧交给 Telegram 报错；
+  - 锁目录用不了时只记一条警告，不加锁照常跑；
+  - 只有 bot 已被别的进程占用时才拒绝启动。process manager 把这种拒绝记为配置错误，不再自动重启。
 
 ## 8. IM 里的审批
 
@@ -121,8 +129,16 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 ## 11. 配置与迁移
 
-- 新配置段 `serve.im`（渠道引用 + binding 列表）。迁移规则：已有 gateway 渠道 entry 默认 owner=gateway，行为不变；运维显式把 `owner` 改为 serve 并补 binding 才启用。`chat_profile_map`/`guild_profile_map`（#3297）在 owner=serve 时由 bridge 读取同一份配置，语义不变。
-- 配置错误 loud：`owner: serve` 但无 binding / allowlist 为空 / binding 指向不存在的 profile——渠道启动即拒绝。
+- 新配置段 `serve.im`，一个 bot 一项：`type`（只有 `telegram`）、`token_env`、`allowed_senders`（数字 id）、`ttl_secs`（默认 600）和 `bindings`（每条写 `chat`、`sender`、`profile`、`session`）。
+- 配置只读：serve 启动时读一次。改 binding（包括撤销）要重启 serve 才生效。没有管理界面，也没有新 wire 方法。
+- 迁移：没有 `serve.im` 时什么都不变，配置写回时也不会多出这一段；已有的 gateway 渠道都归 gateway（§7）。
+- 不复用 `chat_profile_map`/`guild_profile_map`：它们未命中时会落到默认 profile（T-0633 B1）。`serve.im` 里出现这两个键，按未知字段拒绝。
+- 配置错误 loud。以下任一种情况，serve 启动即报错退出，错误写明是第几项：
+  - 缺 binding；
+  - allowlist 为空；
+  - profile 不存在；
+  - session 不是该 profile 的 Chat，Code session 也算；
+  - 同一个 bot 列了两次，或已被别的进程占用（§7）。
 
 ## 12. UPCR 与协议边界
 
@@ -138,7 +154,7 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 | 单元（SessionTurnService） | 抽取后与 OUP handler 行为一致（同一 fixture 双跑）。 |
 | 集成（假渠道） | 内存 fake Channel 驱动真实 serve：消息→turn→审批（同意/拒绝/过期/重放/非授权 sender）→结果出站；高风险只出 PWA 指引；chat workspace 落位（T-B 合后）。 |
 | e2e（真实渠道沙盒） | 首渠道确定后再排：一个测试 bot + 测试群的全链路。 |
-| 回归 | gateway owner=serve 的渠道在 gateway 拒绝启动；gateway 行为在 owner=gateway 下不变。 |
+| 回归 | serve 占着的 bot，gateway 的渠道拒绝启动；没被占的 bot，gateway 行为不变（§7）。 |
 
 ## 14. 第一刀小 PR
 
@@ -176,6 +192,14 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 - **幂等**：turn_id 由 channel、chat、sender 和平台 message id 哈希得出。重投的消息（重启前后都一样）对应已有的 turn，什么都不执行，也不回复。来源只留在 bridge，模型和 ledger 只看到文本。
 - **出站**：结果回复到原消息。binding 撤销后，结果不再发出。发送失败不重发；这时 turn 的记录保留，留给以后的 outbox 对账。发出或撤销后才 `acknowledge`。
 - serve 里还没有调用方。真实渠道（bus 带出平台时间、数字 id 和 sender 类别）、配置、附件、IM 审批、离线 outbox 和群聊都是后面的刀。
+
+第二刀 c（T-0654，配置与单 owner）：
+
+- serve 在拉起任何 gateway、接受任何请求之前装配 `serve.im`（§11），依次做三步，任何一步失败 serve 都不启动：
+  1. 按 bot id 拿锁（§7）；
+  2. 把每个 binding 解析成 `BoundChat`；
+  3. 把整项交给 `ServeImBridge::new` 检查。
+- 真实的 Telegram 传输还没接，是下一刀。这一刀装好的 bridge 收不到消息，serve 只是占住这个 bot，不让任何 gateway 用。
 
 ## 15. 待 Claude / shu 定（本文不擅自决定）
 
