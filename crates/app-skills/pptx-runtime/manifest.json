@@ -16,9 +16,13 @@
           "action"
         ],
         "properties": {
+          "design": {"type":"string","description":"Original image for source_lines intake"},
+          "ocr": {"type":"string","description":"Source OCR file for source_lines intake"},
+          "additional_lines": {"type":"array","items":{"type":"object"},"description":"Extra lines observed on the original in OCR canvas coordinates"},
           "action": {
             "type": "string",
             "enum": [
+              "source_lines",
               "help",
               "doctor",
               "build",

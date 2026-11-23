@@ -18,38 +18,43 @@ pub(crate) fn bind(
         ensure!(!explicit, "source_ocr requires a bound design");
         return Ok(());
     };
-    let mut file = if explicit {
-        page["source_ocr"].clone()
-    } else {
-        let path = parent.join("ocr.json");
-        if !path.is_file() {
-            return Ok(());
+    let mut observed = None;
+    if explicit || parent.join("ocr.json").is_file() {
+        let mut file = if explicit {
+            page["source_ocr"].clone()
+        } else {
+            json!("ocr.json")
+        };
+        spec::asset(ctx, &mut file, parent)?;
+        let bytes = ctx.read(ctx.verify(&file)?)?;
+        ensure!(
+            crate::fs::digest(&bytes) == file["sha256"],
+            "OCR observation changed"
+        );
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(data) if data["source_sha256"] == design_hash => {
+                observed = Some(data);
+                sources.push(file);
+            }
+            Ok(_) => ensure!(!explicit, "OCR observation belongs to a different design"),
+            Err(e) if explicit => return Err(e.into()),
+            _ => {}
         }
-        json!("ocr.json")
-    };
-    spec::asset(ctx, &mut file, parent)?;
-    let data = ctx.read(ctx.verify(&file)?)?;
-    let observed: Value = match serde_json::from_slice(&data) {
-        Ok(v) => v,
-        Err(_) if !explicit => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    if observed["source_sha256"].as_str() != Some(design_hash) {
-        ensure!(!explicit, "OCR observation belongs to a different design");
-        return Ok(());
     }
-    ensure!(
-        crate::fs::digest(&data) == file["sha256"],
-        "OCR observation changed"
-    );
-    page["source_ocr"] = file.clone();
-    sources.push(file);
+    if let Some(mut binding) = crate::source_lines::register(
+        ctx,
+        crate::string(page, "id")?,
+        &page["design"],
+        observed.as_ref(),
+        &[],
+    )? {
+        sources.push(binding.clone());
+        binding["path"] = json!(ctx.verify(&binding)?);
+        page["source_ocr"] = binding;
+    }
     Ok(())
 }
 
-fn key(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
 fn center([x, y, w, h]: [f64; 4]) -> [f64; 2] {
     [x + w / 2., y + h / 2.]
 }
@@ -117,43 +122,19 @@ pub(crate) fn apply(ctx: &Context, spec: &mut Spec) -> Result<Vec<Value>> {
         );
         let lines = o["lines"].as_array().context("missing source OCR lines")?;
         ensure!(lines.len() <= 10000, "excessive OCR lines");
-        let mut by_text: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
-        for line in lines {
-            if let Some(s) = line["text"].as_str() {
-                by_text.entry(key(s)).or_default().push(line);
-            }
-        }
-        let mut counts = BTreeMap::new();
-        let mut occurrences = BTreeMap::new();
-        for t in &spec.pages[pi].texts {
-            *occurrences
-                .entry(t.copy_id.as_ref().unwrap_or(&t.id).clone())
-                .or_insert(0usize) += 1;
-            *counts.entry(key(&t.text)).or_insert(0usize) += 1;
-        }
+        let by_id: BTreeMap<_, _> = lines
+            .iter()
+            .filter_map(|line| Some((line["id"].as_str()?, line)))
+            .collect();
         for i in 0..spec.pages[pi].texts.len() {
             let t = &spec.pages[pi].texts[i];
+            let [id] = t.source_line_ids.as_slice() else {
+                continue;
+            };
             if t.copy_range.is_some() || t.text.lines().count() != 1 {
                 continue;
             }
-            let s = key(&t.text);
-            let Some(rows) = by_text.get(&s) else {
-                continue;
-            };
-            let cid = t.copy_id.as_ref().unwrap_or(&t.id).as_str();
-            let line = match rows.as_slice() {
-                [one] if counts[&s] == 1 => *one,
-                many => {
-                    let mut found = many
-                        .iter()
-                        .copied()
-                        .filter(|line| line["id"].as_str() == Some(cid));
-                    match (found.next(), found.next()) {
-                        (Some(one), None) if occurrences[cid] == 1 => one,
-                        _ => continue,
-                    }
-                }
-            };
+            let line = by_id.get(id.as_str()).context("unregistered source line")?;
             if line["geometry_status"] == "rejected"
                 || line["confidence"]
                     .as_f64()

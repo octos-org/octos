@@ -296,6 +296,15 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         )?;
     }
     let mut bound = bind_observations(&fresh, &observations)?;
+    let required_lines = cycle["source_lines"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::source_lines::coverage(
+        required_lines,
+        &bound,
+        crate::review_routes::permitted(ctx)?,
+    )?;
     let mut fidelity = crate::fidelity::assess(
         &cycle,
         &spec,
@@ -586,8 +595,11 @@ pub fn template(ctx: &Context, cycle: &std::path::Path, objects: &[Value]) -> Re
         }
         reviews.push(json!({"page":v["page"],"object_id":v["object_id"],"evidence_hash":v["evidence_hash"],"checks":checks}));
     }
-    Ok(
-        json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":reviews,
-        "note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root}),
-    )
+    let mut template = json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":reviews,
+        "note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root});
+    let receipt = ctx.json(cycle)?;
+    if let Some(lines) = receipt["source_lines"].as_array() {
+        template["source_line_reviews"]=json!(lines.iter().map(|r|json!({"page":r["page"],"source_line_id":r["source_line_id"],"source":r["source"],"canvas":r["canvas"],"objects":r["objects"],"status":"unknown","observation":""})).collect::<Vec<_>>());
+    }
+    Ok(template)
 }

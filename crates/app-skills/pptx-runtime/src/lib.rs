@@ -27,6 +27,7 @@ pub mod relations;
 pub mod review;
 pub mod review_reuse;
 pub mod review_routes;
+pub mod source_lines;
 pub mod spec;
 pub mod typography;
 pub mod visual_diff;
@@ -66,7 +67,7 @@ impl Context {
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["source_lines","operations","review_view","finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
@@ -75,6 +76,7 @@ impl Context {
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),
+            "source_lines" => source_lines::intake(self,&request),
             "build" | "cycle" => deck::build(self, &request),
             "render" => deck::render(self, &request),
             "inspect" => review::inspect(self, &request),

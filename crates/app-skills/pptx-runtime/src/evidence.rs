@@ -425,6 +425,13 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     // Fresh native measurements are authoritative. A model-authored pass,
     // dismissed finding or edited inspection report cannot replace them.
     let independent = crate::review_routes::authorized(ctx, &policy, &review, &ctx.binding(&cp)?)?;
+    let lines = cycle["source_lines"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let line_scope =
+        crate::source_lines::current_scope(ctx, &spec, lines, &old["source_line_scope"])?;
+    let line_coverage = crate::source_lines::coverage(lines, &review, independent)?;
     let (repair_contract, local_repairs) = crate::fidelity::repair_contract(
         ctx,
         &cycle,
@@ -573,18 +580,20 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         let diff_unknown = if visual {
             comparison_coverage.unknown + object_coverage.unknown + fidelity.unknown
         } else if d == "copy" {
-            object_coverage.summary["symbol_unknown"]
-                .as_u64()
-                .unwrap_or(0) as usize
+            line_coverage["unknown"].as_u64().unwrap_or(0) as usize
+                + object_coverage.summary["symbol_unknown"]
+                    .as_u64()
+                    .unwrap_or(0) as usize
         } else {
             0
         };
         let diff_defects = if visual {
             comparison_coverage.defects + object_coverage.defects + fidelity.defects
         } else if d == "copy" {
-            object_coverage.summary["symbol_defects"]
-                .as_u64()
-                .unwrap_or(0) as usize
+            line_coverage["defects"].as_u64().unwrap_or(0) as usize
+                + object_coverage.summary["symbol_defects"]
+                    .as_u64()
+                    .unwrap_or(0) as usize
         } else {
             0
         };
@@ -653,7 +662,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     }
     // Keep the kernel's generic Snapshot wire schema unchanged. Detailed PPTX
     // evidence is a bound immutable artifact, not a new kernel-level field.
-    let comparison_record = json!({"local_background_repairs":local_repairs,"reference_fidelity":fidelity.summary,"object_coverage":object_coverage.summary,"object_reviews":object_coverage.reviews,"coverage":comparison_coverage.summary,
+    let comparison_record = json!({"source_line_coverage":line_coverage,"local_background_repairs":local_repairs,"reference_fidelity":fidelity.summary,"object_coverage":object_coverage.summary,"object_reviews":object_coverage.reviews,"coverage":comparison_coverage.summary,
         "reviews":comparison_coverage.reviews,"required_pages":comparison_coverage.required_pages,
         "verification_route":{"plan":verification_plan,"independent_visual_acceptances":accepted_measurements,
         "attestation":review["attestation"],"native_status_unchanged":true,"feedback":verification_feedback}});
@@ -702,7 +711,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         } else {
             &native_qa["contract"]
         };
-    ctx.replace_json(BOOK,&json!({"task_id":policy["task_id"],"pages":pages,"attempt":attempt,"key":key,"findings":findings,"verification_plan":verification_plan,"qa_contract":retained_contract,"native_qa":qa_summary,"scope_change_reason":scope_reason,"comparison_reviews":comparison_coverage.reviews,"comparison_required_pages":comparison_coverage.required_pages,"object_reviews":object_coverage.reviews}))?;
+    ctx.replace_json(BOOK,&json!({"source_line_scope":line_scope,"task_id":policy["task_id"],"pages":pages,"attempt":attempt,"key":key,"findings":findings,"verification_plan":verification_plan,"qa_contract":retained_contract,"native_qa":qa_summary,"scope_change_reason":scope_reason,"comparison_reviews":comparison_coverage.reviews,"comparison_required_pages":comparison_coverage.required_pages,"object_reviews":object_coverage.reviews}))?;
     ctx.replace_json(ep, &payload)?;
     let check_feedback = crate::check_feedback::summarize(
         &json!(checks),
@@ -711,6 +720,6 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         &comparison_coverage.summary,
     );
     Ok(
-        json!({"evidence":ctx.binding(ep)?,"attempt":attempt,"checks":checks,"check_feedback":check_feedback,"verification_feedback":verification_feedback,"reference_fidelity":fidelity.summary,"native_qa":qa_summary,"comparison_coverage":comparison_coverage.summary,"object_coverage":object_coverage.summary,"previous_record":previous_record,"visual_quality_verified_by_tool":false,"review_provenance":"Fresh deterministic native QA plus human/model review of bound renders; model judgments cannot override machine failures"}),
+        json!({"source_line_coverage":line_coverage,"evidence":ctx.binding(ep)?,"attempt":attempt,"checks":checks,"check_feedback":check_feedback,"verification_feedback":verification_feedback,"reference_fidelity":fidelity.summary,"native_qa":qa_summary,"comparison_coverage":comparison_coverage.summary,"object_coverage":object_coverage.summary,"previous_record":previous_record,"visual_quality_verified_by_tool":false,"review_provenance":"Fresh deterministic native QA plus human/model review of bound renders; model judgments cannot override machine failures"}),
     )
 }

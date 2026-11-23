@@ -203,3 +203,5 @@ and binds their image bytes into the checked cycle. Use this path for supported
 local repairs instead of post-build insertion/reordering. It does not approve
 texture seams, erase glyphs automatically, or make raster text editable. Schemas
 are in the production skill's native-builder and rust-runtime references.
+
+For reconstruction from an original image, use `source_lines` before making the first spec. Keep the returned source IDs on editable objects, repair by the same IDs, and complete the independent per-line review on the actual candidate. See `references/placement.md` and `references/review-lifecycle.md`.

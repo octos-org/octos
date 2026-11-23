@@ -71,6 +71,8 @@ pub struct Text {
     pub region: Option<String>,
     #[serde(default)]
     pub copy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_line_ids: Vec<String>,
     /// Half-open Unicode-scalar offsets in normalized authoritative copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_range: Option<[usize; 2]>,
@@ -413,6 +415,9 @@ pub fn load_with_sources(
         spec.pages.retain(|p| p.id == id);
         ensure!(spec.pages.len() == 1, "unknown page {id}");
     }
+    for page in &mut spec.pages {
+        crate::source_lines::link(ctx, page)?;
+    }
     for binding in &sources {
         ctx.verify(binding)?;
     }
@@ -469,7 +474,7 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
         {
             if !matches!(
                 k.as_str(),
-                "box" | "rotation" | "format" | "style" | "region" | "text"
+                "box" | "rotation" | "format" | "style" | "region" | "text" | "source_line_ids"
             ) {
                 bail!("unsupported edit field {k}")
             }

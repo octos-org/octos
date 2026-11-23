@@ -242,6 +242,10 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     );
     let mut result = json!({"schema_version":1,"engine_revision":crate::ENGINE_REV,"runtime":"rust","spec":ctx.binding(resolved)?,"editable":ctx.binding(&full)?,"blank":ctx.binding(&blank)?,"pages":spec.pages.iter().map(|p|&p.id).collect::<Vec<_>>(),"quality_approved":false});
     result["sources"] = json!(sources);
+    let lines = crate::source_lines::inventory(ctx, &spec)?;
+    if !lines.is_empty() {
+        result["source_lines"] = json!(lines);
+    }
     if !ocr_placement.is_empty() {
         result["ocr_placement"] = json!(ocr_placement);
     }

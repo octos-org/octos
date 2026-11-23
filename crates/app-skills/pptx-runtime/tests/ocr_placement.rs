@@ -64,11 +64,10 @@ fn build_anchor_survives_repairs_but_ignores_ambiguous_or_rejected_ocr() {
     stale["source_sha256"] = Value::String("wrong-source".into());
     ctx.replace_json("ocr.json", &stale).unwrap();
     build("spec.json", "stale-auto").unwrap();
-    assert!(
-        ctx.json("stale-auto/cycle.json")
-            .unwrap()
-            .get("ocr_placement")
-            .is_none()
+    // A foreign sidecar cannot replace the previously registered original.
+    assert_eq!(
+        ctx.json("stale-auto/cycle.json").unwrap()["ocr_placement"],
+        receipt["ocr_placement"]
     );
     let mut explicit = spec;
     explicit["pages"][0]["source_ocr"] = json!("ocr.json");
