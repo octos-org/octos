@@ -12,10 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-deckcraft-engine = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
-deckcraft-text = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
-deckcraft-pptx = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
-deckcraft-mcp = { git = "https://github.com/ymote/deckcraft", rev = "581ffb43217be6aa9850b23eea38473ded6043fd" }
+deckcraft-engine = { git = "https://github.com/ymote/deckcraft", rev = "f366c7b952bb9d586781c0155441f61e4c9c0a10" }
+deckcraft-text = { git = "https://github.com/ymote/deckcraft", rev = "f366c7b952bb9d586781c0155441f61e4c9c0a10" }
+deckcraft-pptx = { git = "https://github.com/ymote/deckcraft", rev = "f366c7b952bb9d586781c0155441f61e4c9c0a10" }
+deckcraft-mcp = { git = "https://github.com/ymote/deckcraft", rev = "f366c7b952bb9d586781c0155441f61e4c9c0a10" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

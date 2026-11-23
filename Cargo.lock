@@ -272,15 +272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitrary"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1519,7 +1510,7 @@ dependencies = [
 [[package]]
 name = "craft-media"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+source = "git+https://github.com/storytold/craft-libs?rev=1b34eba41e62138fc2438d2734523b302840b45d#1b34eba41e62138fc2438d2734523b302840b45d"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -1527,7 +1518,7 @@ dependencies = [
 [[package]]
 name = "craft-pdf"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
+source = "git+https://github.com/storytold/craft-libs?rev=1b34eba41e62138fc2438d2734523b302840b45d#1b34eba41e62138fc2438d2734523b302840b45d"
 dependencies = [
  "krilla",
  "thiserror 2.0.18",
@@ -1788,7 +1779,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 [[package]]
 name = "deckcraft-anim"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-geom",
  "deckcraft-model",
@@ -1798,7 +1789,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-av1"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-bitstream",
  "rayon",
@@ -1808,7 +1799,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-bitstream"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "craft-media",
 ]
@@ -1816,7 +1807,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-color"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "serde",
 ]
@@ -1824,7 +1815,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-engine"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "chrono",
  "deckcraft-color",
@@ -1849,7 +1840,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-fonts"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "epaint_default_fonts",
  "harfrust 0.13.3",
@@ -1863,19 +1854,19 @@ dependencies = [
 [[package]]
 name = "deckcraft-format"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-model",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "zip 3.0.0",
+ "zip",
 ]
 
 [[package]]
 name = "deckcraft-geom"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "kurbo",
  "serde",
@@ -1884,7 +1875,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-h264"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-bitstream",
  "rayon",
@@ -1894,7 +1885,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-hevc"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-bitstream",
  "rayon",
@@ -1904,7 +1895,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-isobmff"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "craft-media",
 ]
@@ -1912,7 +1903,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-matroska"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "craft-media",
 ]
@@ -1920,7 +1911,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-mcp"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-engine",
  "deckcraft-render",
@@ -1931,7 +1922,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-media"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-av1",
  "deckcraft-h264",
@@ -1950,7 +1941,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-metafile"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "image",
  "kurbo",
@@ -1960,7 +1951,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-model"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-color",
  "deckcraft-geom",
@@ -1973,17 +1964,17 @@ dependencies = [
 [[package]]
 name = "deckcraft-ogg"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 
 [[package]]
 name = "deckcraft-opus"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 
 [[package]]
 name = "deckcraft-pdf"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "craft-pdf",
  "deckcraft-fonts",
@@ -2000,7 +1991,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-pptx"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "base64 0.22.1",
  "deckcraft-color",
@@ -2014,13 +2005,13 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "unicode-general-category",
- "zip 3.0.0",
+ "zip",
 ]
 
 [[package]]
 name = "deckcraft-render"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-anim",
  "deckcraft-color",
@@ -2042,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-text"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "chrono",
  "deckcraft-color",
@@ -2057,7 +2048,7 @@ dependencies = [
 [[package]]
 name = "deckcraft-vp9"
 version = "0.15.0"
-source = "git+https://github.com/ymote/deckcraft?rev=581ffb43217be6aa9850b23eea38473ded6043fd#581ffb43217be6aa9850b23eea38473ded6043fd"
+source = "git+https://github.com/ymote/deckcraft?rev=f366c7b952bb9d586781c0155441f61e4c9c0a10#f366c7b952bb9d586781c0155441f61e4c9c0a10"
 dependencies = [
  "deckcraft-bitstream",
  "rayon",
@@ -2156,17 +2147,6 @@ checksum = "ececcb659e7ba858fb4f10388c250a7252eb0a27373f1a72b8748afdd248e587"
 dependencies = [
  "powerfmt",
  "serde_core",
-]
-
-[[package]]
-name = "derive_arbitrary"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b034bd7d5f032402a2479444dcc6f74e36a03f31854d41680fb240ef682a1ac"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.6",
 ]
 
 [[package]]
@@ -6308,7 +6288,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
- "zip 9.2.2",
+ "zip",
 ]
 
 [[package]]
@@ -6506,7 +6486,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "zip 9.2.2",
+ "zip",
 ]
 
 [[package]]
@@ -6732,7 +6712,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "zip 9.2.2",
+ "zip",
 ]
 
 [[package]]
@@ -11939,20 +11919,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
-]
-
-[[package]]
-name = "zip"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12598812502ed0105f607f941c386f43d441e00148fce9dec3ca5ffb0bde9308"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "flate2",
- "indexmap 2.12.1",
- "memchr",
- "zopfli",
 ]
 
 [[package]]
