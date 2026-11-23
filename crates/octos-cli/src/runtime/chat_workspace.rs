@@ -3,7 +3,7 @@
 //! A chat's folder and record live in one of two layouts. Profiles known when
 //! the server starts keep the original `<profile data_dir>/chats/<name>/` and
 //! `<profile data_dir>/chats/<name>.json`. Profiles registered while the
-//! server runs use the stable root `<server data_dir>/chats/<profile>/<name>/`;
+//! server runs use the stable root `<server data_dir>/chat-workspaces/<profile>/<name>/`;
 //! that root exists before the first sandbox, so a shell command's hiding
 //! rules already cover every future runtime profile. The record sits outside
 //! the folder, so nothing the chat writes can change whose folder it is. Both
@@ -24,6 +24,7 @@ use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 
 const CHATS_DIR: &str = "chats";
+const CHAT_WORKSPACES_DIR: &str = "chat-workspaces";
 
 #[derive(Default)]
 struct ChatWorkspaceLayout {
@@ -138,22 +139,22 @@ fn server_profile_roots(data_dir: &Path, profile_id: &str) -> Vec<PathBuf> {
     roots
 }
 
-/// Validate the one server-level root. A workspace may be an ancestor of the
-/// root (standard installs use `$HOME` as cwd while state lives under it); the
-/// root is hidden inside that workspace. It must not be the root's child,
-/// because that would grant a Code session a workspace inside Chat storage.
+/// Validate the one server-level root. A profile data directory may contain
+/// the root (standard installs often use the state home itself); the real
+/// conflict is with that profile's legacy chats root. A workspace may likewise
+/// be an ancestor, but never at or below the root.
 fn validate_server_root(
     root: &Path,
     profile_data_dirs: &[PathBuf],
     workspace_roots: &[PathBuf],
 ) -> std::io::Result<()> {
     for profile_dir in profile_data_dirs {
-        let profile_dir = canonical_dir(profile_dir);
-        if overlaps_path(root, &profile_dir) {
+        let legacy_root = canonical_dir(&chats_root(profile_dir));
+        if overlaps_path(root, &legacy_root) {
             return Err(std::io::Error::other(format!(
-                "server chats root {} overlaps profile data directory {}",
+                "server chats root {} overlaps legacy profile chats root {}",
                 root.display(),
-                profile_dir.display()
+                legacy_root.display()
             )));
         }
     }
@@ -170,6 +171,102 @@ fn validate_server_root(
     Ok(())
 }
 
+/// Move the pre-release #3326 root into the release root. Both locations on
+/// the same startup mean we cannot prove a merge is safe; refuse instead of
+/// silently choosing one.
+fn migrate_server_root(
+    data_dir: &Path,
+    profile_data_dirs: &[PathBuf],
+    root: &Path,
+) -> std::io::Result<()> {
+    let old_raw = data_dir.join(CHATS_DIR);
+    let new_raw = data_dir.join(CHAT_WORKSPACES_DIR);
+    let old_meta = match std::fs::symlink_metadata(&old_raw) {
+        Ok(meta) => Some(meta),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if old_meta
+        .as_ref()
+        .is_some_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(std::io::Error::other(format!(
+            "old server chats root {} is a symlink; refusing to move its target",
+            old_raw.display()
+        )));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&new_raw)
+        && meta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::other(format!(
+            "server chats root {} is a symlink; refusing to write through it",
+            new_raw.display()
+        )));
+    }
+    let old = canonical_dir(&old_raw);
+    if old == root {
+        return Ok(());
+    }
+    if profile_data_dirs
+        .iter()
+        .any(|profile| canonical_dir(&chats_root(profile)) == old)
+    {
+        // The old path is this profile's legacy root, not the pre-release
+        // server root. It may hold pre-upgrade chats and must stay put.
+        return Ok(());
+    }
+    if profile_data_dirs
+        .iter()
+        .any(|profile| canonical_dir(profile).starts_with(&old))
+    {
+        return Err(std::io::Error::other(format!(
+            "old server chats root {} contains a configured profile data directory; refusing to move the profile",
+            old_raw.display()
+        )));
+    }
+    let Some(old_meta) = old_meta else {
+        return Ok(());
+    };
+    if !old_meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "old server chats root {} is not a directory",
+            old_raw.display()
+        )));
+    }
+    let old_empty = std::fs::read_dir(&old)?.next().is_none();
+    match std::fs::symlink_metadata(&new_raw) {
+        Ok(meta) if meta.is_dir() => {
+            if std::fs::read_dir(&new_raw)?.next().is_some() && !old_empty {
+                return Err(std::io::Error::other(format!(
+                    "cannot move old server chats root {} to {}: both directories contain data",
+                    old_raw.display(),
+                    new_raw.display()
+                )));
+            }
+            if old_empty {
+                std::fs::remove_dir(&old_raw)?;
+                return Ok(());
+            }
+            std::fs::remove_dir(&new_raw)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "server chats root {} is not a directory",
+                new_raw.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(&old_raw, &new_raw).map_err(|error| {
+        std::io::Error::other(format!(
+            "cannot move old server chats root {} to {}: {error}",
+            old_raw.display(),
+            new_raw.display()
+        ))
+    })
+}
+
 /// Create and reserve the one server-level root. Its stable address is known
 /// before any sandbox is built, so even a profile created later is already
 /// hidden from every command started by this process.
@@ -178,8 +275,9 @@ pub(crate) fn configure_server_root(
     profile_data_dirs: &[PathBuf],
     workspace_roots: &[PathBuf],
 ) -> std::io::Result<PathBuf> {
-    let root = canonical_dir(&data_dir.join(CHATS_DIR));
+    let root = canonical_dir(&data_dir.join(CHAT_WORKSPACES_DIR));
     validate_server_root(&root, profile_data_dirs, workspace_roots)?;
+    migrate_server_root(data_dir, profile_data_dirs, &root)?;
     private_dir(&root, true)?;
     reserved_folders()
         .add(root.clone())
@@ -723,16 +821,17 @@ mod server_root_tests {
         let server = temp.path().join("server");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
+        let profile_in_server_root = server.join(CHAT_WORKSPACES_DIR);
         assert!(
             configure_server_root(
                 &server,
-                std::slice::from_ref(&server),
+                std::slice::from_ref(&profile_in_server_root),
                 std::slice::from_ref(&workspace)
             )
             .is_err()
         );
         let home = temp.path().join("home");
-        let server_root = canonical_dir(&home.join("state").join(CHATS_DIR));
+        let server_root = canonical_dir(&home.join("state").join(CHAT_WORKSPACES_DIR));
         validate_server_root(&server_root, &[], std::slice::from_ref(&home))
             .expect("standard install home workspace may contain the hidden root");
         assert!(
@@ -749,6 +848,131 @@ mod server_root_tests {
         let profile_file = temp.path().join("profile-file");
         std::fs::write(&profile_file, b"not a directory").unwrap();
         assert!(register_existing_profile(&profile_file).is_err());
+    }
+
+    #[tokio::test]
+    async fn should_allow_main_profile_data_dir_equal_state_home() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join(CHATS_DIR).join("old-chat.txt");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+        let root = configure_server_root(
+            temp.path(),
+            std::slice::from_ref(&temp.path().to_path_buf()),
+            std::slice::from_ref(&temp.path().to_path_buf()),
+        )
+        .expect("state-home profile data dir is valid");
+        assert_eq!(root, canonical_dir(&temp.path().join(CHAT_WORKSPACES_DIR)));
+        register_existing_profile(temp.path()).expect("legacy root for the same directory");
+        assert_ne!(root, canonical_dir(&chats_root(temp.path())));
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn should_move_pre_release_server_chats_root_on_startup() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join(CHATS_DIR).join("profile").join("chat");
+        let new = temp.path().join(CHAT_WORKSPACES_DIR).join("profile/chat");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("note.txt"), "kept").unwrap();
+        let root = configure_server_root(temp.path(), &[], &[]).expect("migrate old root");
+        assert_eq!(root, canonical_dir(&temp.path().join(CHAT_WORKSPACES_DIR)));
+        assert!(!temp.path().join(CHATS_DIR).exists());
+        assert_eq!(
+            std::fs::read_to_string(new.join("note.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_moving_server_chats_root_containing_profile() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let profile_dir = temp.path().join(CHATS_DIR).join("profiles/custom/data");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("profile.json"), "{}").unwrap();
+        let old = temp.path().join(CHATS_DIR).join("server-chat.txt");
+        std::fs::write(&old, "server").unwrap();
+        let error = configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[])
+            .expect_err("migration must not move a configured profile");
+        assert!(
+            error
+                .to_string()
+                .contains("contains a configured profile data directory"),
+            "{error}"
+        );
+        assert!(profile_dir.join("profile.json").exists());
+        assert!(old.exists());
+        assert!(!temp.path().join(CHAT_WORKSPACES_DIR).exists());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_moving_server_chats_root_over_existing_data() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join(CHATS_DIR).join("old.txt");
+        let new = temp.path().join(CHAT_WORKSPACES_DIR).join("new.txt");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        std::fs::write(&new, "new").unwrap();
+        let error = configure_server_root(temp.path(), &[], &[]).expect_err("both roots have data");
+        assert!(
+            error.to_string().contains("both directories contain data"),
+            "{error}"
+        );
+        assert!(old.exists() && new.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_refuse_moving_server_chats_root_through_symlinks() {
+        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let source_case = tempfile::tempdir().unwrap();
+        let source_target = tempfile::tempdir().unwrap();
+        std::fs::write(source_target.path().join("kept.txt"), "kept").unwrap();
+        std::os::unix::fs::symlink(source_target.path(), source_case.path().join(CHATS_DIR))
+            .unwrap();
+        let error = configure_server_root(source_case.path(), &[], &[])
+            .expect_err("symlink source is not moved");
+        assert!(error.to_string().contains("is a symlink"), "{error}");
+        assert!(
+            source_case
+                .path()
+                .join(CHATS_DIR)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(source_target.path().join("kept.txt").exists());
+        assert!(!source_case.path().join(CHAT_WORKSPACES_DIR).exists());
+
+        let destination_case = tempfile::tempdir().unwrap();
+        let destination_target = tempfile::tempdir().unwrap();
+        let old = destination_case.path().join(CHATS_DIR).join("old.txt");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        std::os::unix::fs::symlink(
+            destination_target.path(),
+            destination_case.path().join(CHAT_WORKSPACES_DIR),
+        )
+        .unwrap();
+        let error = configure_server_root(destination_case.path(), &[], &[])
+            .expect_err("symlink destination is not written through");
+        assert!(error.to_string().contains("is a symlink"), "{error}");
+        assert!(old.exists());
+        assert!(
+            destination_case
+                .path()
+                .join(CHAT_WORKSPACES_DIR)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[tokio::test]
@@ -790,7 +1014,10 @@ mod server_root_tests {
         let server_root =
             configure_server_root(&state_home, std::slice::from_ref(&old_profile), &[])
                 .expect("configure server root");
-        assert_eq!(server_root, canonical_dir(&state_home.join(CHATS_DIR)));
+        assert_eq!(
+            server_root,
+            canonical_dir(&state_home.join(CHAT_WORKSPACES_DIR))
+        );
         assert!(!workspace_inside_server_root(&root_dir));
         assert!(workspace_inside_server_root(&server_root));
         assert!(overlaps_chat_folders(&old_profile, &root_dir));
