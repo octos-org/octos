@@ -2,8 +2,6 @@
 
 use octos_core::ui_protocol::user_question_cancelled_reasons;
 
-#[path = "ui_protocol_cover_workflow.rs"]
-mod cover_workflow;
 #[path = "ui_protocol_transport/dto.rs"]
 mod dto;
 #[path = "ui_protocol_durable_delivery.rs"]
@@ -20,16 +18,12 @@ mod im_telegram;
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
 mod memory_requests;
-#[path = "ui_protocol_pptx_dispatch.rs"]
-mod pptx_dispatch;
 #[path = "ui_protocol_session_turn_service.rs"]
 mod session_turn_service;
 #[path = "ui_protocol_turn_connection.rs"]
 mod turn_connection;
 #[path = "ui_protocol_persistence.rs"]
 mod ui_protocol_persistence;
-#[path = "ui_protocol_workflow_activity.rs"]
-mod workflow_activity;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
@@ -6180,25 +6174,6 @@ fn appui_session_keepalive_interval(idle_ttl: std::time::Duration) -> std::time:
     (idle_ttl / 4).clamp(APPUI_SESSION_KEEPALIVE_MIN, APPUI_SESSION_KEEPALIVE_MAX)
 }
 
-#[cfg(test)]
-static TEST_WORKFLOW_EVENTS_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn appui_recovery_tick() -> tokio::time::Interval {
-    let period = Duration::from_secs(2);
-    let first = tokio::time::Instant::now();
-    // The isolated WebSocket fixture must succeed using only ready events.
-    #[cfg(test)]
-    let first = if TEST_WORKFLOW_EVENTS_ONLY.load(Ordering::Relaxed) {
-        first + Duration::from_secs(3600)
-    } else {
-        first
-    };
-    let mut timer = tokio::time::interval_at(first, period);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    timer
-}
-
 /// Whether a keep-alive round is due, recording the tick when it is.
 fn appui_keepalive_due(
     last: &mut Option<std::time::Instant>,
@@ -7947,8 +7922,8 @@ async fn ui_protocol_connection(
     // sends (the Pongs our binary Pings elicit included). The keepalive tick
     // below closes the connection once it goes stale.
     let mut last_inbound = std::time::Instant::now();
-    let mut workflow_ready = default_agent_orchestrator().subscribe_ready();
-    let mut appui_continuation_tick = appui_recovery_tick();
+    let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
+    appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Frames the housekeeping drain lifted off the socket while an inline
     // dispatch was running. They are replayed through the per-frame path
     // below — draining must never swallow one, or its JSON-RPC id is never
@@ -8039,7 +8014,6 @@ async fn ui_protocol_connection(
                 // runs them.
                 if !connection_is_external {
                     drain_appui_due_master_continuations(
-                        None,
                         &ws,
                         &state,
                         &ledger,
@@ -8065,16 +8039,6 @@ async fn ui_protocol_connection(
                 Some(Ok(msg)) => msg,
                 Some(Err(_)) | None => break,
             },
-            ready = workflow_ready.recv() => {
-                if let Ok((target, profile)) = ready && !connection_is_external {
-                    let wire = wire_key_from_goal_key(&target);
-                    let open = live_forwarders.lock().await.contains_key(&wire).then_some(wire).into_iter().collect();
-                    drain_appui_due_master_continuations(Some((target, profile)), &ws, &state, &ledger,
-                        &contracts, &active_turns, &connection_turns, connection_profile_id.or(routed_profile_id).or(session_open_profile_id.as_deref()),
-                        &open, false, features).await;
-                }
-                continue;
-            }
             }
         };
         last_inbound = std::time::Instant::now();
@@ -9276,8 +9240,8 @@ where
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
     let mut last_session_keepalive: Option<std::time::Instant> = None;
-    let mut workflow_ready = default_agent_orchestrator().subscribe_ready();
-    let mut appui_continuation_tick = appui_recovery_tick();
+    let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
+    appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let failed_notify = ws.failed_notify();
     let mut writer_finished = false;
     let mut writer_exit_error: Option<eyre::Report> = None;
@@ -9313,7 +9277,6 @@ where
                         appui_keep_open_sessions_alive(&state, &open_sessions).await;
                     }
                     drain_appui_due_master_continuations(
-                        None,
                         &ws,
                         &state,
                         &ledger,
@@ -9353,16 +9316,6 @@ where
                             continue;
                         }
                     }
-                }
-                ready = workflow_ready.recv() => {
-                    if let Ok((target, profile)) = ready && embedded.as_ref().is_none_or(|control| control.continuations_enabled.load(Ordering::Acquire)) {
-                        let wire = wire_key_from_goal_key(&target);
-                        let open = live_forwarders.lock().await.contains_key(&wire).then_some(wire).into_iter().collect();
-                        drain_appui_due_master_continuations(Some((target, profile)), &ws, &state, &ledger,
-                            &contracts, &active_turns, &connection_turns, connection_profile_id_owned.as_deref(),
-                            &open, embedded.is_some(), features).await;
-                    }
-                    continue;
                 }
             };
             if ws.is_failed() {
@@ -19613,9 +19566,8 @@ const PEER_GATHER_TOOL_OUTPUT_CAP: usize = 48 * 1024;
 const PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS: usize = 200;
 
 /// Compose the plain-text blackboard view the `peer_gather` tool returns:
-/// one section per peer. Headlines follow current execution; `done` is used
-/// only for an idle peer with a delivered result. Delivered results are historical.
-/// Missing result files do not establish running execution. Total output capped at
+/// one section per peer (done = a result file exists; peers write results
+/// when their turns end), total output capped at
 /// [`PEER_GATHER_TOOL_OUTPUT_CAP`] by truncating evenly across peers with a
 /// note steering the model to per-slug reads.
 fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (String, bool) {
@@ -19625,40 +19577,22 @@ fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (Stri
     let mut sections: Vec<String> = rows
         .iter()
         .map(|row| {
-            let execution = &row.execution_facet;
             let status = if row.closed {
                 "closed"
+            } else if row.result.is_some() {
+                "done"
             } else {
-                match execution.execution {
-                    "running" => "running",
-                    "queued" => "queued",
-                    "idle" if row.result.is_some() => "done",
-                    "idle" => "idle",
-                    "failed" => "failed",
-                    "closed" => "closed",
-                    _ if row.result.is_some() => "result available; execution unknown",
-                    _ => "unknown",
-                }
+                "still running"
             };
             let brief_preview: String = row
                 .brief
                 .chars()
                 .take(PEER_GATHER_TOOL_BRIEF_PREVIEW_CHARS)
                 .collect();
-            let body = match row.result.as_deref() {
-                Some(result) => format!("Latest delivered result (historical):\n{result}"),
-                None => "(no delivered result recorded)".to_owned(),
-            };
-            let prior_result_note = if row.result.is_some()
-                && matches!(execution.execution, "queued" | "running")
-            {
-                format!(
-                    "\nThe current turn is {}; the result below is from an earlier turn.",
-                    execution.execution
-                )
-            } else {
-                String::new()
-            };
+            let body = row
+                .result
+                .as_deref()
+                .unwrap_or("(still running — no result yet)");
             // Address by NAME; annotate the slug when it differs so the model
             // can still pass slugs to a targeted peer_gather.
             let header = if row.name == row.slug {
@@ -19666,10 +19600,7 @@ fn compose_peer_gather_text_with_truncation(rows: &[PeerBlackboardRow]) -> (Stri
             } else {
                 format!("## peer {} [{}] ({status})", row.name, row.slug)
             };
-            format!(
-                "{header}\nCurrent execution: exec={} round={} rounds_delivered={}{prior_result_note}\nBrief: {brief_preview}\n\n{body}\n",
-                execution.execution, execution.round, execution.rounds_delivered
-            )
+            format!("{header}\nBrief: {brief_preview}\n\n{body}\n")
         })
         .collect();
     let joined_len =
@@ -19877,188 +19808,6 @@ fn commit_gathered_peer_results(
         ));
     }
     peer_io::write_peer_file_atomic(peers_root, &peer_consumption_leaf(master), &body)
-}
-
-/// OUP-prepared peers need not have a supervised task id. Bind this turn to
-/// the staged directory's durable UUID as well as the peer's recorded owner.
-/// A purge followed by a re-stage under the same slug starts a new lifetime.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct PeerCheckpointHandoff {
-    slug: String,
-    stage_id: uuid::Uuid,
-    task_id: Option<String>,
-    master: SessionKey,
-    workspace: PathBuf,
-}
-
-impl PeerCheckpointHandoff {
-    fn read(
-        dir: &Path,
-        profile: &str,
-        slug: &str,
-        initialize: Option<&std::sync::MutexGuard<'_, ()>>,
-    ) -> Option<Self> {
-        if dir
-            .join(crate::peers::app_binding::HOST_BINDING_LEAF)
-            .symlink_metadata()
-            .is_ok()
-            || peer_io::read_peer_control_file(dir, "closed", peer_io::PEER_FILE_READ_CAP_SMALL)
-                .ok()?
-                .is_some()
-        {
-            return None;
-        }
-        let owner = peer_io::read_peer_file(dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)?;
-        let master = SessionKey(owner.trim().to_owned());
-        if master.profile_id() != Some(profile)
-            || master.chat_id().is_empty()
-            || master.0.chars().any(char::is_control)
-            || master.topic().is_some_and(|topic| {
-                topic.starts_with("peer-")
-                    || topic.starts_with(crate::peers::app_binding::PEER_CONTEXT_TOPIC_PREFIX)
-            })
-        {
-            return None;
-        }
-        let task_id = match peer_io::read_peer_identity_file(dir, "lifetime.json") {
-            peer_io::PeerFileRead::Missing => None, // peer/prepare has no supervised task record.
-            peer_io::PeerFileRead::Valid(_) => {
-                Some(trusted_lifetime_projection(dir, profile, slug)?.task_id)
-            }
-            peer_io::PeerFileRead::Invalid(_) => return None,
-        };
-        let workspace = PathBuf::from(peer_io::read_peer_file(
-            dir,
-            "workspace-root",
-            peer_io::PEER_FILE_READ_CAP_SMALL,
-        )?);
-        if !workspace.is_absolute() {
-            return None;
-        }
-        let stage_id = match peer_io::read_peer_control_file(dir, "checkpoint-stage-id", 64).ok()? {
-            Some(id) => uuid::Uuid::parse_str(&id).ok()?,
-            None => {
-                let guard = initialize?;
-                let id = uuid::Uuid::new_v4();
-                peer_io::write_peer_file_durable_locked(
-                    dir,
-                    "checkpoint-stage-id",
-                    &id.to_string(),
-                    guard,
-                )
-                .ok()?;
-                id
-            }
-        };
-        Some(Self {
-            slug: slug.to_owned(),
-            stage_id,
-            task_id,
-            master,
-            workspace,
-        })
-    }
-
-    fn capture(
-        root: &Path,
-        profile: &str,
-        session: &SessionKey,
-        caller_workspace: &Path,
-    ) -> Option<Self> {
-        let (peer_profile, slug) = peer_slug_and_profile(session)?;
-        if peer_profile != profile || peer_trusted_session(profile, slug).as_ref() != Some(session)
-        {
-            return None;
-        }
-        let dir = staged_peer_dir(root, slug)?;
-        let lock = peer_io::mutation_lock(&dir);
-        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let binding = Self::read(&dir, profile, slug, Some(&guard))?;
-        let cwd = match peer_io::read_peer_file(&dir, "workspace-mode", 64)?.as_str() {
-            "shared" => binding.workspace.clone(),
-            "fenced" => dir.join("wt"),
-            _ => return None,
-        };
-        (dunce::canonicalize(cwd).ok()? == dunce::canonicalize(caller_workspace).ok()?)
-            .then_some(binding)
-    }
-
-    fn publish(
-        &self,
-        orchestrator: &InProcessAgentOrchestrator,
-        root: &Path,
-        session: &SessionKey,
-        turn: &str,
-        message: &str,
-        handoff_id: &str,
-    ) -> Result<String, String> {
-        use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
-        if message.trim().is_empty() || message.len() > 8192 {
-            return Err("Checkpoint must contain 1..8192 UTF-8 bytes".into());
-        }
-        let (profile, slug) =
-            peer_slug_and_profile(session).ok_or("Caller is not a staged peer")?;
-        if slug != self.slug {
-            return Err("Caller is not the publishing peer".into());
-        }
-        let dir = staged_peer_dir(root, &self.slug).ok_or("Peer is no longer staged")?;
-        let lock = peer_io::mutation_lock(&dir);
-        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let wire = peer_wire_registry()
-            .by_key
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if wire.get(&peer_wire_key(profile, &self.slug)) != Some(session)
-            || Self::read(&dir, profile, &self.slug, None).as_ref() != Some(self)
-        {
-            return Err("Staged peer or supervisor binding changed".into());
-        }
-        if self.task_id.is_some()
-            && !trusted_lifetime_projection(&dir, profile, slug).is_some_and(|lifetime| {
-                lifetime.turn_id.as_deref() == Some(turn)
-                    && matches!(
-                        lifetime.phase,
-                        LifetimePhase::Running | LifetimePhase::Pending
-                    )
-            })
-        {
-            return Err("Publishing turn no longer owns the supervised peer".into());
-        }
-        let target = orchestrator.scoped_goal_key(&self.master);
-        if session_workspace_root_for_profile(Some(profile), &self.master).as_ref()
-            != Some(&self.workspace)
-        {
-            return Err("Supervisor must open the staged workspace to receive this handoff".into());
-        }
-        let checkpoint = json!({"version":1, "session":session, "turn_id":turn, "message":message,
-            "handoff_id":handoff_id, "is_completion":false});
-        let envelope = json!({"publication":self, "checkpoint":checkpoint});
-        match orchestrator.enqueue_peer_checkpoint_handoff(
-            &target,
-            profile,
-            self.stage_id,
-            handoff_id,
-            envelope.to_string(),
-            || {
-                peer_io::write_peer_file_durable_locked(
-                    &dir,
-                    "checkpoint.json",
-                    &checkpoint.to_string(),
-                    &guard,
-                )
-            },
-        ) {
-            PeerSendInputEnqueueOutcome::Queued => Ok(format!(
-                "Checkpoint published. Supervisor handoff {handoff_id} queued."
-            )),
-            PeerSendInputEnqueueOutcome::Duplicate => Ok(format!(
-                "Supervisor handoff {handoff_id} was already accepted."
-            )),
-            PeerSendInputEnqueueOutcome::PersistFailed => Err(format!(
-                "Could not durably publish supervisor handoff {handoff_id}. Retry the same ID."
-            )),
-        }
-    }
 }
 
 fn publish_peer_checkpoint(
@@ -28307,14 +28056,12 @@ async fn maybe_spawn_appui_master_continuation_runner(
     else {
         return false;
     };
-    let runtime_state = MasterContinuationRuntimeState::idle()
-        .with_workflow_activities()
-        .with_approval_pending(
-            !contracts
-                .approvals
-                .pending_for_session(&session_id)
-                .is_empty(),
-        );
+    let runtime_state = MasterContinuationRuntimeState::idle().with_approval_pending(
+        !contracts
+            .approvals
+            .pending_for_session(&session_id)
+            .is_empty(),
+    );
     // #2066 round 3 (codex fix 2) — ATOMIC drain-and-claim, the same
     // primitive the session actor uses: the in-flight claim and the pop
     // happen under ONE state lock, so this path can never pop a one-shot it
@@ -28338,70 +28085,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // (if any) drops here and releases immediately.
         return false;
     };
-    let scheduler = default_agent_orchestrator();
-    let activity = match workflow_activity::PeerActivity::from_item(&continuation) {
-        Ok(activity) => activity,
-        Err(error) => {
-            tracing::error!(%error, "invalid durable workflow activity");
-            scheduler.mark_continuation_completed(
-                &continuation,
-                Some(format!("invalid_workflow_activity: {error}")),
-            );
-            return false;
-        }
-    };
-    if let Some(activity) = &activity {
-        let decision = resolve_session_profile_runtime(state, Some(&profile_id))
-            .ok_or_else(|| eyre::eyre!("workflow profile unavailable"))
-            .and_then(|runtime| activity.preflight(&runtime.data_dir, &continuation, scheduler));
-        match decision {
-            Ok(None) => (),
-            Ok(Some(reason)) => {
-                scheduler.mark_continuation_completed(&continuation, Some(reason.to_owned()));
-                drop(claim_guard);
-                scheduler.signal_pending(&goal_storage_key, &profile_id);
-                return false;
-            }
-            Err(error) => {
-                tracing::error!(%error, "unable to reconcile durable workflow event");
-                scheduler.reinsert_peer_continuation(continuation);
-                return false;
-            }
-        }
-    }
-    if matches!(&continuation.reason, MasterContinuationReason::External(kind)
-        if kind == crate::autonomy::agent_orchestrator::PEER_CHECKPOINT_HANDOFF_KIND)
-    {
-        let binding = continuation
-            .metadata
-            .get("envelope")
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|envelope| {
-                serde_json::from_value::<PeerCheckpointHandoff>(envelope["publication"].clone())
-                    .ok()
-            });
-        let current = binding.as_ref().is_some_and(|binding| {
-            binding.master == session_id
-                && session_workspace_root_for_profile(Some(&profile_id), &session_id).as_ref()
-                    == Some(&binding.workspace)
-                && resolve_session_profile_runtime(state, Some(&profile_id))
-                    .and_then(|runtime| {
-                        staged_peer_dir(&runtime.data_dir.join("peers"), &binding.slug)
-                    })
-                    .and_then(|dir| {
-                        PeerCheckpointHandoff::read(&dir, &profile_id, &binding.slug, None)
-                    })
-                    .as_ref()
-                    == Some(binding)
-        });
-        if !current {
-            default_agent_orchestrator().mark_continuation_completed(
-                &continuation,
-                Some("retired_peer_handoff_binding_changed".to_owned()),
-            );
-            return false;
-        }
-    }
     if peer_synthesis_was_consumed(state, &continuation, &active).await {
         default_agent_orchestrator().mark_continuation_completed(
             &continuation,
@@ -28568,7 +28251,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
         || matches!(
             &continuation.reason,
             MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
-                || kind == crate::autonomy::agent_orchestrator::PEER_CHECKPOINT_HANDOFF_KIND
                 || kind == crate::autonomy::agent_orchestrator::CRON_FIRE_EXTERNAL_KIND
         );
     let cache_reservation = match reserve_peer_build_cache_turn(
@@ -28588,8 +28270,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
     // interactive turn-start path.
     let turn_cancel = tokio_util::sync::CancellationToken::new();
     let turn_cancel_for_agent = turn_cancel.clone();
-    let wake_session = goal_storage_key.clone();
-    let wake_profile = profile_id.clone();
     let handle = tokio::spawn(async move {
         let _cache_reservation = cache_reservation;
         if start_rx.await.is_err() {
@@ -28662,7 +28342,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // retry/replay. `None` for every other continuation kind (unchanged).
         let turn_dispatched = requires_message_dispatch
             .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let physical_turn = params.turn_id.0.to_string();
         run_standalone_turn(
             Arc::new(ws_for_turn),
             state_for_turn,
@@ -28674,7 +28353,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             prompt,
             None,
             routed_profile_id,
-            turn_state_for_task.clone(),
+            turn_state_for_task,
             interrupt_rx,
             Some(steer_buffer_for_turn),
             true,
@@ -28728,45 +28407,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let agent_dispatched = turn_dispatched
             .as_ref()
             .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
-        let workflow_interrupted = activity.is_some()
-            && matches!(
-                *turn_state_for_task.lock().await,
-                TurnState::Terminal(TerminalReason::Interrupted) | TurnState::Interrupting { .. }
-            );
-        if workflow_interrupted
-            || continuation_may_complete(requires_message_dispatch, agent_dispatched)
-        {
-            if let Some(activity) = activity {
-                use octos_workflows::activity::WorkerExit;
-                let exit = match *turn_state_for_task.lock().await {
-                    TurnState::Terminal(TerminalReason::Completed) => WorkerExit::Returned,
-                    TurnState::Terminal(TerminalReason::Interrupted)
-                    | TurnState::Interrupting { .. } => WorkerExit::Interrupted,
-                    _ => WorkerExit::Failed,
-                };
-                let returned = workflow_activity::WorkerReturn {
-                    exit,
-                    turn_id: physical_turn,
-                };
-                match activity.record_exit(&continuation, scheduler, &returned) {
-                    Ok(()) => scheduler.mark_continuation_completed(
-                        &continuation,
-                        Some("workflow_worker_exit_durable".into()),
-                    ),
-                    Err(error) => {
-                        tracing::error!(%error, "unable to persist workflow worker exit");
-                        let mut pending = continuation;
-                        pending.metadata.insert(
-                            workflow_activity::UNSAVED_EXIT.into(),
-                            serde_json::to_string(&returned).expect("worker exit serializes"),
-                        );
-                        scheduler.reinsert_peer_continuation(pending);
-                    }
-                }
-                drop(_in_flight_guard);
-                scheduler.signal_pending(&wake_session, &wake_profile);
-                return;
-            }
+        if continuation_may_complete(requires_message_dispatch, agent_dispatched) {
             default_agent_orchestrator().mark_continuation_completed(
                 &continuation,
                 Some("processed_by_appui_turn_runtime".to_owned()),
@@ -28782,10 +28423,6 @@ async fn maybe_spawn_appui_master_continuation_runner(
                  injection for live retry"
             );
             default_agent_orchestrator().reinsert_peer_continuation(continuation);
-        }
-        drop(_in_flight_guard);
-        if agent_dispatched {
-            scheduler.signal_pending(&wake_session, &wake_profile);
         }
     });
 
@@ -28887,7 +28524,6 @@ fn continuation_may_complete(is_peer_injection: bool, agent_dispatched: bool) ->
 // per-request dependency list, not a missing struct.
 #[allow(clippy::too_many_arguments)]
 async fn drain_appui_due_master_continuations(
-    ready_target: Option<(SessionKey, String)>,
     ws: &WsConnection,
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
@@ -28903,20 +28539,7 @@ async fn drain_appui_due_master_continuations(
     features: ConnectionUiFeatures,
 ) {
     let orchestrator = default_agent_orchestrator();
-    let targets = match ready_target {
-        Some((key, profile)) if profile_filter.is_none_or(|p| p == profile) => vec![(key, profile)],
-        Some(_) => return,
-        None => orchestrator.due_loop_targets_with_filter(
-            profile_filter,
-            8,
-            Some(&|key, _| {
-                let wire = wire_key_from_goal_key(key);
-                (!restrict_to_open_sessions || open_sessions.contains(&wire))
-                    && peer_target_deliverable_on_connection(&wire, open_sessions)
-            }),
-        ),
-    };
-    for (storage_key, profile_id) in targets {
+    for (storage_key, profile_id) in orchestrator.due_loop_targets(profile_filter, 8) {
         // #1666 residue — a scoped goal target fires only for the currently
         // active folder of its wire id (a backgrounded folder's goal is
         // skipped until it is re-opened), so a stale-cwd continuation can never
@@ -41055,25 +40678,6 @@ async fn run_standalone_turn(
         // never hand off recursively. The staged event is sent DURABLE so a
         // briefly-disconnected client still opens the peer on replay.
         if peer_handoff_allowed_for_session(&session_id) {
-            let master = session_id.clone();
-            let profile = session_runtime.profile.profile_id.clone();
-            let workspace = session_runtime.workspace_root.clone();
-            tool_registry.register(octos_agent::PeerCheckpointInboxTool::new(
-                move |ids, after| {
-                    if session_workspace_root_for_profile(Some(&profile), &master).as_ref()
-                        != Some(&workspace)
-                    {
-                        return Err("Supervisor workspace binding changed".into());
-                    }
-                    default_agent_orchestrator().peer_checkpoint_inbox(
-                        &master,
-                        &profile,
-                        &workspace,
-                        &ids,
-                        after.as_deref(),
-                    )
-                },
-            ));
             let peer_ws = ws.clone();
             let peer_ledger = ledger.clone();
             // #1868 Phase 1 — enroll the peer as SUPERVISED work. Peers were
@@ -41245,62 +40849,11 @@ async fn run_standalone_turn(
             let profile = session_runtime.profile.profile_id.clone();
             let caller = session_id.clone();
             let turn = turn_id.clone();
-            let handoff = PeerCheckpointHandoff::capture(
-                &root,
-                &profile,
-                &caller,
-                &session_runtime.workspace_root,
-            );
-            let publish_root = root.clone();
-            let publish_profile = profile.clone();
-            let publish_caller = caller.clone();
-            let turn = turn.0.to_string();
-            let publish_turn = turn.clone();
-            let mut tool = octos_agent::PeerPublishTool::new(Arc::new(move |message| {
-                publish_peer_checkpoint(
-                    &publish_root,
-                    &publish_profile,
-                    &publish_caller,
-                    &publish_turn,
-                    &message,
-                )
-            }));
-            if let Some(binding) = handoff {
-                if let Some(plugin) = tool_registry
-                    .get("pptx_tool")
-                    .and_then(|t| {
-                        t.as_any()
-                            .downcast_ref::<octos_agent::plugins::PluginTool>()
-                    })
-                    .filter(|t| t.plugin_name() == "pptx-runtime")
-                {
-                    let router = pptx_dispatch::PublicationRouter {
-                        root: root.clone(),
-                        profile: profile.clone(),
-                        caller: caller.clone(),
-                        stage: binding.clone(),
-                        turn: turn.clone(),
-                    };
-                    let hooked = plugin.with_result_handler(move |owner, args, result| {
-                        router.observe(default_agent_orchestrator(), owner, args, result)
-                    });
-                    let origin = tool_registry
-                        .origin("pptx_tool")
-                        .expect("registered plugin origin");
-                    tool_registry.register_with_origin(hooked, origin);
-                }
-                tool = tool.with_handoff(move |message, id| {
-                    binding.publish(
-                        default_agent_orchestrator(),
-                        &root,
-                        &caller,
-                        &turn,
-                        &message,
-                        &id,
-                    )
-                });
-            }
-            tool_registry.register(tool);
+            tool_registry.register(octos_agent::PeerPublishTool::new(Arc::new(
+                move |message| {
+                    publish_peer_checkpoint(&root, &profile, &caller, &turn.0.to_string(), &message)
+                },
+            )));
         }
 
         // `peer_list` — the compact status INDEX companion to `peer_gather`:
@@ -41445,25 +40998,8 @@ async fn run_standalone_turn(
                 turn_id.clone(),
                 crate::peers::host_tools::PEER_INPUT_ANSWER_WAIT,
             );
-            let dispatch_root = session_runtime.profile.data_dir.join("peers");
-            let dispatch_profile = session_runtime.profile.profile_id.clone();
-            let dispatch_workspace = session_runtime.workspace_root.clone();
-            let dispatch_master = session_id.clone();
-            tool_registry.register(
-                octos_agent::PeerSendInputTool::new(send_input)
-                    .with_answer(answer)
-                    .with_page_batch(move |digest| {
-                        pptx_dispatch::deliver(
-                            default_agent_orchestrator(),
-                            &dispatch_workspace,
-                            &dispatch_root,
-                            &dispatch_profile,
-                            &dispatch_master,
-                            digest,
-                        )
-                        .map_err(|e| e.to_string())
-                    }),
-            );
+            tool_registry
+                .register(octos_agent::PeerSendInputTool::new(send_input).with_answer(answer));
 
             // `peer_close` — retire a running peer the caller created (#1842:
             // the close STOPS it — the callback interrupts its in-flight turn).

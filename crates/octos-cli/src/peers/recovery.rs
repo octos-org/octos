@@ -178,34 +178,20 @@ pub(crate) fn invalidate_peer_lifetime_for_input(
     peers_root: &Path,
     slug: &str,
 ) -> std::io::Result<()> {
+    let _guard = lifetime_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(dir) = staged_peer_dir(peers_root, slug) else {
         return Ok(());
     };
-    with_peer_input_lifetime(&dir, |advance| advance())
-}
-
-// Hold lifetime then directory locks before the caller binds the wire and
-// queues its occurrence. A deduplicated assignment never advances a lifetime.
-pub(crate) fn with_peer_input_lifetime<T>(
-    dir: &Path,
-    f: impl FnOnce(&dyn Fn() -> std::io::Result<()>) -> T,
-) -> T {
-    let _lifetime = lifetime_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let lock = peer_io::mutation_lock(dir);
-    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    f(&|| {
-        let Some(mut record) = read_lifetime(dir) else {
-            return Ok(());
-        };
-        record.generation = record
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("peer lifetime input generation exhausted"))?;
-        record.phase = LifetimePhase::Pending;
-        record.result_digest = None;
-        let json = serde_json::to_string(&record).map_err(std::io::Error::other)?;
-        peer_io::write_peer_file_durable_locked(dir, LIFETIME_FILE, &json, &guard)
-    })
+    let Some(mut record) = read_lifetime(&dir) else {
+        return Ok(());
+    };
+    record.generation = record
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("peer lifetime input generation exhausted"))?;
+    record.phase = LifetimePhase::Pending;
+    record.result_digest = None;
+    write_lifetime(&dir, &record)
 }
 
 /// Called immediately before actual dispatch. A dropped/aborted turn leaves

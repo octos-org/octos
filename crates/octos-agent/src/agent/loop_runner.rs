@@ -1445,7 +1445,7 @@ impl Agent {
                         ) {
                             turn.record_budget_stop(&stop);
                             // Skip system prompt + history; return only new messages
-                            return stop.finish_conversation(ConversationResponse {
+                            return Ok(ConversationResponse {
                                 content: stop.message(),
                                 reasoning_content: None,
                                 provider_metadata: None,

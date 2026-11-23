@@ -427,7 +427,6 @@ pub(crate) struct MasterContinuationRuntimeState {
     pub(crate) activity: RuntimeActivity,
     pub(crate) user_input_pending: bool,
     pub(crate) approval_pending: bool,
-    pub(crate) handles_workflow_activities: bool,
 }
 
 impl MasterContinuationRuntimeState {
@@ -436,7 +435,6 @@ impl MasterContinuationRuntimeState {
             activity: RuntimeActivity::Idle,
             user_input_pending: false,
             approval_pending: false,
-            handles_workflow_activities: false,
         }
     }
 
@@ -445,13 +443,7 @@ impl MasterContinuationRuntimeState {
             activity: RuntimeActivity::Busy,
             user_input_pending: false,
             approval_pending: false,
-            handles_workflow_activities: false,
         }
-    }
-
-    pub(crate) fn with_workflow_activities(mut self) -> Self {
-        self.handles_workflow_activities = true;
-        self
     }
 
     pub(crate) fn with_user_input_pending(mut self, pending: bool) -> Self {

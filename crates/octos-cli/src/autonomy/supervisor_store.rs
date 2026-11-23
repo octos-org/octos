@@ -1402,24 +1402,6 @@ impl SupervisorStore {
         )
     }
 
-    /// Query the incremental continuation index without replaying the full supervisor ledger.
-    pub fn has_continuation(
-        &self,
-        group: &str,
-        matches: impl Fn(&PendingContinuationRecord) -> bool,
-    ) -> io::Result<bool> {
-        let _lock = self.acquire_append_lock()?;
-        let mut cache = self.lock_seq_cache();
-        self.refresh_continuations_locked(&mut cache)?;
-        Ok(cache.continuations.as_ref().is_some_and(|index| {
-            index
-                .state
-                .continuations
-                .values()
-                .any(|record| record.group_id == group && matches(record))
-        }))
-    }
-
     /// Check replayed state and append under the same cross-process lock.
     /// Completed is final for retry callers, even for a higher offered attempt.
     pub fn record_continuation_queued_if_not_completed(

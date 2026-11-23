@@ -4,8 +4,8 @@
 //! sovereign peer sessions, `peer_gather` fans their results back IN. The
 //! tool reads the durable blackboard (each peer's brief + latest result
 //! file) through an injected host callback and hands the model one composed
-//! plain-text view. Current execution is separate from historical results;
-//! absent lifetime evidence remains unknown, not inferred running or idle.
+//! plain-text view; peers that have not finished a turn yet are listed as
+//! still running.
 //!
 //! Like `peer_handoff`, the tool is deliberately NOT registered anywhere by
 //! default — construction requires the gather callback, which only the
@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::{Tool, ToolResult};
 
@@ -65,22 +64,6 @@ struct Input {
     wait_ms: u64,
     #[serde(default)]
     slugs: Option<Vec<String>>,
-    #[serde(default)]
-    with_cursor: bool,
-    #[serde(default)]
-    after_cursor: Option<String>,
-}
-
-fn cursor(board: &str) -> String {
-    // Group the digest to keep an opaque snapshot ID distinguishable from a credential.
-    let digest = format!("{:x}", Sha256::digest(board.as_bytes()));
-    format!(
-        "board-{}",
-        (0..8)
-            .map(|i| &digest[i * 8..i * 8 + 8])
-            .collect::<Vec<_>>()
-            .join("-")
-    )
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -102,10 +85,9 @@ impl Tool for PeerGatherTool {
          (peers write results when their turns end). Also reads automatic workspace peers by workspace agent_id. Use AFTER you have handed \
          work off with peer_handoff — typically later in the conversation, or \
          when the user asks what the peers found — to collect and synthesize \
-         their results. Consult current execution (running/queued/idle/unknown), \
-         not a historical result, before deciding availability. Dispatch other \
-         ready independent work before waiting; do not busy-wait on results. \
-         Pass slugs to read specific peers; omit to read all. Use with_cursor on the first read, then after_cursor with the same slugs and wait_ms (0..60000) to return changes since that read immediately. Timeout does not mean completion."
+         their results. Peers with no result yet are listed as still running; \
+         do not busy-wait on them, continue other work and gather again later. \
+         Pass slugs to read specific peers; omit to read all. Optional wait_ms (0..60000) waits for a blackboard change; timeout does not mean completion."
     }
 
     fn tags(&self) -> &[&str] {
@@ -127,8 +109,6 @@ impl Tool for PeerGatherTool {
             "type": "object",
             "properties": {
                 "wait_ms": {"type":"integer","minimum":0,"maximum":60000,"description":"Wait for a change to the selected blackboard; cancellation interrupts the wait. Timeout is not completion."},
-                "with_cursor": {"type":"boolean","description":"Prefix the delivered blackboard with its cursor for a later wait."},
-                "after_cursor": {"type":"string","description":"Return immediately if the selected blackboard differs from this earlier cursor. The response includes the current cursor."},
                 "slugs": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -175,29 +155,22 @@ impl Tool for PeerGatherTool {
                 Err(e) => return Ok(failure(e)),
             };
             let end = tokio::time::Instant::now() + std::time::Duration::from_millis(input.wait_ms);
-            let mut changed = input
-                .after_cursor
-                .as_ref()
-                .is_some_and(|previous| previous != &cursor(&initial));
-            while !changed {
+            loop {
                 let now = tokio::time::Instant::now();
                 if now >= end {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250).min(end - now)).await;
-                changed = match probe(slugs.clone()) {
-                    Ok(v) => v != initial,
+                match probe(slugs.clone()) {
+                    Ok(v) if v != initial => break,
+                    Ok(_) => {}
                     Err(e) => return Ok(failure(e)),
-                };
+                }
             }
         }
         match (self.gather)(slugs) {
             Ok(text) => Ok(ToolResult {
-                output: if input.with_cursor || input.after_cursor.is_some() {
-                    format!("cursor: {}\n{text}", cursor(&text))
-                } else {
-                    text
-                },
+                output: text,
                 success: true,
                 ..Default::default()
             }),
@@ -210,31 +183,6 @@ impl Tool for PeerGatherTool {
 mod wait_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
-    #[tokio::test]
-    async fn result_published_between_gather_and_wait_is_delivered_immediately() {
-        let round = Arc::new(AtomicU32::new(1));
-        let board: PeerGatherCallback = {
-            let round = round.clone();
-            Arc::new(move |_| Ok(format!("round {}", round.load(Ordering::SeqCst))))
-        };
-        let tool = PeerGatherTool::with_wait_probe(board.clone(), board);
-        let first = tool.execute(&json!({"with_cursor":true})).await.unwrap();
-        assert_eq!(
-            first.output,
-            format!("cursor: {}\nround 1", cursor("round 1"))
-        );
-        round.store(2, Ordering::SeqCst);
-        let wait = json!({"wait_ms":60000,"after_cursor":cursor("round 1")});
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(200), tool.execute(&wait))
-                .await
-                .expect("already-published result must not wait for another change")
-                .unwrap();
-        assert_eq!(
-            result.output,
-            format!("cursor: {}\nround 2", cursor("round 2"))
-        );
-    }
     #[tokio::test]
     async fn wait_probes_changes_but_only_acknowledges_delivered_results() {
         let probes = Arc::new(AtomicU32::new(0));

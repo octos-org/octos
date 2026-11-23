@@ -7,6 +7,5 @@
 //! `crate::workflow_runtime::…` / `crate::workflows::…` reference (session_actor,
 //! project_templates, …) resolves unchanged.
 
-pub mod activity;
 pub mod workflow_runtime;
 pub mod workflows;

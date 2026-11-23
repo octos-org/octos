@@ -11,8 +11,6 @@ name = "octos"
 path = "src/main.rs"
 
 [dependencies]
-octoscript-workflow = { git = "https://github.com/OctoSense-org/Octoscript.git", rev = "e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23" }
-octoscript-capabilities = { git = "https://github.com/OctoSense-org/Octoscript.git", rev = "e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23" }
 # In-process llama.cpp GGUF embedding provider. Deliberately NOT target-gated:
 # unlike octos-embed-mlx this builds on macOS, Linux and Windows, ARM and x86,
 # which is the entire reason it exists. Optional, so it costs nothing until
