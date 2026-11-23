@@ -124,3 +124,10 @@ Wrong owner/attempt/generation, healthy vs stale lease, exact cap/overflow, gran
 - `cargo +1.97.1 test -p octos-fleet --lib -- --list` — 181 lib tests listed; every exact name above is present in that output.
 - `python3 wake/test-lines.py` at `main@1d52f810` — octos **435,216 lines / 11,120 counted tests**, octos-fleet **8,978 / 181**.
 - This PR adds only this Markdown inventory; it neither deletes nor modifies tests or production code.
+
+## Declared task inputs (UPCR-2026-RBC0874AA)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `fleet::tests::should_keep_a_tasks_declared_inputs_through_the_plan_to_its_view` | 2 | A task's declared inputs survive the plan, the store and the view a worker is handed. |
+| `fleet::tests::should_read_and_write_a_task_without_inputs_as_before_inputs_existed` | 4 | A task without inputs is written as before the field existed, and a record from before it reads back. |

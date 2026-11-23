@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
+use octos_core::task_inputs::DeclaredInput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -66,6 +67,11 @@ pub struct PeerHandoffRequest {
     /// Optional cumulative token limit for this peer's turns. Omit when the
     /// user did not specify a budget.
     pub token_budget: Option<u64>,
+    /// Files the peer needs to begin (see [`octos_core::task_inputs`]). The
+    /// host checks them against what the peer may read, records them with the
+    /// brief, and puts them into the peer's first model request. Empty when
+    /// the handoff declares none.
+    pub inputs: Vec<DeclaredInput>,
 }
 
 /// Staged-peer facts the host callback returns on success.
@@ -89,6 +95,10 @@ pub struct PeerHandoffStaged {
     pub model_note: Option<String>,
     /// Cumulative peer token limit written at staging, if requested.
     pub token_budget: Option<u64>,
+    /// What the host found when it checked the declared inputs at staging,
+    /// one line per input, surfaced in the tool's success output. `None` when
+    /// the handoff declared none.
+    pub inputs_note: Option<String>,
 }
 
 /// Host staging callback. Synchronous by design: the tool needs the staged
@@ -125,6 +135,8 @@ struct Input {
     task_id: Option<String>,
     #[serde(default)]
     token_budget: Option<u64>,
+    #[serde(default)]
+    inputs: Option<Value>,
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -192,7 +204,8 @@ impl Tool for PeerHandoffTool {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Optional cumulative token budget for this peer. Set only when the user requested a token limit; the peer stops accepting new turns after the limit is reached."
-                }
+                },
+                "inputs": octos_core::task_inputs::declared_inputs_schema()
             }
         })
     }
@@ -229,12 +242,17 @@ impl Tool for PeerHandoffTool {
         if brief.len() > PEER_HANDOFF_BRIEF_MAX_BYTES {
             return Ok(failure(format!(
                 "brief exceeds {PEER_HANDOFF_BRIEF_MAX_BYTES} bytes — a brief is a task \
-                 contract; keep the payload in the workspace and reference it by path."
+                 contract; keep the payload in the workspace and declare it in `inputs` \
+                 (or reference it by path)."
             )));
         }
         if input.token_budget == Some(0) {
             return Ok(failure("token_budget must be a positive integer"));
         }
+        let inputs = match octos_core::task_inputs::parse_declared_inputs(input.inputs.as_ref()) {
+            Ok(inputs) => inputs,
+            Err(err) => return Ok(failure(format!("invalid peer_handoff arguments: {err}"))),
+        };
         // Normalize the optional model lane: trim and drop an empty/whitespace
         // value to `None` so the host only ever sees a real lane key.
         let model = input
@@ -251,6 +269,7 @@ impl Tool for PeerHandoffTool {
             goal_id: input.goal_id,
             task_id: input.task_id,
             token_budget: input.token_budget,
+            inputs,
         };
         match (self.stage)(request) {
             Ok(staged) => {
@@ -279,6 +298,13 @@ impl Tool for PeerHandoffTool {
                 if let Some(limit) = staged.token_budget {
                     output.push_str(&format!(" Peer token budget: {limit}."));
                 }
+                if let Some(note) = &staged.inputs_note {
+                    output.push_str(
+                        "\nDeclared inputs, as checked now; they go into the peer's first \
+                         model request:\n",
+                    );
+                    output.push_str(note);
+                }
                 Ok(ToolResult {
                     output,
                     success: true,
@@ -287,5 +313,95 @@ impl Tool for PeerHandoffTool {
             }
             Err(err) => Ok(failure(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octos_core::task_inputs::InputKind;
+    use std::sync::Mutex;
+
+    type Seen = Arc<Mutex<Vec<PeerHandoffRequest>>>;
+
+    fn tool_recording(seen: Seen) -> PeerHandoffTool {
+        PeerHandoffTool::new(Arc::new(move |request| {
+            seen.lock().unwrap().push(request);
+            Ok(PeerHandoffStaged {
+                slug: "edison".into(),
+                topic: "peer-edison".into(),
+                brief_path: "/data/peers/edison/brief.md".into(),
+                cwd: "/work".into(),
+                worktree_branch: None,
+                model_note: None,
+                token_budget: None,
+                inputs_note: Some("renders/page-03.png: delivered as image (67 bytes)".into()),
+            })
+        }))
+    }
+
+    #[tokio::test]
+    async fn should_hand_declared_inputs_to_the_host_when_the_handoff_names_them() {
+        let seen = Seen::default();
+        // The model is told what declaring an input does...
+        let offered = tool_recording(seen.clone()).input_schema();
+        assert!(
+            offered["properties"]["inputs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("FIRST model request")
+        );
+        // ...and what it declares reaches the host.
+        let result = tool_recording(seen.clone())
+            .execute(&json!({
+                "name": "Edison",
+                "brief": "Review slide 3 against its source.",
+                "inputs": [
+                    "pages/page-03.json",
+                    { "path": "renders/page-03.png", "kind": "image", "required": false },
+                ],
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            seen.lock().unwrap()[0].inputs,
+            [
+                DeclaredInput::required("pages/page-03.json"),
+                DeclaredInput {
+                    kind: InputKind::Image,
+                    ..DeclaredInput::optional("renders/page-03.png")
+                },
+            ]
+        );
+        // The host's check of the inputs reaches the model that handed off.
+        assert!(
+            result
+                .output
+                .contains("renders/page-03.png: delivered as image (67 bytes)"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn should_stage_nothing_when_the_declared_inputs_are_malformed() {
+        let seen = Seen::default();
+        let result = tool_recording(seen.clone())
+            .execute(&json!({
+                "name": "Edison",
+                "brief": "Do the thing.",
+                "inputs": [{ "path": "a.txt", "optional": true }],
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("inputs[0]"), "{}", result.output);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the host was asked to stage"
+        );
     }
 }

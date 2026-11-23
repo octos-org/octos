@@ -138,3 +138,15 @@ T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同
 - `cargo +1.97.1 test -p octos-fleet-worker -- --list`：66 项，保留 43 项与拟删 23 项互斥且完备。
 - `cargo +1.97.1 test -p octos-fleet-worker`：**65 passed / 0 failed / 1 ignored**。
 - 本 PR 只新增本文件；required job 名、check-arm、通用 selector、生产代码和测试均未改。
+
+## Declared task inputs (UPCR-2026-RBC0874AA)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `first_inputs_tests::should_put_the_source_and_the_failing_test_in_the_first_request_of_a_code_task` | 1 | Through the real worker and the OpenAI-compatible provider: a code task's first HTTP request carries the source and the failing test whole — one round and no `read_file`, against two rounds and two calls when they are only named. |
+| `first_inputs_tests::should_put_the_page_image_and_its_data_in_the_first_request_of_a_page_task` | 1 | A page task's first HTTP request carries the render as an image part and the page data, with no fetch round. |
+| `first_inputs_tests::should_send_no_request_when_a_required_input_is_missing` | 5 | A missing required input terminates the task with the per-input report; no model request is sent. |
+| `first_inputs_tests::should_send_no_request_when_a_required_input_is_not_the_workers_to_read` | 3 | A required input outside the worker's read grant is not read; the task terminates as denied, with no request. |
+| `first_inputs_tests::should_send_no_request_when_required_inputs_exceed_the_models_context` | 5 | Required inputs over the model's input budget are not truncated; the task terminates as over budget, with no request. |
+| `first_inputs_tests::should_say_in_the_first_request_which_optional_inputs_were_left_out` | 5 | Optional inputs that were left out are named with their reasons in the first request, and the task runs. |
+| `first_inputs_tests::should_never_call_an_image_too_large_for_a_model_request_delivered` | 5 | An image over the request limit is reported unsupported and is not attached. |

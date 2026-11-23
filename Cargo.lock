@@ -6384,6 +6384,7 @@ name = "octos-fleet-worker"
 version = "2.1.0-rc.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "eyre",
  "octos-agent",
  "octos-core",
@@ -6394,6 +6395,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

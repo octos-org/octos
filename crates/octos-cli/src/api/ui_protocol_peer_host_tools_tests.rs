@@ -44,7 +44,7 @@ async fn fixture() -> Fx {
 /// The "dev" profile used by both the unit fixture and the scripted e2e
 /// fixture: same openai/gpt-4o-mini shape, only the env credential pair
 /// differs (test key vs scripted-e2e key).
-fn dev_profile(env_key: &str, env_value: &str) -> crate::profiles::UserProfile {
+pub(super) fn dev_profile(env_key: &str, env_value: &str) -> crate::profiles::UserProfile {
     crate::profiles::UserProfile {
         id: "dev".to_string(),
         name: "Dev".to_string(),

@@ -2741,6 +2741,16 @@ impl LlmProvider for AdaptiveRouter {
         self.slots[idx].provider.ensure_ready().await;
     }
 
+    fn accepts_image_input(&self) -> bool {
+        if current_turn_pin().is_some() {
+            let (idx, _) = self.pinned_slot();
+            return self.slots[idx].provider.accepts_image_input();
+        }
+        self.slots
+            .iter()
+            .all(|slot| slot.provider.accepts_image_input())
+    }
+
     fn model_id(&self) -> &str {
         self.slots[self.identity_slot()].provider.model_id()
     }

@@ -141,3 +141,9 @@ Concrete `EmbedQueueFull` shedding/backfill tests live in `octos-embed-llama` an
 |---|---:|---|
 | `registry::orcarouter::tests::should_apply_gpt5_hints_to_a_prefixed_orcarouter_model_on_the_wire` | 3 | A provider-prefixed id (`openai/gpt-5`) keeps its full form on the wire while hints derive from the upstream name: `max_completion_tokens` (never `max_tokens`), no `temperature`, and the configured `reasoning_effort` is preserved. |
 | `registry::orcarouter::tests::should_let_explicit_hint_overrides_win_over_detected_gpt5_defaults` | 3 | An explicit `model_hints` override beats the detected GPT-5 defaults on the same prefixed id: plain `max_tokens`, forwarded `temperature`, and no `reasoning_effort` field. |
+
+## Declared task inputs (UPCR-2026-RBC0874AA)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `openai::tests::should_say_whether_the_model_takes_images_through_any_wrapper` | 2 | Whether the model takes image input is answered through the provider wrappers, so a declared image is reported unsupported instead of attached and then stripped. |

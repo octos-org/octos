@@ -718,6 +718,10 @@ impl LlmProvider for LocalContextProbe {
         self.inner.estimate_request_tokens(messages, tools)
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.inner.accepts_image_input()
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

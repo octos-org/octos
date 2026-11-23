@@ -70,6 +70,19 @@ pub trait LlmProvider: Send + Sync {
         context::max_output_tokens(self.model_id())
     }
 
+    /// Whether a user message's images are sent to the model as images.
+    ///
+    /// `false` only where this provider is KNOWN to replace them with a text
+    /// note instead (an OpenAI-compatible model configured `lacks_vision`).
+    /// `true` is not a promise that the model sees them: an endpoint that
+    /// rejects image input is still discovered at request time, and that
+    /// request is retried once without the images. Code that must say
+    /// truthfully what a request carries asks this first. Wrappers delegate;
+    /// a provider with several lanes answers for all of them.
+    fn accepts_image_input(&self) -> bool {
+        true
+    }
+
     /// #2143 part 3: estimate the token size of the REQUEST this provider would
     /// build from `messages` + `tools`, INCLUDING provider-specific
     /// serialization overhead (a separate system block, per-message

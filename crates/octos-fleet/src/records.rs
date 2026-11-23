@@ -8,6 +8,7 @@
 //! executor, keeper, and outbox consumer live in later PRs.
 
 use octos_core::SessionKey;
+use octos_core::task_inputs::DeclaredInput;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -348,6 +349,13 @@ pub struct PlanTask {
     /// explicitly per task.
     #[serde(default)]
     pub grant: WorkerGrant,
+    /// Files the worker needs to begin, delivered in its first model request
+    /// (see [`octos_core::task_inputs`]). Like `grant`, this is forward
+    /// compatible without a `SCHEMA_VERSION` bump: a row written before inputs
+    /// existed reads as a task that declares none, and a task that declares
+    /// none is written exactly as such a row was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<DeclaredInput>,
 }
 
 /// An acceptance criterion: a description plus a checkable [`Verifier`].

@@ -65,6 +65,7 @@ pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_
 pub(crate) mod private_git;
 pub mod summarizer;
 pub mod swarm;
+pub mod task_inputs;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;

@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 use octos_core::SessionKey;
+use octos_core::task_inputs::DeclaredInput;
 
 use crate::grant::WorkerGrant;
 use crate::records::{
@@ -58,6 +59,9 @@ pub struct TaskSpec {
     /// (network / tools / filesystem). Defaults to [`WorkerGrant::minimal`]
     /// (today's closed worker) when the master specifies nothing.
     pub grant: WorkerGrant,
+    /// Files the worker needs to begin, delivered in its first model request
+    /// (see [`octos_core::task_inputs`]). Empty for a task that declares none.
+    pub inputs: Vec<DeclaredInput>,
 }
 
 impl From<TaskSpec> for PlanTask {
@@ -69,6 +73,7 @@ impl From<TaskSpec> for PlanTask {
             deps: s.deps,
             acceptance: s.acceptance,
             grant: s.grant,
+            inputs: s.inputs,
         }
     }
 }
@@ -142,6 +147,9 @@ pub struct TaskView {
     /// (`octos-fleet-worker`) reads it to build the worker's registry, sandbox
     /// network, and filesystem scope. Defaults to [`WorkerGrant::minimal`].
     pub grant: WorkerGrant,
+    /// The inputs the task declared, projected from [`PlanTask::inputs`]. The
+    /// executor delivers them in the worker's first model request.
+    pub inputs: Vec<DeclaredInput>,
     // ---- state (from the child) ----
     pub status: ChildStatus,
     pub verdict: Option<AcceptanceVerdict>,
@@ -337,6 +345,7 @@ impl Fleet {
                     deps: t.deps.clone(),
                     acceptance: t.acceptance.clone(),
                     grant: t.grant.clone(),
+                    inputs: t.inputs.clone(),
                     status: child.map(|c| c.status).unwrap_or(ChildStatus::Planned),
                     evidence: verdict_evidence(verdict.as_ref()),
                     verdict,
@@ -1032,6 +1041,7 @@ mod tests {
             deps: deps.iter().map(|s| s.to_string()).collect(),
             acceptance: Vec::new(),
             grant: WorkerGrant::minimal(),
+            inputs: Vec::new(),
         }
     }
 
@@ -1112,6 +1122,58 @@ mod tests {
             .unwrap();
         assert_eq!(out, CompleteOutcome::Completed);
         request
+    }
+
+    #[tokio::test]
+    async fn should_keep_a_tasks_declared_inputs_through_the_plan_to_its_view() {
+        use octos_core::task_inputs::DeclaredInput;
+
+        let (_d, store) = fresh().await;
+        let declared = vec![
+            DeclaredInput::required("src/lib.rs"),
+            DeclaredInput::optional("notes/page.png"),
+        ];
+        let fleet = Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(10_000),
+            "obj",
+            vec![
+                TaskSpec {
+                    inputs: declared.clone(),
+                    ..spec("a", &[])
+                },
+                spec("b", &[]),
+            ],
+            0,
+        )
+        .await
+        .unwrap();
+
+        // The view is read back from the durable plan, so this is what a
+        // worker launched after a restart is given.
+        let view = fleet.view().await.unwrap();
+        assert_eq!(view.tasks[0].inputs, declared);
+        assert!(view.tasks[1].inputs.is_empty());
+    }
+
+    #[test]
+    fn should_read_and_write_a_task_without_inputs_as_before_inputs_existed() {
+        let old_row = serde_json::json!({
+            "task_id": "a",
+            "title": "Task a",
+            "detail": "do the thing",
+            "deps": [],
+            "acceptance": [],
+        });
+        let task: PlanTask = serde_json::from_value(old_row).unwrap();
+        assert!(task.inputs.is_empty());
+
+        let written = serde_json::to_value(PlanTask::from(spec("a", &[]))).unwrap();
+        assert!(written.get("inputs").is_none(), "{written}");
     }
 
     #[tokio::test]

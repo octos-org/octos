@@ -395,6 +395,12 @@ impl LlmProvider for ProviderChain {
         self.slots[idx].provider.ensure_ready().await;
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.slots
+            .iter()
+            .all(|slot| slot.provider.accepts_image_input())
+    }
+
     fn model_id(&self) -> &str {
         let idx = self.pick_start();
         self.slots[idx].provider.model_id()
