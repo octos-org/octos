@@ -1403,7 +1403,7 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
 
 #[tokio::test]
 async fn active_only_steer_never_starts_a_replacement_turn() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let (state, _profile) =
         state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
     assert!(
@@ -1551,7 +1551,7 @@ async fn host_scope_denies_an_already_loaded_foreign_profile() {
         );
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let (mut state, _profile) =
         state_with_profile_llm(dir.path(), "allowed", Arc::new(NoopLlm)).await;
     let foreign = make_m11e_profile_with_llm_and_sandbox(
@@ -2432,7 +2432,7 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 /// read-only (no mkdir on the broken branch).
 #[tokio::test]
 async fn session_history_reports_broken_flat_but_keeps_users_sibling_read_only() {
-    let dir = tempfile::tempdir().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let mut base = local_profile_state(dir.path());
     create_or_get_local_solo_profile(
         &base,
@@ -2605,7 +2605,7 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
         default_agent_orchestrator,
     };
 
-    let dir = tempfile::TempDir::new().unwrap();
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let profile = "m9-tenant";
     let (state, _runtime) = state_with_profile_llm(dir.path(), profile, Arc::new(NoopLlm)).await;
     // Bare session: only the admitted connection/routed profile identifies

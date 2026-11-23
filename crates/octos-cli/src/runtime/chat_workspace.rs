@@ -214,6 +214,52 @@ pub(crate) fn unregister_profile(data_dir: &Path) {
     }
 }
 
+#[cfg(all(test, feature = "api"))]
+pub(crate) struct HiddenFixtureGuard {
+    root: PathBuf,
+}
+
+#[cfg(all(test, feature = "api"))]
+pub(crate) fn hidden_fixture_guard(root: &Path) -> HiddenFixtureGuard {
+    HiddenFixtureGuard {
+        root: canonical_dir(root),
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+pub(crate) fn tempdir_with_hidden_guard() -> (tempfile::TempDir, HiddenFixtureGuard) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let guard = hidden_fixture_guard(temp.path());
+    (temp, guard)
+}
+
+#[cfg(all(test, feature = "api"))]
+impl Drop for HiddenFixtureGuard {
+    fn drop(&mut self) {
+        let mut layout = layout_write();
+        layout
+            .legacy_profiles
+            .retain(|data_dir, _| !data_dir.starts_with(&self.root));
+        layout
+            .profile_server_roots
+            .retain(|data_dir, _| !data_dir.starts_with(&self.root));
+        if layout
+            .server_root
+            .as_ref()
+            .is_some_and(|root| root.starts_with(&self.root))
+        {
+            layout.server_root = None;
+        }
+        drop(layout);
+        let reserved = reserved_folders();
+        for folder in reserved.folders() {
+            if canonical_dir(&folder).starts_with(&self.root) {
+                reserved.remove(&folder);
+            }
+        }
+    }
+}
+
 /// A runtime-created profile must never move the server-level chats root into
 /// its own data directory, or its data directory into that root. This is the
 /// runtime half of the startup validation in `octos serve`.
@@ -719,7 +765,7 @@ mod server_root_tests {
 
     #[test]
     fn should_refuse_server_root_overlapping_profile_or_workspace() {
-        let temp = tempfile::tempdir().unwrap();
+        let (temp, hidden) = tempdir_with_hidden_guard();
         let server = temp.path().join("server");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -747,8 +793,14 @@ mod server_root_tests {
             .is_err()
         );
         let profile_file = temp.path().join("profile-file");
-        std::fs::write(&profile_file, b"not a directory").unwrap();
+        let failed_root = chats_root(&profile_file);
+        std::fs::create_dir_all(&profile_file).unwrap();
+        std::fs::write(&failed_root, b"not a directory").unwrap();
+        let failed_root = canonical_dir(&failed_root);
         assert!(register_existing_profile(&profile_file).is_err());
+        assert!(reserved_folders().folders().contains(&failed_root));
+        drop(hidden);
+        assert!(!reserved_folders().folders().contains(&failed_root));
     }
 
     #[tokio::test]
