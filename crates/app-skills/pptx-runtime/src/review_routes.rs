@@ -346,7 +346,12 @@ pub fn feedback(qa: &Value, review: &Value, accepted: &BTreeSet<String>, plan: &
                 "native_status":f["status"],"decision":decision,"next_action":next})
         })
         .collect::<Vec<_>>();
+    let instruction = if plan["mode"] == "independent_visual" {
+        "Reviewer uses measurement_reviews with each exact ID, decision and concrete visual basis. Object checks alone do not adjudicate native unknowns. Remaining fail/unknown checks are incomplete acceptance; Supervisor may report a blocker, never declare the deck accepted. Do not edit a correct slide or change the frozen plan to clear measurement gaps."
+    } else {
+        "Strict verification has no measurement_reviews or native_review_candidates route. Native fail/unknown checks remain incomplete acceptance; Supervisor must report the concrete measurement/contract blocker, never declare the deck accepted. Object and reference-fidelity observations are still required where present, but they do not adjudicate native QA unknowns. Do not edit a correct slide or change the frozen plan to clear measurement gaps."
+    };
     json!({"remaining":remaining,"accepted_count":accepted.len(),
-        "instruction":"Reviewer uses measurement_reviews with each exact ID, decision and concrete visual basis. Object checks alone do not adjudicate native unknowns. Remaining fail/unknown checks are incomplete acceptance; Supervisor may report a blocker, never declare the deck accepted. Do not edit a correct slide or change the frozen plan to clear measurement gaps.",
+        "instruction":instruction,
         "native_status_unchanged":true,"quality_approved":false})
 }
