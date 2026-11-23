@@ -37,6 +37,19 @@ pub fn attach_relations(ctx: &Context, template: &mut Value, binding: &Value) ->
             && report["cycle"]["sha256"] == template["cycle_sha256"],
         "stale relation report"
     );
+    // Page-selected packs can be signed separately and merged without duplicate lines.
+    if let Some(rows) = template
+        .get_mut("source_line_reviews")
+        .and_then(Value::as_array_mut)
+    {
+        let pages: BTreeSet<_> = report["pages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["page"].as_str())
+            .collect();
+        rows.retain(|r| r["page"].as_str().is_some_and(|p| pages.contains(p)));
+    }
     let signals: Vec<Value> = report["pages"]
         .as_array()
         .into_iter()
@@ -157,6 +170,11 @@ pub fn bind_observations(template: &Value, observations: &Value) -> Result<Value
         result["relations"] = template["relations"].clone();
     }
     result["object_reviews"] = json!(bound);
+    let lines = template["source_line_reviews"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::source_lines::coverage(lines, observations, false)?;
     if let Some(rows) = observations.get("comparisons") {
         let required = template["comparisons"].as_array().ok_or_else(|| {
             anyhow::anyhow!("comparison observations require a pack with comparisons")
@@ -296,15 +314,6 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         )?;
     }
     let mut bound = bind_observations(&fresh, &observations)?;
-    let required_lines = cycle["source_lines"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    crate::source_lines::coverage(
-        required_lines,
-        &bound,
-        crate::review_routes::permitted(ctx)?,
-    )?;
     let mut fidelity = crate::fidelity::assess(
         &cycle,
         &spec,

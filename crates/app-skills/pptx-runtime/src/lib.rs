@@ -27,7 +27,7 @@ pub mod relations;
 pub mod review;
 pub mod review_reuse;
 pub mod review_routes;
-pub mod source_lines;
+mod source_lines;
 pub mod spec;
 pub mod typography;
 pub mod visual_diff;

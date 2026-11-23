@@ -13,6 +13,16 @@ pub(crate) fn bind(
     parent: &Path,
     sources: &mut Vec<Value>,
 ) -> Result<()> {
+    let registered = crate::source_lines::original(
+        ctx,
+        crate::string(page, "id")?,
+        page.get("design").filter(|v| !v.is_null()),
+    )?;
+    if page["design"].is_null()
+        && let Some(original) = registered
+    {
+        page["design"] = original;
+    }
     let explicit = page.get("source_ocr").is_some_and(|x| !x.is_null());
     let Some(design_hash) = page["design"]["sha256"].as_str() else {
         ensure!(!explicit, "source_ocr requires a bound design");

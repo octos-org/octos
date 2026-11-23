@@ -37,10 +37,41 @@ fn line_identity_survives_repair_and_unrepresented_lines_reach_independent_revie
         {"id":"x","text":"UI","source_line_ids":["t08"],"style":"b","box":[100,20,30,18]},
         {"id":"y","text":"UI","source_line_ids":["t09"],"style":"b","box":[160,20,30,18]}]}]});
     maker.write_json("raw-spec.json", &spec).unwrap();
+    let mut draft = spec.clone();
+    draft["pages"][0].as_object_mut().unwrap().remove("design");
+    maker.write_json("no-design.json", &draft).unwrap();
+    maker
+        .execute(json!({"action":"build","spec":"no-design.json","output":"restored"}))
+        .unwrap();
+    assert_eq!(
+        maker.json("restored/cycle.json").unwrap()["source_lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
     let cycle =
         |spec: &str, out: &str| json!({"action":"cycle","spec":spec,"output":out,"width":640});
     maker.execute(cycle("raw-spec.json", "before")).unwrap();
     maker.execute(json!({"action":"patch","spec":"raw-spec.json","edits":[{"page":"p","id":"a","copy":"AgentOS","set":{"text":"AgentOS"}}],"output":"corrected.json"})).unwrap();
+    maker.execute(json!({"action":"split_text","spec":"corrected.json","output":"split.json","page":"p","id":"a","parts":[
+        {"id":"left","text":"Agent","box":[20,15,45,20]},{"id":"right","text":"OS","box":[65,15,40,20]}]})).unwrap();
+    maker
+        .execute(json!({"action":"build","spec":"split.json","output":"fragments"}))
+        .unwrap();
+    let fragments = maker.json("fragments/cycle.json").unwrap();
+    assert_eq!(
+        fragments["source_lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|line| line["source_line_id"] == "t07")
+            .unwrap()["objects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let mut corrected = maker.json("corrected.json").unwrap();
     assert_eq!(
         corrected["pages"][0]["texts"][0]["source_line_ids"],
@@ -109,6 +140,14 @@ fn line_identity_survives_repair_and_unrepresented_lines_reach_independent_revie
             .unwrap()["status"],
         "fail"
     );
+    // Even a fully populated draft cannot sign itself as the independent peer.
+    maker.execute(submit("self.json")).unwrap();
+    let self_review = maker
+        .execute(
+            json!({"action":"evidence_record","cycle":"fixed/cycle.json","review":"self.json"}),
+        )
+        .unwrap();
+    assert_eq!(self_review["source_line_coverage"]["unknown"], 3);
     let mut extra = intake.clone();
     extra["additional_lines"] = json!([{"text":"Missed by OCR","box":[180,80,50,14]}]);
     let five = reviewer.execute(extra).unwrap();

@@ -232,6 +232,9 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
                 let record = ctx.json(ctx.verify(binding)?)?;
                 v["comparison_coverage"] = record["coverage"].clone();
                 v["object_coverage"] = record["object_coverage"].clone();
+                if let Some(lines) = record.get("source_line_coverage") {
+                    v["source_line_coverage"] = lines.clone();
+                }
                 v["verification_route"] = record["verification_route"].clone();
                 v["reference_fidelity"] = record["reference_fidelity"].clone();
                 v["local_background_repairs"] = record["local_background_repairs"].clone();
@@ -431,7 +434,15 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         .unwrap_or_default();
     let line_scope =
         crate::source_lines::current_scope(ctx, &spec, lines, &old["source_line_scope"])?;
-    let line_coverage = crate::source_lines::coverage(lines, &review, independent)?;
+    let line_reviewer = !lines.is_empty()
+        && crate::review_routes::independent_line_reviewer(
+            ctx,
+            &policy,
+            &review,
+            &ctx.binding(&cp)?,
+            independent,
+        )?;
+    let line_coverage = crate::source_lines::coverage(lines, &review, line_reviewer)?;
     let (repair_contract, local_repairs) = crate::fidelity::repair_contract(
         ctx,
         &cycle,

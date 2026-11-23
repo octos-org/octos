@@ -49,8 +49,14 @@ pub(crate) fn register(
     let key = digest(&serde_json::to_vec(&(page, hash))?);
     let dir = ctx.path(format!(".octos/pptx-source-lines/{key}"))?;
     let latest = dir.join("current.json");
-    if observed.is_none() && additions.is_empty() && !latest.is_file() {
-        return Ok(None);
+    if observed.is_none() && additions.is_empty() {
+        if !latest.try_exists()? {
+            return Ok(None);
+        }
+        // The writer atomically replaces this pointer after committing the immutable snapshot.
+        let binding = ctx.json(latest)?;
+        ctx.verify(&binding)?;
+        return Ok(Some(binding));
     }
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -118,8 +124,40 @@ pub(crate) fn register(
     Ok(Some(binding))
 }
 
-pub fn intake(ctx: &Context, r: &Value) -> Result<Value> {
+fn page_pin(page: &str) -> String {
+    format!(
+        ".octos/pptx-source-lines/pages/{}.json",
+        digest(page.as_bytes())
+    )
+}
+
+/// A peer may omit the design in a repair draft. Restore the original admitted
+/// by intake, and reject an attempted substitution for the same task page.
+pub(crate) fn original(
+    ctx: &Context,
+    page: &str,
+    declared: Option<&Value>,
+) -> Result<Option<Value>> {
+    let path = ctx.path(page_pin(page))?;
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let mut bound = ctx.json(path)?;
+    if let Some(design) = declared {
+        ensure!(
+            design["sha256"] == bound["sha256"],
+            "different original for registered page {page}"
+        );
+    } else {
+        bound["path"] = json!(ctx.verify(&bound)?);
+    }
+    Ok(Some(bound))
+}
+
+pub(crate) fn intake(ctx: &Context, r: &Value) -> Result<Value> {
     let design = ctx.binding(string(r, "design")?)?;
+    let page = string(r, "page")?;
+    let pinned = original(ctx, page, Some(&design))?.is_some();
     let mut data = r
         .get("ocr")
         .map(|v| ctx.json(v.as_str().context("ocr must be a workspace file")?))
@@ -144,6 +182,11 @@ pub fn intake(ctx: &Context, r: &Value) -> Result<Value> {
         additions.map(Vec::as_slice).unwrap_or_default(),
     )?
     .context("supply the source OCR file on first admission")?;
+    if !pinned && let Err(error) = ctx.write_json(page_pin(page), &design) {
+        if original(ctx, page, Some(&design))?.is_none() {
+            return Err(error);
+        }
+    }
     Ok(
         json!({"source_ocr":binding,"lines":ctx.json(ctx.verify(&binding)?)?["lines"],"quality_approved":false}),
     )
@@ -335,7 +378,8 @@ pub(crate) fn current_scope(
         );
     }
     for page in &spec.pages {
-        if let Some(original) = &page.design
+        let admitted = original(ctx, &page.id, page.design.as_ref())?;
+        if let Some(original) = page.design.as_ref().or(admitted.as_ref())
             && let Some(latest) = register(ctx, &page.id, original, None, &[])?
         {
             let data = ctx.json(ctx.verify(&latest)?)?;
