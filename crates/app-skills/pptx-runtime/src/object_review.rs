@@ -349,6 +349,15 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         )?;
     }
     let mut bound = bind_observations(&fresh, &observations)?;
+    let required_lines = cycle["source_lines"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::source_lines::coverage(
+        required_lines,
+        &bound,
+        crate::review_routes::permitted(ctx)?,
+    )?;
     let mut fidelity = crate::fidelity::assess(
         &cycle,
         &spec,
