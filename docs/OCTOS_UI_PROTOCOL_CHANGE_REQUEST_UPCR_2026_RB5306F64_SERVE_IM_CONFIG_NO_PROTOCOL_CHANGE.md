@@ -1,7 +1,7 @@
 # UPCR-2026-RB5306F64 — `serve.im` config and one owner per bot (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3361
 
 ## Decision record
 
