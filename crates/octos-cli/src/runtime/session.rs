@@ -176,6 +176,27 @@ pub struct SessionRuntime {
     client_commands_owner: std::sync::Mutex<Option<u64>>,
 }
 
+/// Whether a non-chat session's shell carries the chat-folder guard.
+///
+/// A backend that cannot hide a folder makes the guard refuse every command
+/// while any chat folder is reserved, which every non-chat session reserves.
+/// `danger_full_access` resolves to exactly that no-sandbox backend, and the
+/// profile is admitted only in `RuntimeMode::Solo` after the operator chose
+/// to bypass the sandbox (`octos chat --dangerously-bypass-approvals-and-sandbox`,
+/// a `--solo` server). Guarding it left that mode with no shell at all, so an
+/// operator-unconfined shell is not guarded. Every other session keeps the
+/// guard, including a danger session given a real sandbox by override, and
+/// the file tools keep their own chat-folder fence either way.
+fn shell_hides_chat_folders(
+    permissions: &octos_agent::EffectivePermissions,
+    sandbox: &octos_agent::SandboxConfig,
+) -> bool {
+    let unconfined_by_operator = permissions.permission_profile
+        == octos_agent::PermissionProfile::DangerFullAccess
+        && (!sandbox.enabled || sandbox.mode == octos_agent::SandboxMode::None);
+    !unconfined_by_operator
+}
+
 /// UPCR-2026-034 `read_parent`: a request context's read-only view of its
 /// peer's folder, minus every context's folder (its own stays its
 /// workspace): `(peer folder, excluded folders)`. Enforced by the session
@@ -575,7 +596,9 @@ impl SessionRuntime {
         // or home that holds them.
         if chat_root.is_none() {
             super::chat_workspace::register_profile(&chat_records_dir);
-            sandbox.hidden_folders = Some(super::chat_workspace::reserved_folders());
+            if shell_hides_chat_folders(&permissions, &sandbox) {
+                sandbox.hidden_folders = Some(super::chat_workspace::reserved_folders());
+            }
         }
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
@@ -1663,4 +1686,38 @@ fn validate_workspace_hint(hint: &Path) -> Result<PathBuf> {
     // Return the CANONICAL path (collapses `..`, resolves symlinks) so the
     // caller roots the session scope at a normalized workspace_root.
     Ok(canonical)
+}
+
+#[cfg(test)]
+mod shell_guard_tests {
+    use super::shell_hides_chat_folders;
+    use octos_agent::{
+        EffectivePermissions, PermissionProfile, RuntimeMode, SandboxConfig, SandboxMode,
+    };
+
+    #[test]
+    fn should_guard_the_shell_unless_the_operator_bypassed_the_sandbox() {
+        let danger = EffectivePermissions::for_runtime(
+            PermissionProfile::DangerFullAccess,
+            RuntimeMode::Solo,
+        )
+        .unwrap();
+        let unconfined = danger.apply_to_sandbox(&SandboxConfig::default());
+        assert!(!shell_hides_chat_folders(&danger, &unconfined));
+
+        let workspace = EffectivePermissions::workspace_write();
+        let confined = workspace.apply_to_sandbox(&SandboxConfig::default());
+        assert!(shell_hides_chat_folders(&workspace, &confined));
+        let no_backend = SandboxConfig {
+            mode: SandboxMode::None,
+            ..SandboxConfig::default()
+        };
+        assert!(shell_hides_chat_folders(&workspace, &no_backend));
+
+        let overridden = SandboxConfig {
+            mode: SandboxMode::Docker,
+            ..SandboxConfig::default()
+        };
+        assert!(shell_hides_chat_folders(&danger, &overridden));
+    }
 }
