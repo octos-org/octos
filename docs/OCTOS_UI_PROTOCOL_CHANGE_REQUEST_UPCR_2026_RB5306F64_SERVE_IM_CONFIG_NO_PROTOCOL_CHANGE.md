@@ -24,8 +24,9 @@ Nothing on the wire changes:
   The bridge itself is unchanged.
 - Bot locks (`~/.octos/bot-owners/<platform>-<bot id>.lock`) are local
   process state, not protocol.
-- Without `serve.im`, serve and every gateway behave as before. A Telegram
-  gateway channel is refused only when another process already consumes its
-  bot.
+- Without `serve.im`, serve and every gateway behave as before, as long as
+  a gateway can take its bots' locks. A Telegram gateway channel whose token
+  names a bot is refused when another process consumes that bot, or when
+  the lock cannot be taken.
 
 Cite this record elsewhere as `UPCR-2026-RB5306F64`.

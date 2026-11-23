@@ -846,13 +846,14 @@ impl ProcessManager {
                                             );
                                             return;
                                         }
-                                        // T-0654: a gateway refused its bot, even after
-                                        // the startup check, would only be refused again.
+                                        // T-0654: a gateway refused its bot (taken, or no
+                                        // usable lock), even after the startup check,
+                                        // would only be refused again.
                                         let refused = history
                                             .lock()
                                             .await
                                             .iter()
-                                            .find(|line| line.contains(crate::bot_owner::TAKEN))
+                                            .find(|line| line.contains(crate::bot_owner::REFUSED))
                                             .map(|line| line.trim().to_string());
                                         if let Some(line) = refused {
                                             pm.record_configuration_error(&pid2, line).await;

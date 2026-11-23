@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 /// starts the new process half a second after it stops the old one.
 pub(crate) const HANDOFF: Duration = Duration::from_secs(3);
 
-/// What every refusal says, for whoever must tell it from other errors.
-pub(crate) const TAKEN: &str = "already has an owner";
+/// What a gateway refused its bot says, for whoever must tell it from
+/// other errors.
+pub(crate) const REFUSED: &str = "telegram channel refused";
 
 /// Where this user's octos processes take bot locks.
 pub(crate) fn default_dir() -> Option<PathBuf> {
@@ -36,22 +37,6 @@ pub(crate) fn telegram_bot_id(token: &str) -> Option<i64> {
         .then(|| id.parse::<i64>().ok())
         .flatten()
         .filter(|id| *id > 0)
-}
-
-#[derive(Debug)]
-pub(crate) enum Unclaimed {
-    /// Another process consumes the bot.
-    Taken(String),
-    /// The lock itself could not be used.
-    Unusable(String),
-}
-
-impl std::fmt::Display for Unclaimed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Taken(why) | Self::Unusable(why) => f.write_str(why),
-        }
-    }
 }
 
 /// A bot this process consumes, until dropped.
@@ -72,12 +57,10 @@ impl BotOwner {
         bot: i64,
         holder: &str,
         wait: Duration,
-    ) -> Result<Self, Unclaimed> {
+    ) -> Result<Self, String> {
         let path = dir.join(format!("{platform}-{bot}.lock"));
         let note = dir.join(format!("{platform}-{bot}.owner"));
-        let unusable = |error: std::io::Error| {
-            Unclaimed::Unusable(format!("bot lock {}: {error}", path.display()))
-        };
+        let unusable = |error: std::io::Error| format!("bot lock {}: {error}", path.display());
         std::fs::create_dir_all(dir).map_err(unusable)?;
         let file = OpenOptions::new()
             .write(true)
@@ -95,11 +78,11 @@ impl BotOwner {
                     let now = Instant::now();
                     if now >= deadline {
                         let other = std::fs::read_to_string(&note).unwrap_or_default();
-                        return Err(Unclaimed::Taken(format!(
-                            "{platform} bot {bot} {TAKEN} ({}): a bot is consumed by \
-                             serve.im or by one gateway, never by two",
+                        return Err(format!(
+                            "{platform} bot {bot} already has an owner ({}): a bot is \
+                             consumed by serve.im or by one gateway, never by two",
                             other.trim()
-                        )));
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(50).min(deadline - now));
                 }
@@ -110,27 +93,24 @@ impl BotOwner {
         Ok(Self { file })
     }
 
-    /// A gateway's Telegram channel takes its bot before it starts. A token
-    /// with no bot id fails at Telegram as it always did, and a lock
-    /// directory the gateway cannot use leaves it running unlocked, as
-    /// before; only a bot another process consumes stops it.
+    /// A gateway's Telegram channel takes its bot before it starts, or does
+    /// not start: a bot another process consumes, or a lock that cannot be
+    /// taken, stops it. A token with no bot id fails at Telegram as it
+    /// always did.
     #[cfg_attr(not(feature = "telegram"), allow(dead_code))]
     pub(crate) fn claim_for_gateway(
         token: &str,
         dir: Option<&Path>,
         holder: &str,
     ) -> Result<Option<Self>, String> {
-        let (Some(dir), Some(bot)) = (dir, telegram_bot_id(token)) else {
+        let Some(bot) = telegram_bot_id(token) else {
             return Ok(None);
         };
-        match Self::claim(dir, "telegram", bot, holder, HANDOFF) {
-            Ok(owner) => Ok(Some(owner)),
-            Err(Unclaimed::Taken(why)) => Err(why),
-            Err(Unclaimed::Unusable(why)) => {
-                tracing::warn!(error = %why, "telegram bot not locked");
-                Ok(None)
-            }
-        }
+        let claimed = match dir {
+            Some(dir) => Self::claim(dir, "telegram", bot, holder, HANDOFF),
+            None => Err("no home directory to keep bot locks in".into()),
+        };
+        claimed.map(Some).map_err(|why| format!("{REFUSED}: {why}"))
     }
 }
 

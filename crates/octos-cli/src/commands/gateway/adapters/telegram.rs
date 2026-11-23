@@ -21,7 +21,7 @@ pub fn register(
         std::env::var(&env).wrap_err_with(|| format!("{env} environment variable not set"))?;
     // T-0654: the bot is this gateway's alone, or the gateway does not start.
     if let Some(owner) = BotOwner::claim_for_gateway(&token, owners.dir, owners.holder)
-        .map_err(|why| eyre::eyre!("telegram channel refused: {why}"))?
+        .map_err(|why| eyre::eyre!(why))?
     {
         owners.held.push(owner);
     }

@@ -80,10 +80,9 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
   - 锁目录按用户放，不按数据目录，所以两个 serve 实例之间也互斥。
   - 拿不到就拒绝，并写明谁占着（进程说明加 pid）。锁随进程退出释放；gateway 重启时等旧进程放锁，最多等 3 秒。
 - 没有单独的 `owner` 字段：列进 `serve.im` 就是声明这个 bot 归 serve，其余渠道照旧归 gateway。再加一个字段就多了一个来源，两边可能写得不一致。某个 gateway 渠道还写着同一个 bot 时，锁会拒绝那个 gateway，因为 serve 在自动拉起 gateway 之前就先拿了锁。
-- gateway 的默认行为不变：
-  - token 里没有 bot id 的，照旧交给 Telegram 报错；
-  - 锁目录用不了时只记一条警告，不加锁照常跑；
-  - 只有 bot 已被别的进程占用时才拒绝启动。process manager 把这种拒绝记为配置错误，不再自动重启。
+- gateway 能正常拿到锁时，默认行为不变。token 里没有 bot id 的，照旧交给 Telegram 报错。
+- token 带 bot id 却拿不到锁，gateway 一律拒绝启动，不会不加锁照跑。拿不到锁有两种情况：bot 已被别的进程占用；锁目录或锁文件用不了。否则两个 gateway 碰上同一个文件系统错误，就会同时消费这个 bot。
+- process manager 把这种拒绝记为配置错误，不再自动重启。
 
 ## 8. IM 里的审批
 

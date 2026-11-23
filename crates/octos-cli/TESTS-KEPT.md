@@ -116,7 +116,7 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | Cat. | Exact test | Guard |
 |---|---|---|
 | 3 | `api::ui_protocol_transport::im_config::tests::serve_im_refuses_any_entry_it_cannot_bind_exactly` | Without `serve.im` the config is unchanged and written back without it; an entry with a gateway's `chat_profile_map`, another platform, no bindings key or a binding with no profile does not parse, and one with an unset or non-bot token, no bindings, no allowed senders, an unknown profile, another profile's session, a Code session or a bot listed twice stops serve at start. |
-| 3 | `api::ui_protocol_transport::im_config::tests::a_bot_has_one_owner_serve_or_one_gateway` | A bot serve owns is refused to a second serve and to any gateway, by the bot's id whatever token names it, with the holder named; a gateway's other bots and tokens with no bot id start as before, and the bot is free once serve lets go. |
+| 3 | `api::ui_protocol_transport::im_config::tests::a_bot_has_one_owner_serve_or_one_gateway` | A bot serve owns is refused to a second serve and to any gateway, by the bot's id whatever token names it, with the holder named; a gateway's other bots and tokens with no bot id start as before, a lock directory it cannot use refuses it instead of leaving it unlocked, and the bot is free once serve lets go. |
 | 3 | `api::ui_protocol_transport::im_config::tests::a_binding_taken_out_of_the_config_is_refused_from_the_next_start` | After a restart with a chat's binding taken out of the config, its next message and a redelivery of its last are refused and run nothing. |
 
 ## Peer host tools and shared history

@@ -173,6 +173,18 @@ async fn a_bot_has_one_owner_serve_or_one_gateway() {
         assert!(claimed.unwrap().is_none(), "{odd}");
     }
 
+    // A lock it cannot take refuses the gateway too, rather than leave two
+    // gateways polling one bot.
+    let not_a_dir = owners.join("not-a-dir");
+    std::fs::write(&not_a_dir, "").unwrap();
+    for dir in [Some(not_a_dir.as_path()), None] {
+        let unusable = BotOwner::claim_for_gateway("902:secret", dir, "gateway").unwrap_err();
+        assert!(
+            unusable.starts_with("telegram channel refused: "),
+            "{unusable}"
+        );
+    }
+
     // Once serve lets go, a gateway may have it.
     drop(ours);
     let handed = BotOwner::claim_for_gateway(&token, Some(owners), "gateway");

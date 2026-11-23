@@ -90,8 +90,7 @@ pub(crate) async fn assemble(
                 "no bindings; bind each chat to a chat session".into(),
             ));
         }
-        let owner = BotOwner::claim(owners_dir, platform, bot, holder, HANDOFF)
-            .map_err(|why| refuse(why.to_string()))?;
+        let owner = BotOwner::claim(owners_dir, platform, bot, holder, HANDOFF).map_err(refuse)?;
         im._owners.push(owner);
         let channel = channel(ImChannelId {
             platform: platform.into(),
