@@ -73,6 +73,22 @@ async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
     }
 }
 
+/// `serve` again over `dir`, as after a restart. A new process finds the
+/// episode store closed. In this process the last serve's turn tasks can
+/// still hold it for a moment after their turns ended, and nothing signals
+/// when they let go, so wait for its lock first.
+async fn restart(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
+    let data_dir = dir.join("profiles").join(CHAT_PROFILE).join("data");
+    for _ in 0..3000 {
+        let released = octos_memory::EpisodeStore::open(&data_dir).await.is_ok();
+        if released {
+            return serve(dir, llm).await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the last serve still holds {}", data_dir.display());
+}
+
 /// A chat id no other test uses: the turn registry is process-wide.
 fn unique(name: &str) -> SessionKey {
     chat_key(&format!("{name}-{}", uuid::Uuid::new_v4().simple()))
@@ -304,7 +320,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         std::fs::create_dir(file).unwrap();
     }
 
-    let fx = serve(dir.path(), llm.clone()).await;
+    let fx = restart(dir.path(), llm.clone()).await;
     let reconciled = async || {
         let mut turns: Vec<_> = (fx.entry.reconcile(&fx.profile).await.into_iter())
             .map(|(_, turn, record)| (turn, record.ok()))
