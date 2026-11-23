@@ -67,7 +67,32 @@ pub trait LlmProvider: Send + Sync {
 
     /// Get the maximum output tokens this model supports per call.
     fn max_output_tokens(&self) -> u32 {
-        context::max_output_tokens(self.model_id())
+        context::native_output_limits(self.provider_name(), self.model_id()).map_or_else(
+            || context::max_output_tokens(self.model_id()),
+            |(_, output)| output,
+        )
+    }
+
+    /// Resolve at the leaf so fallback requests use the model that actually serves them.
+    /// Leave an unknown optional wire limit to the endpoint. Explicit budgets for
+    /// short tasks remain meaningful even for an unlisted model.
+    fn request_output_tokens(
+        &self,
+        config: &ChatConfig,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> Option<u32> {
+        let Some((window, native)) =
+            context::native_output_limits(self.provider_name(), self.model_id())
+        else {
+            return config.max_tokens;
+        };
+        let limit = config.max_tokens.unwrap_or(native).min(native);
+        Some(context::fit_output(
+            limit,
+            window,
+            self.estimate_request_tokens(messages, tools),
+        ))
     }
 
     /// #2143 part 3: estimate the token size of the REQUEST this provider would
@@ -577,6 +602,119 @@ pub(crate) mod test_lanes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Inspect the HTTP body at the receiving endpoint for every chat protocol.
+    // A rejection is sufficient: the boundary under test is the outgoing request.
+    #[tokio::test]
+    async fn native_output_limit_reaches_each_wire_protocol() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let root = server.uri();
+        let cases: Vec<(Box<dyn LlmProvider>, &str, u32)> = vec![
+            (
+                Box::new(
+                    crate::openai::OpenAIProvider::new("test", "deepseek-flash")
+                        .with_provider_label("deepseek")
+                        .with_base_url(&root),
+                ),
+                "/max_tokens",
+                393216,
+            ),
+            (
+                Box::new(
+                    crate::openai_responses::OpenAIResponsesProvider::new("test", "gpt-5")
+                        .with_base_url(&root),
+                ),
+                "/max_output_tokens",
+                128000,
+            ),
+            (
+                Box::new(
+                    crate::anthropic::AnthropicProvider::new("test", "claude-3-5-haiku-20241022")
+                        .with_base_url(&root),
+                ),
+                "/max_tokens",
+                8192,
+            ),
+            (
+                Box::new(
+                    crate::gemini::GeminiProvider::new("test", "gemini-2.5-pro")
+                        .with_base_url(&root),
+                ),
+                "/generation_config/max_output_tokens",
+                65536,
+            ),
+            (
+                Box::new(
+                    crate::openrouter::OpenRouterProvider::new("test", "deepseek/deepseek-v4-pro")
+                        .with_base_url(&root),
+                ),
+                "/max_tokens",
+                393216,
+            ),
+        ];
+        for (i, (provider, pointer, expected)) in cases.iter().enumerate() {
+            let config = ChatConfig::default();
+            let messages = [Message::user("hello")];
+            let _ = provider.chat(&messages, &[], &config).await;
+            let _ = provider.chat_stream(&messages, &[], &config).await;
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(
+                received.len(),
+                (i + 1) * 2,
+                "catalogued route must not probe"
+            );
+            for req in &received[i * 2..] {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(
+                    body.pointer(pointer).and_then(|v| v.as_u64()),
+                    Some(u64::from(*expected)),
+                    "{}",
+                    provider.model_id()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_compatible_model_uses_endpoint_limit_and_remaining_context() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id":"my-model","context_window":1000,"max_output_tokens":200}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let p = crate::openai::OpenAIProvider::new("test", "my-model").with_base_url(server.uri());
+        for text in ["short".to_string(), "x".repeat(2800), "x".repeat(3600)] {
+            let messages = [Message::user(text)];
+            let estimate = p.estimate_request_tokens(&messages, &[]);
+            let expected = 200.min(
+                1000u32
+                    .saturating_sub(estimate + estimate.div_ceil(4).min(150))
+                    .max(1),
+            );
+            let _ = p.chat(&messages, &[], &ChatConfig::default()).await;
+            let requests = server.received_requests().await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(body["max_tokens"], expected);
+        }
+    }
 
     #[test]
     fn should_not_panic_when_truncating_multibyte_utf8_body() {

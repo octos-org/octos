@@ -1,5 +1,6 @@
 //! Anthropic (Claude) provider implementation.
 
+use crate::discovery::{DiscoveryProtocol, ModelOutputDiscovery, OutputProbe};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -29,6 +30,7 @@ pub struct AnthropicProvider {
     /// timeout so a healthy long generation is never cut off mid-stream. See
     /// [`crate::provider::build_streaming_http_client`].
     stream_client: Client,
+    output_probe: OutputProbe,
     api_key: SecretString,
     model: String,
     base_url: String,
@@ -80,6 +82,7 @@ impl AnthropicProvider {
             stream_client: crate::provider::build_streaming_http_client(
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
+            output_probe: Default::default(),
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
             base_url: OFFICIAL_ANTHROPIC_BASE_URL.to_string(),
@@ -98,6 +101,7 @@ impl AnthropicProvider {
 
     /// Set a custom base URL (for compatible endpoints).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.output_probe = Default::default();
         self.base_url = base_url.into();
         if self.prompt_caching_override.is_none() {
             self.prompt_caching = prompt_caching_default_for_base_url(&self.base_url);
@@ -154,14 +158,32 @@ impl AnthropicProvider {
         )
     }
 
+    // Messages requires max_tokens. For an unlisted model, obtain the
+    // serving endpoint's advertised maximum once, including concurrent calls.
+    async fn output_budget(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> u32 {
+        let config = self.output_config(config, messages, tools).await;
+        self.request_output_tokens(&config, messages, tools)
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    "Messages endpoint has no advertised output limit; using 4096 tokens"
+                );
+                4096
+            })
+    }
+
     /// Build the shared request struct used by both chat() and chat_stream().
     fn build_request<'a>(
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
         config: &'a ChatConfig,
+        max_tokens: u32,
     ) -> AnthropicRequest<'a> {
-        let max_tokens = config.max_tokens.unwrap_or(4096);
         // Provider default AND the request did not opt out: a one-shot call
         // (`ChatConfig.cache_retention: None`) pays the 1.25x cache-write
         // premium on a prefix it never sends again, so it gets the exact
@@ -448,6 +470,17 @@ fn model_accepts_sampling(model: &str) -> bool {
     leaf.trim().to_ascii_lowercase().starts_with("glm-")
 }
 
+impl ModelOutputDiscovery for AnthropicProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)> {
+        Some((
+            &self.output_probe,
+            DiscoveryProtocol::AnthropicMessages,
+            &self.base_url,
+            self.api_key.expose_secret(),
+        ))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn chat(
@@ -456,7 +489,8 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let request = self.build_request(messages, tools, config);
+        let max_tokens = self.output_budget(messages, tools, config).await;
+        let request = self.build_request(messages, tools, config, max_tokens);
         self.trace_prompt_cache_input(&request, config);
 
         let response = self
@@ -506,7 +540,8 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let request = self.build_request(messages, tools, config);
+        let max_tokens = self.output_budget(messages, tools, config).await;
+        let request = self.build_request(messages, tools, config, max_tokens);
         self.trace_prompt_cache_input(&request, config);
 
         let mut body = serde_json::to_value(&request).wrap_err_with(|| {
@@ -1543,7 +1578,8 @@ mod tests {
         let messages = vec![msg(MessageRole::User, "list files"), assistant, tool_result];
 
         let config = ChatConfig::default();
-        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &config, 8192)).unwrap();
         let out = body["messages"].as_array().unwrap();
         assert_eq!(out.len(), 3, "user + assistant + tool_result: {body}");
 
@@ -1591,7 +1627,8 @@ mod tests {
         ];
 
         let config = ChatConfig::default();
-        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &config, 8192)).unwrap();
         let out = body["messages"].as_array().unwrap();
         assert_eq!(
             out.len(),
@@ -1630,7 +1667,8 @@ mod tests {
         orphan.tool_call_id = Some("toolu_gone".into());
         let messages = vec![orphan.clone(), msg(MessageRole::User, "continue")];
         let config = ChatConfig::default();
-        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &config, 8192)).unwrap();
         let out = body["messages"].as_array().unwrap();
         assert_eq!(out[0]["role"], "user");
         assert_eq!(
@@ -1655,7 +1693,8 @@ mod tests {
             msg(MessageRole::User, "interposed"),
             late,
         ];
-        let body = serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &config, 8192)).unwrap();
         let out = body["messages"].as_array().unwrap();
         assert_eq!(out[3]["role"], "user");
         assert_eq!(
@@ -1753,7 +1792,7 @@ mod tests {
 
         // Pin caching ON — this test asserts cache breakpoints are sent on the
         // wire, so it must not depend on the ambient `OCTOS_PROMPT_CACHING`.
-        let provider = AnthropicProvider::new("test-key", "claude-test")
+        let provider = AnthropicProvider::new("test-key", "claude-sonnet-4-6")
             .with_base_url(server.uri())
             .with_prompt_caching(true);
         let tools = vec![tool_spec("shell", "run a command")];
@@ -1803,6 +1842,60 @@ mod tests {
         (provider, tools, messages)
     }
 
+    #[tokio::test]
+    async fn unlisted_messages_model_discovers_required_output_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/new-model"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"max_tokens": 85000})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let p = AnthropicProvider::new("test", "new-model").with_base_url(server.uri());
+        let config = ChatConfig::default();
+        for _ in 0..2 {
+            let output = p.output_budget(&[], &[], &config).await;
+            assert_eq!(p.build_request(&[], &[], &config, output).max_tokens, 85000);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_messages_metadata_is_cached_and_falls_back() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/unlisted"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test", "unlisted").with_base_url(server.uri());
+        let messages = [Message::user("hi")];
+        let config = ChatConfig::default();
+        let _ = tokio::join!(
+            provider.chat(&messages, &[], &config),
+            provider.chat_stream(&messages, &[], &config)
+        );
+        let requests = server.received_requests().await.unwrap();
+        for req in requests.iter().filter(|r| r.method == "POST") {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["max_tokens"], 4096);
+        }
+    }
+
     /// GLM via z.ai (the `zai` / `zai-coding` families), accepts sampling.
     fn glm_fixture() -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
         fixture_for("glm-5.3")
@@ -1818,18 +1911,28 @@ mod tests {
         sp.insert("temperature".to_string(), serde_json::json!(1.9));
         sp.insert("max_tokens".to_string(), serde_json::json!(9));
         let config = ChatConfig {
+            max_tokens: Some(1234),
             sampling_params: Some(sp),
             ..ChatConfig::default()
         };
-        let body =
-            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        let body = serde_json::to_value(
+            provider.build_request(
+                &messages,
+                &tools,
+                &config,
+                provider
+                    .request_output_tokens(&config, &messages, &tools)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
         assert!(
             body.get("temperature").is_none(),
             "smuggled temperature must not reach the wire: {body}"
         );
         assert_eq!(
             body["max_tokens"],
-            serde_json::json!(crate::context::default_max_tokens()),
+            serde_json::json!(1234),
             "dedicated max_tokens field must win: {body}"
         );
     }

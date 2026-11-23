@@ -7,7 +7,7 @@
 
 use octos_core::Message;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 // ── Runtime catalog (loaded from model_catalog.json) ─────────
 
@@ -177,7 +177,9 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     let m = model_id.to_lowercase();
     // Check the newest model families first so they win over the broader
     // substring branches below (e.g. minimax-m3 before the generic minimax).
-    if m.contains("deepseek-v4") || is_deepseek_flash(&m) {
+    if is_deepseek_flash(&m) {
+        393_216
+    } else if m.contains("deepseek-v4") {
         384_000
     } else if m.contains("minimax-m3") || m.contains("kimi-k3") {
         // kimi-k3 default max completion is 131072 (settable up to 1M);
@@ -197,9 +199,60 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
     }
 }
 
-/// Default max tokens per LLM call.
+/// Legacy budget used by releases preceding per-model output resolution.
+#[deprecated(
+    note = "use LlmProvider::max_output_tokens for model metadata, or ChatConfig::default for inference"
+)]
 pub fn default_max_tokens() -> u32 {
     16_384
+}
+
+/// Exact model metadata for a wire request. Substring and family estimates used
+/// for routing are not provider-advertised output limits. Prefer the serving
+/// route. A different host offering the same model ID may have a smaller maximum.
+pub(crate) fn native_output_limits(provider: &str, model: &str) -> Option<(u32, u32)> {
+    static SHIPPED: LazyLock<HashMap<String, CatalogModel>> = LazyLock::new(|| {
+        let catalog: crate::adaptive::QosCatalog =
+            serde_json::from_str(crate::registry::CANONICAL_MODEL_CATALOG)
+                .expect("invalid bundled model catalog");
+        let entries = catalog
+            .models
+            .into_iter()
+            .map(|m| (m.provider, m.context_window, m.max_output))
+            .collect::<Vec<_>>();
+        build_catalog_map(&entries)
+    });
+    let runtime = CATALOG.read().unwrap_or_else(|err| err.into_inner());
+    let provider = provider.split('@').next().unwrap_or(provider);
+    let model = model.to_lowercase();
+    let route = format!("{}/{model}", provider.to_lowercase());
+    for map in [runtime.as_ref(), Some(&*SHIPPED)].into_iter().flatten() {
+        if let Some(row) = map.get(&route) {
+            if let Ok(output @ 1..) = u32::try_from(row.max_output) {
+                return Some((
+                    u32::try_from(row.context_window).unwrap_or(u32::MAX),
+                    output,
+                ));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn fit_output(output: u32, window: u32, estimated_input: u32) -> u32 {
+    if window == 0 {
+        output
+    } else {
+        // Wire token counts are estimated. Reserve headroom for dense prompts while
+        // leaving the full native output allowance available for short requests.
+        let margin = estimated_input.div_ceil(4).min((window / 100) * 15);
+        output.min(
+            window
+                .saturating_sub(estimated_input)
+                .saturating_sub(margin)
+                .max(1),
+        )
+    }
 }
 
 /// Estimate token count from text using character heuristic.

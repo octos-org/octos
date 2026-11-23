@@ -457,8 +457,7 @@ impl Agent {
                                     && Self::is_truncated_tool_call_error(&e)
                                 {
                                     let model_max = self.llm.max_output_tokens();
-                                    let current = fallback_config.max_tokens.unwrap_or(0);
-                                    if model_max > current {
+                                    if let Some(current) = fallback_config.max_tokens.filter(|v| model_max > *v) {
                                         fallback_config.max_tokens = Some(model_max);
                                         fallback_truncation_retried = true;
                                         warn!(
@@ -528,8 +527,7 @@ impl Agent {
                         // attempt can complete the call. Only bump upward.
                         if Self::is_truncated_tool_call_error(&e) {
                             let model_max = self.llm.max_output_tokens();
-                            let current = provider_config.max_tokens.unwrap_or(0);
-                            if model_max > current {
+                            if let Some(current) = provider_config.max_tokens.filter(|v| model_max > *v) {
                                 let mut c = provider_config.clone();
                                 c.max_tokens = Some(model_max);
                                 warn!(
@@ -664,8 +662,7 @@ impl Agent {
                                     && Self::is_truncated_tool_call_error(&fb_err)
                                 {
                                     let model_max = self.llm.max_output_tokens();
-                                    let current = fallback_config.max_tokens.unwrap_or(0);
-                                    if model_max > current {
+                                    if let Some(current) = fallback_config.max_tokens.filter(|v| model_max > *v) {
                                         fallback_config.max_tokens = Some(model_max);
                                         fallback_truncation_retried = true;
                                         warn!(

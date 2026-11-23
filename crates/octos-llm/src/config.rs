@@ -52,7 +52,7 @@ impl PromptCacheContext {
 /// Configuration for a chat completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatConfig {
-    /// Maximum tokens to generate.
+    /// Explicit per-call output budget. Unset selects the serving model's native maximum.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     /// Temperature for sampling (0.0 = deterministic, 1.0 = creative).
@@ -193,7 +193,7 @@ pub enum ReasoningEffort {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            max_tokens: Some(crate::context::default_max_tokens()),
+            max_tokens: None,
             temperature: Some(0.0),
             tool_choice: ToolChoice::Auto,
             stop_sequences: Vec::new(),

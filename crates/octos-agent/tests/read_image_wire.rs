@@ -84,6 +84,7 @@ async fn four_tools_deliver_image_pixels_and_retain_them_after_another_read() {
     let requests = server.received_requests().await.unwrap();
     let bodies: Vec<Value> = requests
         .iter()
+        .filter(|r| !(r.method.as_str() == "GET" && r.url.path() == "/models"))
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
     for body in &bodies {

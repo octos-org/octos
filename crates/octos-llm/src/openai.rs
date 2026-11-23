@@ -1,5 +1,6 @@
 //! OpenAI (GPT) provider implementation.
 
+use crate::discovery::{DiscoveryProtocol, ModelOutputDiscovery, OutputProbe};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -264,6 +265,7 @@ fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
 
 /// OpenAI GPT provider.
 pub struct OpenAIProvider {
+    output_probe: OutputProbe,
     client: Client,
     /// Separate client for streaming requests, built without a total request
     /// timeout so a healthy long generation is never cut off mid-stream. See
@@ -305,6 +307,7 @@ impl OpenAIProvider {
         let model = model.into();
         let hints = ModelHints::detect(&model);
         Self {
+            output_probe: Default::default(),
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
@@ -331,6 +334,7 @@ impl OpenAIProvider {
 
     /// Set a custom base URL (for Azure, local proxies, etc.).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.output_probe = Default::default();
         let url = base_url.into();
         let official = is_official_openai_base_url(&url);
         // Affinity is official-endpoint-only by default; an explicit builder
@@ -810,16 +814,19 @@ impl OpenAIProvider {
                 _ => (None, None),
             };
 
+        let output = self.request_output_tokens(config, messages, tools);
+        tracing::debug!(target: "octos.llm.output", model = %self.model, provider = %self.provider_label,
+            max_output_tokens = ?output, "building chat completion request");
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
             max_tokens: if self.hints.uses_completion_tokens {
                 None
             } else {
-                config.max_tokens
+                output
             },
             max_completion_tokens: if self.hints.uses_completion_tokens {
-                config.max_tokens.or(Some(4096))
+                output
             } else {
                 None
             },
@@ -934,6 +941,17 @@ const RESERVED_SAMPLING_KEYS: &[&str] = &[
     "tool_choice",
 ];
 
+impl ModelOutputDiscovery for OpenAIProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)> {
+        Some((
+            &self.output_probe,
+            DiscoveryProtocol::OpenAICompatible,
+            &self.base_url,
+            self.api_key.expose_secret(),
+        ))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(
@@ -942,6 +960,7 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        let config = &self.output_config(config, messages, tools).await;
         let request = self.build_request(messages, tools, config, false);
         self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat(&request).await?;
@@ -1150,6 +1169,7 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        let config = &self.output_config(config, messages, tools).await;
         let request = self.build_request(messages, tools, config, false);
         self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat_stream(&request).await?;
@@ -1853,6 +1873,44 @@ mod tests {
     }
 
     #[test]
+    fn output_budget_uses_serving_model_on_the_wire() {
+        let messages = [msg("hello")];
+        for (family, model, field, limit) in [
+            ("deepseek", "deepseek-flash", "max_tokens", 393216),
+            (
+                "openrouter",
+                "deepseek/deepseek-v4-pro",
+                "max_tokens",
+                393216,
+            ),
+            ("openai", "gpt-5", "max_completion_tokens", 128000),
+        ] {
+            let provider = OpenAIProvider::new("test", model).with_provider_label(family);
+            for (override_limit, expected) in
+                [(None, limit), (Some(64), 64), (Some(u32::MAX), limit)]
+            {
+                let config = ChatConfig {
+                    max_tokens: override_limit,
+                    ..Default::default()
+                };
+                let body =
+                    serde_json::to_value(provider.build_request(&messages, &[], &config, false))
+                        .unwrap();
+                assert_eq!(body[field], expected, "{family}/{model}");
+            }
+        }
+        let unknown = OpenAIProvider::new("test", "unlisted-deepseek-test-model");
+        let body = serde_json::to_value(unknown.build_request(
+            &messages,
+            &[],
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        assert!(body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
     fn build_request_drops_reserved_keys_from_sampling_params() {
         // Defense-in-depth (#2172): a modeled key put in sampling_params is
         // dropped so it can't duplicate/override the dedicated field. The
@@ -1983,8 +2041,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            OpenAIProvider::new("test-key", "deepseek-v4-flash").with_base_url(server.uri());
+        let provider = OpenAIProvider::new("test-key", "deepseek-v4-flash")
+            .with_provider_label("deepseek")
+            .with_base_url(server.uri());
         let messages = vec![msg_with_user_video(dir.path())];
         let response = provider
             .chat(&messages, &[], &ChatConfig::default())

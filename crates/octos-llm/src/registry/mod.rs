@@ -16,7 +16,7 @@ use crate::provider::LlmProvider;
 /// The canonical `model_catalog.json`, compiled in — the same SSOT the CLI
 /// serves for onboarding. It is the single place a model NAME is written down;
 /// no provider module hardcodes one.
-const CANONICAL_MODEL_CATALOG: &str = include_str!(concat!(
+pub(crate) const CANONICAL_MODEL_CATALOG: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../model_catalog.json"
 ));

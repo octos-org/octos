@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use crate::discovery::{DiscoveryProtocol, ModelOutputDiscovery, OutputProbe};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -29,6 +30,7 @@ use continuation::{Continuations, Pending, missing_response};
 
 /// OpenAI provider using the Responses API.
 pub struct OpenAIResponsesProvider {
+    output_probe: OutputProbe,
     client: Client,
     /// Separate client for streaming requests, built without a total request
     /// timeout so a healthy long generation is never cut off mid-stream. See
@@ -47,6 +49,7 @@ pub struct OpenAIResponsesProvider {
 impl OpenAIResponsesProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
+            output_probe: Default::default(),
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
@@ -64,6 +67,7 @@ impl OpenAIResponsesProvider {
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.output_probe = Default::default();
         let base_url = base_url.into();
         self.prompt_cache_affinity = is_official_openai_base_url(&base_url);
         self.base_url = base_url;
@@ -115,7 +119,7 @@ impl OpenAIResponsesProvider {
             "input": input,
         });
 
-        if let Some(max) = config.max_tokens {
+        if let Some(max) = self.request_output_tokens(config, messages, tools) {
             body["max_output_tokens"] = max.into();
         }
         if !is_official_openai_base_url(&self.base_url) {
@@ -317,6 +321,17 @@ impl OpenAIResponsesProvider {
     }
 }
 
+impl ModelOutputDiscovery for OpenAIResponsesProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)> {
+        Some((
+            &self.output_probe,
+            DiscoveryProtocol::OpenAICompatible,
+            &self.base_url,
+            self.api_key.expose_secret(),
+        ))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenAIResponsesProvider {
     async fn chat(
@@ -325,6 +340,7 @@ impl LlmProvider for OpenAIResponsesProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        let config = &self.output_config(config, messages, tools).await;
         let body = self.build_request(messages, tools, config);
         let (response, pending) = self.send_request(&body, config, false).await?;
         let raw: serde_json::Value = response.json().await.wrap_err_with(|| {
@@ -354,6 +370,7 @@ impl LlmProvider for OpenAIResponsesProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        let config = &self.output_config(config, messages, tools).await;
         let mut body = self.build_request(messages, tools, config);
         body["stream"] = true.into();
         let (response, mut pending) = self.send_request(&body, config, true).await?;

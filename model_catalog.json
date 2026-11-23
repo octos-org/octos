@@ -319,7 +319,7 @@
       "cost_in": 0.14,
       "cost_out": 0.38,
       "context_window": 1048576,
-      "max_output": 384000,
+      "max_output": 393216,
       "endpoints": [
         {
           "id": "deepseek",
@@ -1218,7 +1218,7 @@
       "cost_in": 0.28,
       "cost_out": 0.42,
       "context_window": 1048576,
-      "max_output": 384000
+      "max_output": 393216
     },
     {
       "provider": "openrouter/deepseek/deepseek-v4.1-flash",
