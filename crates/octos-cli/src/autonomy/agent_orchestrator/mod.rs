@@ -16374,10 +16374,15 @@ fn retire_old_peer_injection(
     old_key: &MasterContinuationDedupeKey,
     reason: &str,
 ) {
-    cancel_pending_continuation(state, old_key);
+    let group = state
+        .continuations
+        .pending_items()
+        .find(|i| &i.dedupe_key == old_key)
+        .map(|i| i.group_id.as_str().to_owned())
+        .unwrap_or_else(|| PEER_SEND_INPUT_GROUP.to_owned());
     if let Some(store) = state.supervisor_store.as_ref() {
         if let Err(err) = store.record_continuation_completed(
-            PEER_SEND_INPUT_GROUP,
+            &group,
             old_key.as_str(),
             now_ms_u64(),
             Some(reason.to_owned()),
@@ -16388,8 +16393,10 @@ fn retire_old_peer_injection(
                 key = old_key.as_str(),
                 "peer_send_input old-record tombstone write failed"
             );
+            return;
         }
     }
+    cancel_pending_continuation(state, old_key);
 }
 
 /// #15 SF1 — the primary sort key for the deterministic restart re-enqueue:

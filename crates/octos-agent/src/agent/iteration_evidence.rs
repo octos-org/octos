@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
+// One level of independently bound inventories keeps the owner snapshot bounded.
+// Apply the same 16 MiB aggregate limit as native skill input, even on replay.
+const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const POLICY: &str = ".octos/continuation.json";
 const STATE: &str = ".octos/continuation-state.json";
 
@@ -47,6 +50,8 @@ struct Snapshot {
     attempt: u64,
     phase: Phase,
     artifacts: Vec<Binding>,
+    #[serde(default)]
+    dependency_manifests: Vec<Binding>,
     checks: Vec<Observation>,
     #[serde(default)]
     scope: BTreeSet<String>,
@@ -58,6 +63,7 @@ struct Snapshot {
 enum Phase {
     Pending,
     Checked,
+    Blocked,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +99,12 @@ struct State {
     flat_attempts: u32,
     warned: bool,
     final_notice: Option<String>,
+    /// Final completion claims are distinct from completed checker attempts.
+    /// Failed submissions can otherwise repeat forever without a new snapshot.
+    #[serde(default)]
+    completion_gap_attempts: u32,
+    #[serde(default)]
+    completion_blocked: bool,
     #[serde(default)]
     scope: BTreeSet<String>,
 }
@@ -199,12 +211,14 @@ impl Observer {
                 &state_path,
                 &mut state,
                 &fingerprint,
-                "External work/checking is pending. Preserve its job handle and wait for actual completion; do not claim completion.",
+                "External work/checking is pending in the whole-task evidence. This does not establish that every unfinished item is externally blocked. Check and dispatch ready unassigned work before waiting; preserve real pending job handles and do not claim completion.",
             );
         }
         // Polls and old attempts never consume a repair round. On EndTurn still
         // revalidate bytes: the artifact can have changed without a new report.
         if !final_answer && snapshot.attempt <= state.attempt {
+            // A supervisor must honor the durable handoff. Deliberate resumes
+            // still need tools to diagnose/repair before publishing improvement.
             return Ok(Decision::Continue);
         }
         let checked = (|| -> Result<BTreeMap<String, Observation>> {
@@ -247,25 +261,38 @@ impl Observer {
                 !snapshot.artifacts.is_empty(),
                 "checked evidence must bind actual artifacts"
             );
+            let mut hashes = BTreeMap::new();
             for binding in &snapshot.artifacts {
-                let path = confined(&root, &binding.path)?;
-                ensure!(
-                    binding.sha256.len() == 64 && file_digest(&path)? == binding.sha256,
-                    "stale artifact binding: {}",
-                    binding.path
-                );
+                verify_artifact(&root, binding, &mut hashes)?;
             }
-            if final_answer {
+            // Only top-level artifacts can satisfy an explicitly declared delivery.
+            if final_answer && snapshot.phase != Phase::Blocked {
                 for delivery in &policy.deliverables {
-                    let path = confined(&root, delivery)?;
                     ensure!(
-                        snapshot
-                            .artifacts
-                            .iter()
-                            .any(|b| confined(&root, &b.path).ok().as_ref() == Some(&path)),
+                        hashes.contains_key(&confined(&root, delivery)?),
                         "delivery path has no current check binding: {}",
                         delivery
                     );
+                }
+            }
+            let mut manifest_bytes = 0usize;
+            for manifest in &snapshot.dependency_manifests {
+                let path = confined(&root, &manifest.path)?;
+                let bytes = record(&path)?;
+                manifest_bytes += bytes.len();
+                ensure!(
+                    manifest_bytes <= MAX_MANIFEST_BYTES,
+                    "dependency manifests exceed aggregate limit"
+                );
+                ensure!(
+                    digest(&bytes) == manifest.sha256,
+                    "stale dependency manifest: {}",
+                    manifest.path
+                );
+                let rows: Vec<Binding> = serde_json::from_slice(&bytes)?;
+                ensure!(!rows.is_empty(), "empty dependency manifest");
+                for row in rows {
+                    verify_artifact(&root, &row, &mut hashes)?;
                 }
             }
             let mut observed = BTreeMap::new();
@@ -279,6 +306,19 @@ impl Observer {
                     "invalid residual"
                 );
                 observed.insert(c.id.clone(), c.clone());
+            }
+            if snapshot.phase == Phase::Blocked {
+                ensure!(
+                    policy
+                        .required_checks
+                        .iter()
+                        .all(|check| observed.contains_key(&check.id))
+                        && policy
+                            .required_checks
+                            .iter()
+                            .any(|check| observed[&check.id].status == Status::Fail),
+                    "a blocked attempt must account for every required check and identify a failure"
+                );
             }
             Ok(policy
                 .required_checks
@@ -342,6 +382,11 @@ impl Observer {
                     .get(&c.id)
                     .is_some_and(|p| better(p, &current[&c.id], c.epsilon))
             });
+            if state.attempt == 0 || expanded || (improved && !regressed) || ready {
+                state.completion_gap_attempts = 0;
+                state.completion_blocked = false;
+                state.final_notice = None;
+            }
             if expanded {
                 // Scope growth is neither a repair win nor a failed repair.
             } else if state.attempt == 0 || (improved && !regressed) || ready {
@@ -365,8 +410,12 @@ impl Observer {
             state.attempt = snapshot.attempt;
             state.snapshot_digest = fingerprint.clone();
             let was_warned = state.warned;
-            if !ready && state.flat_attempts >= policy.stagnant_attempts {
+            if snapshot.phase != Phase::Blocked
+                && !ready
+                && state.flat_attempts >= policy.stagnant_attempts
+            {
                 state.warned = true;
+                state.completion_blocked = true;
                 save(&state_path, &state)?;
                 let message = format!(
                     "[needs_replan] {} checked attempts without a new best result without regression. Unresolved checks: {}. Preserve artifacts and evidence. Diagnose a different cause or hand back to the coordinator; do not restart the same attempt or claim completion.",
@@ -379,9 +428,27 @@ impl Observer {
                     Decision::Notice(message)
                 });
             }
+            if snapshot.phase == Phase::Blocked {
+                state.completion_blocked = true;
+            }
             save(&state_path, &state)?;
         }
+        if snapshot.phase == Phase::Blocked && final_answer {
+            return Ok(Decision::Yield(format!(
+                "[evidence_stalled] A checked blocker ended this attempt. Unresolved checks: {}. Keep the bound evidence and resume on a changed input or capability.",
+                unresolved(&current)
+            )));
+        }
+        if state.completion_blocked && !ready && final_answer {
+            return Ok(Decision::Yield(stalled_message(&current)));
+        }
         if final_answer && !ready {
+            state.completion_gap_attempts = state.completion_gap_attempts.saturating_add(1);
+            if state.completion_gap_attempts >= policy.stagnant_attempts {
+                state.completion_blocked = true;
+                save(&state_path, &state)?;
+                return Ok(Decision::Yield(stalled_message(&current)));
+            }
             return finish_gap(
                 &state_path,
                 &mut state,
@@ -394,6 +461,13 @@ impl Observer {
         }
         Ok(Decision::Continue)
     }
+}
+
+fn stalled_message(checks: &BTreeMap<String, Observation>) -> String {
+    format!(
+        "[needs_replan] [evidence_stalled] Completion is blocked by unchanged incomplete evidence: {}. Preserve the candidate, review evidence and attempt history. Return the concrete blocker to the coordinator; do not automatically resume the same work. Fresh checked evidence showing improvement or completion is required to clear this handoff.",
+        unresolved(checks)
+    )
 }
 
 fn valid_delivery_revision(root: &Path, previous_digest: &str, current: &[u8]) -> Result<bool> {
@@ -497,6 +571,30 @@ fn record(path: &Path) -> Result<Vec<u8>> {
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+// Each normalized file is hashed once per observation. A second binding to the
+// same path must agree, including across manifests; nothing is cached across polls.
+fn verify_artifact(
+    root: &Path,
+    binding: &Binding,
+    seen: &mut BTreeMap<PathBuf, String>,
+) -> Result<()> {
+    let path = confined(root, &binding.path)?;
+    if let Some(prior) = seen.get(&path) {
+        ensure!(
+            prior == &binding.sha256,
+            "conflicting artifact binding: {}",
+            binding.path
+        );
+    } else {
+        ensure!(
+            binding.sha256.len() == 64 && file_digest(&path)? == binding.sha256,
+            "stale artifact binding: {}",
+            binding.path
+        );
+        seen.insert(path, binding.sha256.clone());
+    }
+    Ok(())
 }
 fn file_digest(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;

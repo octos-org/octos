@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use octos_core::TokenUsage;
 use tracing::{info, warn};
 
-use super::Agent;
 use super::activity::{DEFAULT_IDLE_TIMEOUT_SECS, LoopActivityState};
+use super::turn_state::attach_partial_usage;
+use super::{Agent, ConversationResponse, FailedConversationProgress};
 use crate::progress::ProgressEvent;
 
 /// Reason why the agent loop stopped due to budget constraints.
@@ -38,6 +39,23 @@ pub(super) enum BudgetStop {
 }
 
 impl BudgetStop {
+    /// A stopped conversation is partial work, not a successful final answer.
+    /// Keep the native partial-progress carrier so hosts persist the transcript,
+    /// artifacts and usage before emitting their existing error terminal.
+    pub(super) fn finish_conversation(
+        &self,
+        partial: ConversationResponse,
+    ) -> eyre::Result<ConversationResponse> {
+        if matches!(self, Self::Shutdown) {
+            // Cancellation owns the terminal classification at the host.
+            return Ok(partial);
+        }
+        let message = format!("[needs_replan] {}", self.message());
+        let usage = partial.token_usage.clone();
+        Err(attach_partial_usage(eyre::eyre!("{message}"), usage)
+            .wrap_err(FailedConversationProgress { partial, message }))
+    }
+
     pub(super) fn message(&self) -> String {
         match self {
             Self::Shutdown => String::new(),

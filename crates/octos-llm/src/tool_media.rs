@@ -83,12 +83,17 @@ impl ToolMedia {
 }
 
 /// Index of the assistant row whose tool calls the transcript's trailing
-/// tool rows answer: the last assistant row carrying tool calls. Tool rows
-/// after it are the batch the model is about to see for the first time.
+/// tool rows answer. A later user or non-calling assistant closes the batch;
+/// looking backwards for any historical call would resend its images on a
+/// resumed turn even with current-batch-only media explicitly selected.
 pub fn current_batch_start(messages: &[Message]) -> Option<usize> {
-    messages.iter().rposition(|m| {
-        m.role == MessageRole::Assistant && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
-    })
+    let boundary = messages
+        .iter()
+        .rposition(|m| !matches!(m.role, MessageRole::Tool | MessageRole::System))?;
+    let message = &messages[boundary];
+    (message.role == MessageRole::Assistant
+        && message.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()))
+    .then_some(boundary)
 }
 
 /// Whether the tool row at `idx` belongs to the current batch.
@@ -405,5 +410,44 @@ mod working_set_tests {
         let opt_out: crate::openai::ModelHints =
             serde_json::from_str(r#"{"retain_tool_images":false}"#).unwrap();
         assert!(!opt_out.retain_tool_images);
+    }
+
+    #[test]
+    fn current_batch_only_does_not_resend_images_after_a_user_resume() {
+        let mut messages = vec![];
+        batch(&mut messages, &["source.png", "current.png"]);
+        assert_eq!(
+            for_tool_row_with_image_history(&messages, 1, false, true, false).images,
+            ["source.png", "current.png"]
+        );
+        let mut resume = Message::assistant("Continue from the recorded findings.");
+        resume.role = MessageRole::User;
+        messages.push(resume);
+        let shown = for_tool_row_with_image_history(&messages, 1, false, true, false);
+        assert!(shown.images.is_empty());
+        assert!(shown.note.is_some());
+        // The default continuous-visual-evidence mode is unchanged.
+        assert_eq!(images(&messages), ["source.png", "current.png"]);
+    }
+
+    #[test]
+    fn completed_assistant_closes_current_batch_but_system_note_does_not() {
+        let mut messages = vec![];
+        batch(&mut messages, &["source.png", "current.png"]);
+        let mut note = Message::assistant("Runtime guidance.");
+        note.role = MessageRole::System;
+        messages.push(note);
+        assert_eq!(
+            for_tool_row_with_image_history(&messages, 1, false, true, false)
+                .images
+                .len(),
+            2
+        );
+        messages.push(Message::assistant("Recorded the observations."));
+        assert!(
+            for_tool_row_with_image_history(&messages, 1, false, true, false)
+                .images
+                .is_empty()
+        );
     }
 }
