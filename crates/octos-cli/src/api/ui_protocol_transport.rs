@@ -1553,13 +1553,24 @@ impl SessionWorkspaceStore {
 /// (no-op, `/live` present) yet `set_goal_scope_if_absent` scope A — Gate A then
 /// passes on `/live` and Gate D on A, so the keeper runs in `/live`, not `/A`.
 ///
-/// So gate the WHOLE seed on the target slots being absent (seed only a FRESH
-/// wire, never a half/mixed pair):
-/// - Scoped (`scope = Some`): seed BOTH only when the workspace AND the goal
-///   scope are both absent. If either is already present (a live session, or a
-///   prior seed), skip both — never inject a scope into a wire whose workspace
-///   belongs to someone else. `wire` is the `wire_key_from_goal_key` strip so the
-///   workspace key is byte-identical to the drain gate probe.
+/// So gate the WHOLE seed on the wire having no workspace, and on the seed
+/// agreeing with whatever scope the wire already has (never a half/mixed pair):
+/// - Scoped (`scope = Some`): seed only when the workspace is absent AND the
+///   goal scope is absent or EQUAL to the seed's.
+///   - A workspace already present (a live session, or a prior seed) skips both
+///     — never inject a scope into a wire whose workspace belongs to someone
+///     else.
+///   - A DIFFERENT scope present skips both: the wire's active folder is another
+///     one, this keeper is not dispatchable there (Gate D), and its root must
+///     not become that folder's workspace.
+///   - An EQUAL scope with no workspace is what a serve restart leaves: scopes
+///     are restored from `goal-scopes.json` at boot (#1973), workspaces only by
+///     a `session/open`. The scope is the hash of the folder, so the seed's root
+///     is that scope's folder. Requiring the scope to be ABSENT here stranded
+///     every restarted scoped keeper until a client reopened its session.
+///
+///   `wire` is the `wire_key_from_goal_key` strip so the workspace key is
+///   byte-identical to the drain gate probe.
 /// - Plain (`scope = None`): only a workspace to seed (Gate D is always true for
 ///   an unscoped target); fill the workspace gap.
 ///
@@ -1584,9 +1595,12 @@ fn reseed_fleet_keeper_candidates(
         let profile_id = workspace_profile_scope(None, &seed.wire);
         match seed.scope {
             Some(scope) => {
-                // Seed the pair only into a FRESH wire — never a mixed pair.
+                // Seed only a wire with no workspace, and only a pair that
+                // agrees with the scope the wire already has — never a mixed
+                // pair.
+                let registered = orchestrator.goal_scope(&seed.wire);
                 if workspaces.get(&profile_id, &seed.wire).is_none()
-                    && orchestrator.goal_scope(&seed.wire).is_none()
+                    && registered.is_none_or(|registered| registered == scope)
                 {
                     let root = PathBuf::from(&seed.root);
                     let runtime_hint =
