@@ -221,8 +221,144 @@ pub struct FleetChildRecord {
     /// added).
     #[serde(default)]
     pub pending_escalation: Option<EscalationRequest>,
+    /// The isolated worktree and IMMUTABLE base revision this task's current
+    /// generation is bound to. Written once per generation by
+    /// [`crate::FleetKernelStore::bind_worktree`], before the worker edits
+    /// anything; a later attempt of the same generation reads the same base
+    /// back. `None` until the task first runs in a worktree, and always for a
+    /// task that runs in a scratch directory (which has no tree to bind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeBinding>,
+    /// The journal of acceptance-command runs against this task's worktree.
+    /// Each entry is written as an INTENT before the command starts and gains
+    /// its `result` when the command's outcome is committed; an entry with no
+    /// result is an operation whose outcome is unknown. An accepted verdict's
+    /// evidence points at these entries by `op_id`. Empty for a scratch task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifications: Vec<VerificationRecord>,
     pub generation: u64,
     pub updated_at_ms: u64,
+}
+
+/// The worktree a task generation owns, and the immutable base revision it was
+/// admitted against.
+///
+/// `base_commit` / `base_tree` never change for the life of the generation, no
+/// matter how far the task branch advances or how many attempts run: they are
+/// what "the patch" is measured from and what the admitted test must fail on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeBinding {
+    /// The fleet generation this binding belongs to. A replan bumps the fleet
+    /// generation, and the next attempt then binds afresh.
+    pub generation: u64,
+    /// Canonical controller repository root.
+    pub repo_root: String,
+    /// The task branch (`fleet/<fleet>/<task>`).
+    pub branch: String,
+    /// The directory that holds this task's work: the checkout the last attempt
+    /// to finish populating one ran in. Every attempt gets a directory of its
+    /// own, and this moves to it — together with `populated` — only once that
+    /// directory holds the tree, so it never names an empty one as populated.
+    pub checkout: String,
+    /// The commit the task branch pointed at when the generation was bound.
+    pub base_commit: String,
+    /// The git tree id of `base_commit`.
+    pub base_tree: String,
+    pub bound_at_ms: u64,
+    /// Whether a worker finished populating `checkout` from the branch. The
+    /// controller creates checkouts EMPTY (`--no-checkout`); only a populated
+    /// checkout holds work worth recovering, and snapshotting an unpopulated
+    /// one would commit the deletion of every file.
+    #[serde(default)]
+    pub populated: bool,
+}
+
+/// What a worker asks [`crate::FleetKernelStore::bind_worktree`] to record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeBindRequest {
+    pub repo_root: String,
+    pub branch: String,
+    pub checkout: String,
+    /// The branch head read host-side when the checkout was prepared. Recorded
+    /// as the base ONLY if this generation has no binding yet.
+    pub base_commit: String,
+    /// The git tree id of `base_commit`.
+    pub base_tree: String,
+}
+
+/// Why a test was run against a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VerificationPhase {
+    /// Before any edit: the admitted test must FAIL on the base revision.
+    Admission,
+    /// After the work: the criterion must hold on the resulting tree.
+    Acceptance,
+}
+
+/// One run of an acceptance command against one exact tree — the test receipt.
+///
+/// The identity of what was tested is `(commit, tree_digest)`; `command` is the
+/// exact command line. A record is created with `result: None` BEFORE the
+/// command starts, so a host that dies mid-run leaves durable proof that the
+/// run was started and that its outcome is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRecord {
+    /// Fresh UUID per run; accepted evidence refers to it as
+    /// `verification:<op_id>`.
+    pub op_id: String,
+    /// The attempt that started the run.
+    pub attempt_id: String,
+    /// The fleet generation the run belongs to.
+    pub generation: u64,
+    pub phase: VerificationPhase,
+    /// The [`AcceptanceCriterion::id`] this run checks.
+    pub criterion_id: String,
+    /// The command line, exactly as the criterion states it.
+    pub command: String,
+    /// The commit whose tree was tested — the immutable deliverable identity.
+    pub commit: String,
+    /// The git tree id of `commit`.
+    pub tree_digest: String,
+    pub started_at_ms: u64,
+    /// `None` until the outcome is committed.
+    #[serde(default)]
+    pub result: Option<VerificationResult>,
+}
+
+impl VerificationRecord {
+    /// Whether this record is a run of exactly `request` in fleet generation
+    /// `generation`: the same phase, criterion, command, commit and tree.
+    pub(crate) fn is_run(&self, generation: u64, request: &VerificationRequest) -> bool {
+        self.generation == generation
+            && self.phase == request.phase
+            && self.criterion_id == request.criterion_id
+            && self.command == request.command
+            && self.commit == request.commit
+            && self.tree_digest == request.tree_digest
+    }
+}
+
+/// The committed outcome of a [`VerificationRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationResult {
+    /// The process exit code; `None` when a signal ended it.
+    pub exit_status: Option<i32>,
+    /// SHA-256 over the captured output, framed as the stdout length (u64,
+    /// little-endian), then stdout, then stderr.
+    pub output_sha256: String,
+    pub finished_at_ms: u64,
+}
+
+/// One exact test run: what a worker is about to start
+/// ([`crate::FleetKernelStore::begin_verification`]) or asks about
+/// ([`crate::FleetKernelStore::find_verification`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationRequest {
+    pub phase: VerificationPhase,
+    pub criterion_id: String,
+    pub command: String,
+    pub commit: String,
+    pub tree_digest: String,
 }
 
 /// A worker's mid-task request to WIDEN its [`crate::WorkerGrant`] (PR B). The
@@ -356,6 +492,24 @@ pub struct PlanTask {
     /// none is written exactly as such a row was.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<DeclaredInput>,
+    /// The failing test this task is admitted on, when it names one: the test
+    /// must fail on the worktree's base revision before any edit, and work
+    /// recovered from an interrupted attempt is delivered without calling a
+    /// model again once that test and every other criterion pass on it. `None`
+    /// for a task with no such test — in a worktree it is still bound,
+    /// recovered and receipted like any other, but only its agent can say it is
+    /// finished. A task that names one cannot run in a scratch directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_test: Option<FailingTest>,
+}
+
+/// The failing test a task is admitted on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailingTest {
+    /// The `id` of the task's [`AcceptanceCriterion`] that is the ADMITTED
+    /// TEST: a `CommandExit { code: 0 }` whose command fails on the base
+    /// revision and must pass on the delivered tree.
+    pub criterion: String,
 }
 
 /// An acceptance criterion: a description plus a checkable [`Verifier`].

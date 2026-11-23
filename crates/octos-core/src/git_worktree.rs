@@ -248,36 +248,33 @@ pub struct PreparedWorktree {
     /// where its HEAD/index/logs live. Resolved from the linked worktree's
     /// `.git` pointer file.
     pub worktree_git_dir: PathBuf,
-    /// The branch's commit right after prepare — the BASE that
-    /// [`branch_advanced_past`] compares against to decide whether the attempt
-    /// actually landed a deliverable (branch advanced past this) or left an empty
-    /// branch.
+    /// The branch's head commit right after prepare.
     pub base_commit: String,
 }
 
-/// Allocate — or, for a re-launched attempt, RECONCILE — the TASK-STABLE
-/// worktree for a fleet task.
+/// Create a worktree checkout of a fleet task's branch at `checkout`.
 ///
 /// `work_root` is the pool's `fleet-work` root; the `checkout` MUST resolve
 /// safely under it (no symlinked component, no escape — [`assert_checkout_contained`]),
-/// which is what makes the reconcile's removals safe (HIGH #2: never create or
+/// which is what makes the removals here safe (HIGH #2: never create or
 /// `remove_dir_all` outside `fleet-work`).
 ///
-/// The branch (`fleet/<fleet>/<task>`) and checkout path are deterministic and
-/// stable across attempts, which is what makes a restarted attempt resumable:
-/// it continues from the dead attempt's last committed work. But it also means
-/// a re-launch finds the branch and/or its checkout ALREADY PRESENT, where a
-/// plain `git worktree add -b` would fail. This reconciles deterministically
-/// (v1 = interrupt-and-restart, matching the kernel's "never resume a live
-/// turn"):
+/// The BRANCH (`fleet/<fleet>/<task>`) is stable across attempts — it is what
+/// carries a task's committed work from one attempt to the next. The checkout
+/// DIRECTORY is not: every attempt gets a directory of its own
+/// ([`new_work_checkout`]), so nothing still running in an earlier attempt's
+/// directory can write into this one.
 ///
-/// 1. If the checkout dir or the branch exists, [`force_free_checkout`] frees a
-///    leftover checkout — even a LOCKED one (HIGH #5: `unlock` +
-///    `remove --force --force` + `prune` + clear a stale admin entry) — WITHOUT
-///    deleting the branch, so the relaunch can always reclaim the task.
-/// 2. Re-add: if the branch still exists, `git worktree add <checkout> <branch>`
-///    (NO `-b`) so the checkout RESUMES from the branch's last commit;
+/// 1. Whatever sits at `checkout` (normally nothing) is freed first by
+///    [`force_free_checkout`] — even a LOCKED worktree (HIGH #5) — WITHOUT
+///    deleting the branch.
+/// 2. If the branch exists, `git worktree add --force <checkout> <branch>` (NO
+///    `-b`), so the checkout continues from the branch's last commit;
 ///    otherwise `git worktree add -b <branch> <checkout> HEAD` for a fresh task.
+///    `--force` because the branch may still be checked out in the directory of
+///    an interrupted attempt whose work has yet to be recovered: this checkout
+///    is created EMPTY beside it and is only populated after the caller has
+///    committed that work and retired that directory.
 ///
 /// The branch is NEVER deleted here — it is the deliverable. Every git op runs
 /// hooks-disabled (module SECURITY note).
@@ -342,7 +339,14 @@ pub fn prepare_fleet_worktree(
     if branch_exists {
         run_git(
             &canonical_root,
-            &["worktree", "add", "--no-checkout", &checkout_str, branch],
+            &[
+                "worktree",
+                "add",
+                "--force",
+                "--no-checkout",
+                &checkout_str,
+                branch,
+            ],
         )
         .wrap_err("git worktree add (resume existing fleet branch) failed")?;
     } else {
@@ -385,6 +389,362 @@ pub fn prepare_fleet_worktree(
     })
 }
 
+/// Confirm that `checkout` is still an interrupted attempt's worktree of
+/// `branch`, with whatever the dead attempt left in it — uncommitted edits
+/// included — and describe it.
+///
+/// A caller that recovers work asks here before it trusts a directory its
+/// durable record names: the answer says whether there is something to commit
+/// from, never that the directory is a place to keep working in (a process of
+/// the dead attempt may still be writing there). `Ok(None)` means there is
+/// nothing to recover from it.
+///
+/// Returns `Ok(Some(_))` only when ALL of these hold:
+///
+/// - `checkout` is an existing directory proven contained in `work_root` with
+///   no symlinked component (the same [`assert_checkout_contained`] proof
+///   `prepare_fleet_worktree` requires — a failure is an `Err`, not a fallback);
+/// - git has it REGISTERED as a worktree of `repo_root` checked out on exactly
+///   `refs/heads/<branch>` and not marked prunable;
+/// - its `.git` pointer resolves to an admin dir under this repository's own
+///   `<git_dir>/worktrees`.
+///
+/// This MUTATES NOTHING: no `worktree add`, no checkout, no index write. The
+/// only git invocations are read-only and go through [`git_command`] (hooks
+/// disabled, global/system config masked), so the controller-side code-exec
+/// fence of the module SECURITY note holds unchanged.
+///
+/// It cannot tell a populated working tree from one the worker never populated
+/// (`--no-checkout` leaves it empty). The caller must know that from its own
+/// durable record before trusting the tree's contents.
+pub fn reuse_fleet_worktree(
+    repo_root: &Path,
+    work_root: &Path,
+    branch: &str,
+    checkout: &Path,
+) -> Result<Option<PreparedWorktree>> {
+    validate_fleet_branch(branch)?;
+    if !is_git_repo(repo_root) {
+        return Err(eyre!(
+            "controller workspace {} is not a git repository",
+            repo_root.display()
+        ));
+    }
+    if checkout.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    assert_checkout_contained(work_root, checkout)?;
+    if !checkout.is_dir() {
+        return Ok(None);
+    }
+
+    let canonical_root = std::fs::canonicalize(repo_root)
+        .wrap_err_with(|| format!("failed to canonicalize repo root {}", repo_root.display()))?;
+    let git_dir = git_common_dir(&canonical_root)?;
+    let Ok(canonical_checkout) = std::fs::canonicalize(checkout) else {
+        return Ok(None);
+    };
+
+    let listing = run_git(&canonical_root, &["worktree", "list", "--porcelain"])
+        .wrap_err("git worktree list failed")?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let registered = listing.split("\n\n").any(|block| {
+        let mut path_matches = false;
+        let mut branch_matches = false;
+        let mut prunable = false;
+        for line in block.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                path_matches = std::fs::canonicalize(path)
+                    .map(|p| p == canonical_checkout)
+                    .unwrap_or(false);
+            } else if let Some(name) = line.strip_prefix("branch ") {
+                branch_matches = name == branch_ref;
+            } else if line == "prunable" || line.starts_with("prunable ") {
+                prunable = true;
+            }
+        }
+        path_matches && branch_matches && !prunable
+    });
+    if !registered {
+        return Ok(None);
+    }
+
+    // The pointer file must lead back into THIS repository's worktree admin
+    // area, so the worker's in-checkout git ops act on the task branch.
+    let Some(worktree_git_dir) = worktree_admin_dir(checkout) else {
+        return Ok(None);
+    };
+    let Ok(canonical_admin) = std::fs::canonicalize(&worktree_git_dir) else {
+        return Ok(None);
+    };
+    if !canonical_admin.starts_with(git_dir.join("worktrees")) {
+        return Ok(None);
+    }
+
+    let base_commit = run_git(&canonical_root, &["rev-parse", branch]).unwrap_or_default();
+    Ok(Some(PreparedWorktree {
+        repo_root: canonical_root,
+        branch: branch.to_string(),
+        checkout: checkout.to_path_buf(),
+        git_dir,
+        worktree_git_dir: canonical_admin,
+        base_commit,
+    }))
+}
+
+/// Create a throwaway, DETACHED worktree checkout of exactly `commit` — the
+/// place a commit's checks run, where nothing an earlier run left behind (a
+/// build cache, a file git ignores, a half-written edit) can be seen.
+///
+/// Like [`prepare_fleet_worktree`], `checkout` must be proven contained in
+/// `work_root`, is created with `--no-checkout` (the worker populates it inside
+/// its own sandbox — module SECURITY note), and every git op is hooks-disabled.
+/// Unlike it, no branch is involved: HEAD is detached at `commit`, so nothing
+/// run there moves a ref by committing. Whatever already sits at `checkout` is
+/// removed first.
+///
+/// `commit` must be a full object id, never a ref name: the caller checks out
+/// the immutable object it read, not whatever a name resolves to now. Remove the
+/// checkout with [`remove_checkout_keep_branch`].
+pub fn prepare_detached_worktree(
+    repo_root: &Path,
+    work_root: &Path,
+    checkout: &Path,
+    commit: &str,
+) -> Result<()> {
+    validate_object_id(commit)?;
+    if !is_git_repo(repo_root) {
+        return Err(eyre!(
+            "controller workspace {} is not a git repository",
+            repo_root.display()
+        ));
+    }
+    let canonical_root = std::fs::canonicalize(repo_root)
+        .wrap_err_with(|| format!("failed to canonicalize repo root {}", repo_root.display()))?;
+    let git_dir = git_common_dir(&canonical_root)?;
+    assert_checkout_contained(work_root, checkout)?;
+    if let Some(parent) = checkout.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("failed to create worktree parent {}", parent.display()))?;
+    }
+    if checkout.symlink_metadata().is_ok() {
+        force_free_checkout(&canonical_root, Some(&git_dir), work_root, checkout);
+    }
+    let checkout_str = checkout.to_string_lossy();
+    run_git(
+        &canonical_root,
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            &checkout_str,
+            commit,
+        ],
+    )
+    .wrap_err("git worktree add (detached checkout of one commit) failed")?;
+    Ok(())
+}
+
+/// Whether `commit`'s tree holds a REGULAR FILE at the repository-relative
+/// `path`. A directory, a symlink, a submodule or nothing at all is `false`.
+///
+/// This is how "the deliverable contains this file" is decided: against the
+/// immutable commit, not against a working directory that also holds whatever
+/// git ignores. Read-only, through [`git_command`], with the path taken
+/// literally (no glob, no pathspec magic).
+///
+/// `Err` for a `commit` that is not a full object id, a `path` that is not a
+/// plain relative path, or a git failure — never a silent `false`.
+pub fn commit_has_regular_file(repo_root: &Path, commit: &str, path: &str) -> Result<bool> {
+    validate_object_id(commit)?;
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => return Err(eyre!("`{path}` is not a plain repository-relative path")),
+        }
+    }
+    let wanted = parts.join("/");
+    if wanted.is_empty() || wanted.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(eyre!("`{path}` is not a plain repository-relative path"));
+    }
+    let output = git_command(repo_root)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-tree", "-z", "--full-tree", commit, "--", &wanted])
+        .output()
+        .wrap_err("failed to run git ls-tree")?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "git ls-tree {commit} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    // Each entry is `<mode> <type> <object>\t<path>`, NUL-terminated.
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing.split('\0').any(|entry| {
+        entry.split_once('\t').is_some_and(|(meta, listed)| {
+            listed == wanted && meta.starts_with("100") && meta.split(' ').nth(1) == Some("blob")
+        })
+    }))
+}
+
+/// `<stem>.<suffix>`: a directory that belongs to the task whose stem is
+/// `stem` (`<work_root>/<fleet>/<task>`).
+fn task_dir(stem: &Path, suffix: &str) -> Result<PathBuf> {
+    let mut name = stem
+        .file_name()
+        .ok_or_else(|| eyre!("task directory {} has no name", stem.display()))?
+        .to_os_string();
+    name.push(".");
+    name.push(suffix);
+    Ok(stem.with_file_name(name))
+}
+
+/// A directory for a task's work checkout that no attempt has used before:
+/// `<stem>.work-<random>`.
+///
+/// Every attempt works in a directory of its own. A process an interrupted
+/// attempt left running knows only that attempt's directory (and its sandbox
+/// confines it there), so it cannot write where the next attempt works.
+pub fn new_work_checkout(stem: &Path) -> Result<PathBuf> {
+    task_dir(stem, &format!("work-{}", uuid::Uuid::new_v4().simple()))
+}
+
+/// Whether `checkout` is a work checkout of the task whose stem is `stem` — a
+/// sibling named `<stem>.work-…`. A path read back from a record is checked
+/// with this before anything is done to it.
+pub fn is_work_checkout(stem: &Path, checkout: &Path) -> bool {
+    let (Some(stem_name), Some(name)) = (stem.file_name(), checkout.file_name()) else {
+        return false;
+    };
+    checkout.parent() == stem.parent()
+        && name
+            .to_string_lossy()
+            .strip_prefix(&*stem_name.to_string_lossy())
+            .is_some_and(|rest| rest.starts_with(".work-") && rest.len() > ".work-".len())
+}
+
+/// The directory of a clean, detached checkout for one verification of the
+/// task whose stem is `stem`: `<stem>.verify-<label>`. See
+/// [`prepare_detached_worktree`].
+pub fn clean_checkout_path(stem: &Path, label: &str) -> Result<PathBuf> {
+    task_dir(stem, &format!("verify-{label}"))
+}
+
+/// Remove every checkout directory that belongs to ONE task, except `keep`.
+///
+/// A task's directories all sit next to each other and are named after its
+/// `stem` (`<work_root>/<fleet>/<task>`) plus a dot-suffix:
+/// `<stem>.<anything>` ([`new_work_checkout`], [`clean_checkout_path`]). The
+/// stem's own name never contains a dot (it comes from
+/// [`crate::safe_filename`]), so the dot-suffix can only match THIS task's
+/// directories — never another task whose id merely starts the same way, and
+/// never the bare `<stem>` directory itself.
+///
+/// Each one is freed with [`remove_checkout_keep_branch`] (contained removal,
+/// its own admin entry cleared, no branch deleted). Best-effort.
+pub fn sweep_task_checkouts(repo_root: &Path, work_root: &Path, stem: &Path, keep: Option<&Path>) {
+    let (Some(parent), Some(name)) = (stem.parent(), stem.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.", name.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if keep == Some(path.as_path()) {
+            continue;
+        }
+        remove_checkout_keep_branch(repo_root, work_root, &path);
+    }
+}
+
+/// A full git object id: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits.
+/// Anything else — a ref name, an abbreviation, an option — is refused, so a
+/// value read from a record can never be parsed by git as something else.
+fn validate_object_id(id: &str) -> Result<()> {
+    let hex = id
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex && (id.len() == 40 || id.len() == 64) {
+        Ok(())
+    } else {
+        Err(eyre!("`{id}` is not a full git object id"))
+    }
+}
+
+/// The commit `branch` points at and the git tree id OF THAT COMMIT, read
+/// host-side. The tree id is the digest a test receipt is bound to: it names the
+/// exact content that was verified, independent of the mutable branch name.
+///
+/// The tree is resolved from the commit id just read — an immutable object —
+/// never from the ref a second time, so a writer that moves the branch between
+/// the two reads cannot pair one commit with another commit's tree.
+///
+/// Read-only (`rev-parse`) through [`git_command`], so it is safe to run
+/// host-side on a branch a worker controls. A missing branch is an `Err`: the
+/// caller must never treat "could not read" as an empty or matching digest.
+pub fn branch_commit_and_tree(repo_root: &Path, branch: &str) -> Result<(String, String)> {
+    validate_fleet_branch(branch)?;
+    let commit = run_git(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ],
+    )
+    .wrap_err_with(|| format!("reading the head commit of {branch} failed"))?;
+    let tree = run_git(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{commit}^{{tree}}"),
+        ],
+    )
+    .wrap_err_with(|| format!("reading the tree of commit {commit} failed"))?;
+    if commit.is_empty() || tree.is_empty() {
+        return Err(eyre!(
+            "git returned an empty commit or tree id for branch {branch}"
+        ));
+    }
+    Ok((commit, tree))
+}
+
+/// The POSIX `sh -c` command an attempt runs — in a sandbox confined to the
+/// interrupted attempt's checkout — to commit whatever that attempt left there,
+/// so the leftover work becomes an immutable commit that can be digested and
+/// verified.
+///
+/// It is [`deliverable_commit_command`] preceded by the removal of a stale
+/// `index.lock`: a host killed during a git index write leaves that lock behind,
+/// and every later `git add` in the checkout would refuse to run. Removing it is
+/// sound only because reclamation happens after the prior attempt's lease was
+/// reclaimed; it does NOT stop a writer that outlived its host. The caller
+/// deals with that one by not staying: it retires the checkout once this
+/// command has committed, and continues in another directory.
+///
+/// The caller gates on this command's exit code: a snapshot that did not commit
+/// leaves the tree unknown, and an unknown tree cannot be verified. A clean
+/// tree is still a no-op (exit 0).
+///
+/// PLATFORM: POSIX `sh`, like [`deliverable_commit_command`].
+pub fn recovery_snapshot_command(message: &str) -> String {
+    format!(
+        "rm -f \"$(git rev-parse --git-dir)/index.lock\" && {}",
+        deliverable_commit_command(message)
+    )
+}
+
 /// Parse a linked worktree's `<checkout>/.git` pointer file
 /// (`gitdir: <git_dir>/worktrees/<slug>`) to locate its per-worktree admin dir.
 fn worktree_admin_dir(checkout: &Path) -> Option<PathBuf> {
@@ -414,10 +774,9 @@ fn worktree_admin_dir(checkout: &Path) -> Option<PathBuf> {
 /// contained grant is exactly the point (dissolution (b)). The string itself
 /// does not mask the global/system config either; the fleet worker's command
 /// builder does that in the environment, as the shell tool does for the
-/// agent's own `git` commands. The caller does NOT gate on this command's exit
-/// code (a clean tree, or a worker's own broken filter, exits non-zero without
-/// being an infra error) — the authoritative "did a deliverable land?" check is
-/// [`branch_advanced_past`], read host-side.
+/// agent's own `git` commands. A clean tree is a no-op (exit 0). Whether a
+/// deliverable landed is decided by the caller from the branch's commit and
+/// tree, read host-side ([`branch_commit_and_tree`]).
 ///
 /// PLATFORM: the returned string is POSIX `sh` (`&&`, `if ! …; then …; fi`,
 /// single-quote escaping) and is only valid where the worker sandbox runs a
@@ -474,27 +833,13 @@ fn sh_single_quote(s: &str) -> String {
     out
 }
 
-/// Whether `branch`'s head in `repo_root` has ADVANCED past `base_commit` — i.e.
-/// the worktree attempt landed a real commit. Read-only (`rev-parse`), routed
-/// through [`git_command`] (hooks-disabled + global/system-config masked), so it
-/// is safe to run host-side; the MUTATING commit runs in the worker sandbox via
-/// [`deliverable_commit_command`].
-///
-/// `Ok(false)` means the branch is unchanged — an accepted run that left an EMPTY
-/// branch, which the caller must NOT record as a success. `Err` is an infra
-/// failure reading the ref (the caller terminates rather than record a phantom).
-pub fn branch_advanced_past(repo_root: &Path, branch: &str, base_commit: &str) -> Result<bool> {
-    let head = run_git(repo_root, &["rev-parse", branch])
-        .wrap_err("deliverable check: reading the fleet branch head failed")?;
-    Ok(!head.is_empty() && head != base_commit)
-}
-
 /// Best-effort removal of a fleet task's worktree CHECKOUT, KEEPING the branch.
 ///
-/// Used on two paths: (a) after an attempt completes (free the disk, keep the
-/// `fleet/*` branch as the deliverable) and (b) when an attempt is interrupted
-/// (so a dead attempt does not leave a locked checkout blocking the next
-/// attempt's re-add). Robust to a LOCKED checkout (HIGH #5) and NEVER removes a
+/// Used on two paths: (a) after a task is ACCEPTED (free the disk, keep the
+/// `fleet/*` branch as the deliverable) and (b) to roll back a checkout a
+/// dispatch created but never ran an attempt in. An interrupted or unaccepted
+/// attempt's checkout is NOT removed — it may hold uncommitted work. Robust to
+/// a LOCKED checkout (HIGH #5) and NEVER removes a
 /// directory not proven contained in `fleet-work` (HIGH #2). Deliberately does
 /// NOT run `git branch -D` — the branch is the deliverable the keeper/user
 /// reviews and merges. Every git op runs hooks-disabled (module SECURITY note).
@@ -537,7 +882,8 @@ fn force_free_checkout(repo: &Path, git_dir: Option<&Path>, work_root: &Path, ch
     // Clear a leftover checkout dir ONLY if provably contained in fleet-work.
     remove_contained_dir(work_root, checkout);
     // Clear a stale (possibly locked) admin entry still pointing at this
-    // checkout, so a relaunch can reclaim the task-stable branch.
+    // checkout, so git stops treating the directory as a worktree of the
+    // task's branch.
     if let Some(git_dir) = git_dir {
         clear_stale_admin_entry(git_dir, checkout);
     }
@@ -963,8 +1309,7 @@ mod tests {
     fn deliverable_commit_command_lands_changes_and_escapes_the_message() {
         // §4b: a worker wrote a file but did NOT commit. The auto-commit command
         // (run here via `sh -c`, standing in for the worker's sandbox) must land
-        // it on the branch, and `branch_advanced_past` must report a real
-        // deliverable. The commit MESSAGE is single-quote-escaped, so a message
+        // it on the branch, advancing it. The commit MESSAGE is single-quote-escaped, so a message
         // containing a quote or shell metacharacters cannot break the command or
         // inject — it lands verbatim as the commit subject.
         let Some((repo, work)) = fleet_fixture() else {
@@ -985,14 +1330,11 @@ mod tests {
             run_deliverable_command(&checkout, "fleet a deliverable"),
             "the auto-commit command must succeed",
         );
-        let landed = branch_advanced_past(&prepared.repo_root, "fleet/f1/a", &prepared.base_commit)
-            .expect("branch check");
-        assert!(
-            landed,
+        let head = run_git(&prepared.repo_root, &["rev-parse", "fleet/f1/a"]).unwrap();
+        assert_ne!(
+            head, prepared.base_commit,
             "an uncommitted change must land + advance the branch"
         );
-        let head = run_git(&prepared.repo_root, &["rev-parse", "fleet/f1/a"]).unwrap();
-        assert_ne!(head, prepared.base_commit, "branch advanced");
         assert!(
             run_git(
                 &prepared.repo_root,
@@ -1023,6 +1365,190 @@ mod tests {
             subject, tricky,
             "the message must land verbatim as the subject"
         );
+    }
+
+    /// Run [`recovery_snapshot_command`] in `checkout` via `sh -c` (standing in
+    /// for the worker's sandbox). Returns whether it exited 0.
+    #[cfg(unix)]
+    fn run_recovery_snapshot(checkout: &Path, message: &str) -> bool {
+        Command::new("sh")
+            .arg("-c")
+            .arg(recovery_snapshot_command(message))
+            .current_dir(checkout)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    // POSIX-sh contract: `commit_in` populates through the worker's `sh -c`
+    // command string.
+    #[cfg(unix)]
+    #[test]
+    fn should_return_commit_and_its_tree_when_branch_exists() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let checkout = work.path().join("f1").join("a");
+        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+            .expect("prepare");
+        let base_tree = run_git(&prepared.repo_root, &["rev-parse", "HEAD^{tree}"]).unwrap();
+
+        // A fresh fleet branch points at the base commit and therefore its tree.
+        let (commit, tree) =
+            branch_commit_and_tree(&prepared.repo_root, "fleet/f1/a").expect("fresh branch");
+        assert_eq!(commit, prepared.base_commit);
+        assert_eq!(tree, base_tree);
+
+        // After the worker commits, both move — and the tree is the tree OF the
+        // returned commit, never of some other revision.
+        assert!(commit_in(&checkout, "out.txt"), "worker commit");
+        let (commit2, tree2) =
+            branch_commit_and_tree(&prepared.repo_root, "fleet/f1/a").expect("advanced branch");
+        assert_ne!(commit2, commit, "the branch advanced");
+        assert_ne!(tree2, tree, "the tree changed with the new file");
+        assert_eq!(
+            tree2,
+            run_git(
+                &prepared.repo_root,
+                &["rev-parse", &format!("{commit2}^{{tree}}")]
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            branch_commit_and_tree(&prepared.repo_root, "fleet/f1/missing").is_err(),
+            "a missing branch is an error, never an empty digest",
+        );
+    }
+
+    // POSIX-sh contract: populates through the worker's `sh -c` command string.
+    #[cfg(unix)]
+    #[test]
+    fn should_reuse_checkout_in_place_when_interrupted_attempt_left_uncommitted_work() {
+        // The host died after the worker wrote a patch but before anything was
+        // committed. Recovery must find the SAME checkout with the patch intact —
+        // `prepare_fleet_worktree` would have removed it and re-added an empty one.
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let checkout = work.path().join("f1").join("a");
+        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+            .expect("prepare");
+        assert!(populate(&checkout), "worker populates the worktree");
+        std::fs::write(checkout.join("seed.txt"), b"patched\n").unwrap();
+        std::fs::write(checkout.join("new.txt"), b"untracked work\n").unwrap();
+
+        let reused = reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+            .expect("reuse probe")
+            .expect("a registered checkout on the task branch must be reusable");
+
+        assert_eq!(reused.repo_root, prepared.repo_root);
+        assert_eq!(reused.branch, "fleet/f1/a");
+        assert_eq!(reused.git_dir, prepared.git_dir);
+        assert_eq!(reused.worktree_git_dir, prepared.worktree_git_dir);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("seed.txt")).unwrap(),
+            "patched\n",
+            "the tracked edit must survive recovery",
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("new.txt")).unwrap(),
+            "untracked work\n",
+            "the untracked file must survive recovery",
+        );
+    }
+
+    #[test]
+    fn should_not_reuse_when_checkout_is_missing_or_not_the_task_worktree() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let checkout = work.path().join("f1").join("a");
+
+        // Nothing on disk yet.
+        assert!(
+            reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+                .expect("probe")
+                .is_none(),
+            "a missing checkout is not reusable",
+        );
+
+        // A plain directory that git never registered as a worktree.
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("stray.txt"), b"x\n").unwrap();
+        assert!(
+            reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+                .expect("probe")
+                .is_none(),
+            "an unregistered directory is not reusable",
+        );
+        std::fs::remove_dir_all(&checkout).unwrap();
+
+        // A registered worktree, but on ANOTHER task's branch.
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/other", &checkout)
+            .expect("prepare other");
+        assert!(
+            reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+                .expect("probe")
+                .is_none(),
+            "a checkout on a different branch is not this task's worktree",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_reuse_when_checkout_path_is_a_symlink() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("f1")).unwrap();
+        let checkout = work.path().join("f1").join("a");
+        std::os::unix::fs::symlink(elsewhere.path(), &checkout).unwrap();
+
+        assert!(
+            reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
+            "a symlinked checkout must be refused, exactly as prepare refuses it",
+        );
+    }
+
+    // POSIX-sh contract: drives the worker's `sh -c` command strings.
+    #[cfg(unix)]
+    #[test]
+    fn should_snapshot_leftover_work_when_dead_writer_left_an_index_lock() {
+        // A host killed in the middle of a git index write leaves `index.lock`
+        // behind. The recovery snapshot must still land the leftover work.
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let checkout = work.path().join("f1").join("a");
+        let prepared = prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
+            .expect("prepare");
+        assert!(populate(&checkout), "worker populates the worktree");
+        std::fs::write(checkout.join("seed.txt"), b"patched\n").unwrap();
+        std::fs::write(prepared.worktree_git_dir.join("index.lock"), b"").unwrap();
+        let (_, base_tree) = branch_commit_and_tree(&prepared.repo_root, "fleet/f1/a").unwrap();
+
+        assert!(
+            run_recovery_snapshot(&checkout, "fleet a recovered work"),
+            "the recovery snapshot must clear the stale lock and commit",
+        );
+
+        let (commit, tree) = branch_commit_and_tree(&prepared.repo_root, "fleet/f1/a").unwrap();
+        assert_ne!(
+            commit, prepared.base_commit,
+            "the leftover work was committed"
+        );
+        assert_ne!(tree, base_tree, "the recovered tree differs from the base");
+        assert_eq!(
+            run_git(&prepared.repo_root, &["show", "fleet/f1/a:seed.txt"]).unwrap(),
+            "patched",
+        );
+
+        // Idempotent: a second snapshot of an unchanged tree commits nothing.
+        assert!(run_recovery_snapshot(&checkout, "fleet a recovered work"));
+        let (commit2, tree2) = branch_commit_and_tree(&prepared.repo_root, "fleet/f1/a").unwrap();
+        assert_eq!((commit2, tree2), (commit, tree));
     }
 
     #[test]
@@ -1205,6 +1731,230 @@ mod tests {
             prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout).is_err(),
             "a symlinked PARENT component must be refused (no create/remove through it)",
         );
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    // POSIX-sh contract: populates through the worker's `sh -c` command string.
+    #[cfg(unix)]
+    #[test]
+    fn should_check_out_exactly_the_given_commit_when_preparing_a_detached_worktree() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let base = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        let task = work.path().join("f1").join("a");
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &task).expect("prepare");
+        assert!(commit_in(&task, "out.txt"), "the task commits its work");
+        let patched = git_in(repo.path(), &["rev-parse", "fleet/f1/a"]);
+
+        // Something already sits where the clean checkout will go: a directory
+        // an earlier run left, with a cache file in it.
+        let clean = work.path().join("f1").join("a.verify-1");
+        std::fs::create_dir_all(&clean).unwrap();
+        std::fs::write(clean.join("test-cache"), b"stale\n").unwrap();
+
+        prepare_detached_worktree(repo.path(), work.path(), &clean, &base).expect("detached");
+        assert!(populate(&clean), "the worker populates the clean checkout");
+
+        assert!(clean.join("seed.txt").exists(), "the commit's files");
+        assert!(
+            !clean.join("out.txt").exists(),
+            "nothing from a later commit"
+        );
+        assert!(!clean.join("test-cache").exists(), "nothing left behind");
+        assert_eq!(git_in(&clean, &["rev-parse", "HEAD"]), base);
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&clean)
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "HEAD is detached: a commit made here moves no branch",
+        );
+        assert_eq!(
+            git_in(repo.path(), &["rev-parse", "fleet/f1/a"]),
+            patched,
+            "the task branch is untouched",
+        );
+
+        remove_checkout_keep_branch(repo.path(), work.path(), &clean);
+        assert!(!clean.exists());
+        assert!(
+            !git_in(repo.path(), &["worktree", "list", "--porcelain"]).contains("a.verify-1"),
+            "the clean checkout is unregistered again",
+        );
+        assert!(
+            task.join("out.txt").exists(),
+            "the task checkout is untouched"
+        );
+    }
+
+    #[test]
+    fn should_refuse_detached_worktree_when_commit_is_not_a_full_object_id() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let clean = work.path().join("f1").join("a.verify-1");
+        for not_an_id in ["HEAD", "fleet/f1/a", "--force", "abc123", ""] {
+            assert!(
+                prepare_detached_worktree(repo.path(), work.path(), &clean, not_an_id).is_err(),
+                "{not_an_id:?} must be refused",
+            );
+        }
+        assert!(!clean.exists(), "nothing was created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_tell_a_regular_file_in_a_commit_from_everything_else() {
+        let Some((repo, _work)) = fleet_fixture() else {
+            return;
+        };
+        std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+        std::fs::write(repo.path().join("docs/report.md"), b"report\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", repo.path().join("link.txt")).unwrap();
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "files"]);
+        let commit = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        // Present on disk but not in the commit.
+        std::fs::write(repo.path().join("untracked.txt"), b"x\n").unwrap();
+
+        let has = |path: &str| commit_has_regular_file(repo.path(), &commit, path);
+        assert!(has("seed.txt").unwrap());
+        assert!(has("docs/report.md").unwrap());
+        assert!(has("./docs/report.md").unwrap());
+        assert!(!has("docs").unwrap(), "a directory is not a file");
+        assert!(!has("link.txt").unwrap(), "a symlink is not a regular file");
+        assert!(!has("missing.txt").unwrap());
+        assert!(!has("untracked.txt").unwrap(), "only the commit counts");
+        assert!(!has("*.txt").unwrap(), "the path is literal, not a glob");
+        assert!(has("/etc/passwd").is_err());
+        assert!(has("../seed.txt").is_err());
+        assert!(has("").is_err());
+        assert!(
+            commit_has_regular_file(repo.path(), "HEAD", "seed.txt").is_err(),
+            "a ref name is not an object id",
+        );
+    }
+
+    #[test]
+    fn should_name_every_directory_of_a_task_after_its_stem() {
+        let stem = Path::new("/work/f1/a");
+        let first = new_work_checkout(stem).unwrap();
+        let second = new_work_checkout(stem).unwrap();
+        assert_ne!(first, second, "no two work checkouts share a directory");
+        assert_eq!(first.parent(), stem.parent());
+        assert!(is_work_checkout(stem, &first) && is_work_checkout(stem, &second));
+
+        let clean = clean_checkout_path(stem, "attempt-0").unwrap();
+        assert_eq!(clean, Path::new("/work/f1/a.verify-attempt-0"));
+
+        for not_a_work_checkout in [
+            "/work/f1/a",
+            "/work/f1/a.work-",
+            "/work/f1/a.verify-attempt-0",
+            "/work/f1/ab.work-1",
+            "/work/f2/a.work-1",
+            "/elsewhere/a.work-1",
+        ] {
+            assert!(
+                !is_work_checkout(stem, Path::new(not_a_work_checkout)),
+                "{not_a_work_checkout} is not a work checkout of task a",
+            );
+        }
+    }
+
+    // POSIX-sh contract: populates through the worker's `sh -c` command string.
+    #[cfg(unix)]
+    #[test]
+    fn should_add_a_second_checkout_of_the_branch_when_an_earlier_one_still_holds_work() {
+        // An interrupted attempt's directory still has the task branch checked
+        // out, with a patch that was never committed. The next attempt's
+        // directory is created beside it; nothing in the old one is touched.
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let stem = work.path().join("f1").join("a");
+        let old = new_work_checkout(&stem).unwrap();
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &old).expect("first");
+        assert!(populate(&old));
+        std::fs::write(old.join("seed.txt"), b"patched\n").unwrap();
+
+        let new = new_work_checkout(&stem).unwrap();
+        prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &new)
+            .expect("a second checkout of the same branch");
+
+        assert_eq!(
+            std::fs::read_to_string(old.join("seed.txt")).unwrap(),
+            "patched\n",
+            "the uncommitted patch is untouched",
+        );
+        assert!(
+            reuse_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &old)
+                .unwrap()
+                .is_some(),
+            "the old checkout is still the task's registered worktree",
+        );
+        assert!(!new.join("seed.txt").exists(), "created empty");
+        // Once the old work is committed and the old directory retired, the new
+        // one is populated from the branch and holds that work.
+        assert!(run_recovery_snapshot(&old, "recovered"));
+        remove_checkout_keep_branch(repo.path(), work.path(), &old);
+        assert!(populate(&new));
+        assert_eq!(
+            std::fs::read_to_string(new.join("seed.txt")).unwrap(),
+            "patched\n",
+        );
+    }
+
+    #[test]
+    fn should_remove_only_this_tasks_leftover_checkouts_when_sweeping() {
+        let Some((repo, work)) = fleet_fixture() else {
+            return;
+        };
+        let base = git_in(repo.path(), &["rev-parse", "HEAD"]);
+        let fleet = work.path().join("f1");
+        let stem = fleet.join("a");
+        let leftover = fleet.join("a.verify-1");
+        let kept = fleet.join("a.work-2");
+        let other_task = fleet.join("ab.verify-3");
+        prepare_detached_worktree(repo.path(), work.path(), &leftover, &base).expect("leftover");
+        prepare_detached_worktree(repo.path(), work.path(), &other_task, &base).expect("other");
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::create_dir_all(&stem).unwrap();
+
+        sweep_task_checkouts(repo.path(), work.path(), &stem, Some(&kept));
+
+        assert!(!leftover.exists(), "this task's leftover is removed");
+        assert!(kept.exists(), "the checkout to keep is kept");
+        assert!(
+            other_task.exists(),
+            "another task's checkout is not touched"
+        );
+        assert!(stem.exists(), "the bare stem directory is not touched");
+        let listing = git_in(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert!(
+            !listing.contains("a.verify-1"),
+            "and unregistered: {listing}"
+        );
+        assert!(listing.contains("ab.verify-3"), "got: {listing}");
     }
 
     #[test]

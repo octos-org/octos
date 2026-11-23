@@ -120,9 +120,10 @@ pub struct FleetWorkerPool {
     per_fleet: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     /// Per-(fleet, task) preflight locks. Held across [live-check → worktree
     /// prep → launch → spawn] so two concurrent dispatches of the SAME Ready
-    /// task cannot both pass the non-atomic live check and race on (remove/
-    /// re-add) the same task-stable checkout; the loser sees the winner's live
-    /// attempt and `launch_child` double-launch rejects it. Like `per_fleet`,
+    /// task cannot both pass the non-atomic live check and race on the task's
+    /// directories (one sweeping what the other just created); the loser sees
+    /// the winner's live attempt and `launch_child` double-launch rejects it.
+    /// Like `per_fleet`,
     /// entries are never pruned (bounded by the number of distinct tasks).
     preflight_locks: PreflightLocks,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
@@ -237,8 +238,8 @@ impl FleetWorkerPool {
         // Serialize preflight+launch per (fleet, task). Held across [live-check →
         // worktree prep → launch → spawn] (released when dispatch returns, after
         // the run is spawned), so two concurrent dispatches of the SAME Ready
-        // task cannot both pass the non-atomic live check and race on the same
-        // task-stable checkout; the loser sees the winner's live attempt and is
+        // task cannot both pass the non-atomic live check and race on the task's
+        // directories; the loser sees the winner's live attempt and is
         // double-launch rejected below.
         let task_lock = self.preflight_lock(fleet_id, task_id).await;
         let _preflight = task_lock.lock().await;
@@ -252,11 +253,15 @@ impl FleetWorkerPool {
                 "task {task_id} is absent from fleet {fleet_id}'s plan"
             ));
         };
-        let working_dir = self
+        // `<workspace_root>/<fleet>/<task>`: a scratch task's working directory,
+        // and the name every worktree directory of the task starts with
+        // (`<stem>.work-…`, `<stem>.verify-…`).
+        let stem = self
             .cfg
             .workspace_root
             .join(safe_filename(fleet_id))
             .join(safe_filename(task_id));
+        let mut working_dir = stem.clone();
 
         // Snapshot the plan revision the worktree decision + launch are made
         // against, so a concurrent replan that narrows the grant during the (slow)
@@ -266,8 +271,8 @@ impl FleetWorkerPool {
         // Worktree preflight (before any durable attempt). Run this attempt
         // inside a REAL `git worktree` of the controller repo on the task-stable
         // branch `fleet/<fleet>/<task>` — so the fleet does durable, PARALLEL
-        // repository work and a restarted attempt resumes from the dead one's
-        // last commit — ONLY when ALL gate conditions hold:
+        // repository work and a restarted attempt continues from what the dead
+        // one left — ONLY when ALL gate conditions hold:
         //   1. a COHERENT FULL-TRUST grant (codex fix #1): the operator granted
         //      BOTH `FsGrant::Host` AND `NetworkGrant::Full`, read per-attempt.
         //      This removes the trust GRADIENT: a `Host-FS + restricted-network`
@@ -313,8 +318,25 @@ impl FleetWorkerPool {
             None => false,
         };
 
-        // The worktree cleanup + auto-commit context, populated only in the
+        // A task that names a failing test has no meaning outside an isolated
+        // git worktree — there would be no base revision for the test to fail
+        // on and no patch to deliver. If the worktree gate does not hold, REFUSE
+        // the dispatch (no durable attempt) rather than run it in scratch.
+        if task_view.failing_test.is_some() && !is_repo {
+            return Err(eyre!(
+                "{fleet_id}/{task_id} names a failing test and cannot be dispatched: it needs an \
+                 isolated git worktree (a full-trust grant, a git controller workspace, and a \
+                 sandbox backend that supports the worktree flow)"
+            ));
+        }
+
+        // The worktree cleanup + run context, populated only in the
         // worktree case; None for the scratch fallback.
+        // `worktree_cleanup` names the checkout THIS dispatch creates — always a
+        // new, empty directory — so a launch that never reaches a running
+        // attempt can roll it back. An interrupted attempt's directory is never
+        // in it: that one holds work, and only the worker retires it, after
+        // committing what it holds.
         let mut worktree_cleanup: Option<WorktreeCleanup> = None;
         let mut worktree_ctx: Option<WorktreeContext> = None;
 
@@ -322,19 +344,17 @@ impl FleetWorkerPool {
             let root = repo_root
                 .clone()
                 .expect("repo_root is Some when is_repo is true");
-            // A live attempt already owns this task's stable checkout/branch
-            // (this dispatch will be a double-launch): SKIP the destructive
-            // worktree reconcile — it would clobber the live checkout — and let
-            // `launch_child` reject below. Reconciliation is otherwise safe
-            // because a re-launch only happens AFTER the prior attempt was
-            // interrupted (single-writer-per-task). The per-task preflight lock
-            // makes this live check + the launch that follows atomic w.r.t. a
-            // concurrent same-task dispatch.
+            // A live attempt already owns this task's branch and directories
+            // (this dispatch will be a double-launch): SKIP the worktree prep —
+            // its sweep would remove the live attempt's directories — and let
+            // `launch_child` reject below. The prep is otherwise safe because a
+            // re-launch only happens AFTER the prior attempt was interrupted
+            // (single-writer-per-task). The per-task preflight lock makes this
+            // live check + the launch that follows atomic w.r.t. a concurrent
+            // same-task dispatch.
+            let child = self.store.get_child(fleet_id, task_id).await?;
             let live = matches!(
-                self.store
-                    .get_child(fleet_id, task_id)
-                    .await?
-                    .map(|c| c.status),
+                child.as_ref().map(|c| c.status),
                 Some(ChildStatus::Launching) | Some(ChildStatus::Running)
             );
             if !live {
@@ -343,29 +363,75 @@ impl FleetWorkerPool {
                     safe_filename(fleet_id),
                     safe_filename(task_id)
                 );
-                // `prepare_fleet_worktree` shells out to git several times; run
-                // it on the blocking pool. A git failure returns Err with NO
+                // If an earlier attempt of THIS generation bound this branch
+                // and finished populating a directory, that directory may hold
+                // work the dead attempt never committed. It is handed to the
+                // worker as the place to recover FROM — the worker commits what
+                // it holds and retires it. Anything else (no binding, another
+                // generation, a directory the worker never populated, a path
+                // that is not one of this task's work checkouts) has nothing to
+                // recover.
+                let recorded = child
+                    .as_ref()
+                    .and_then(|c| c.worktree.as_ref())
+                    .filter(|bound| {
+                        bound.generation == view.generation
+                            && bound.populated
+                            && bound.branch == branch
+                    })
+                    .map(|bound| PathBuf::from(&bound.checkout))
+                    .filter(|dead| octos_core::is_work_checkout(&stem, dead));
+                // The worktree helpers shell out to git several times; run them
+                // on the blocking pool. A git failure returns Err with NO
                 // durable attempt (nothing launched yet).
-                let wd = working_dir.clone();
                 let work_root = self.cfg.workspace_root.clone();
-                let prepared = tokio::task::spawn_blocking(move || {
-                    octos_core::prepare_fleet_worktree(&root, &work_root, &branch, &wd)
+                let task_stem = stem.clone();
+                let (prepared, recover_from) = tokio::task::spawn_blocking(move || {
+                    // Still this task's registered worktree on its branch?
+                    let recover_from = match recorded {
+                        Some(dead) => {
+                            octos_core::reuse_fleet_worktree(&root, &work_root, &branch, &dead)?
+                                .map(|_| dead)
+                        }
+                        None => None,
+                    };
+                    // No attempt of this task is live, so every OTHER directory
+                    // of the task belongs to a dead one and holds nothing to
+                    // recover: an empty checkout a launch never ran in, a clean
+                    // checkout a verification left behind, a retired directory
+                    // something kept writing into.
+                    octos_core::sweep_task_checkouts(
+                        &root,
+                        &work_root,
+                        &task_stem,
+                        recover_from.as_deref(),
+                    );
+                    // This attempt's own directory: one no attempt has used, so
+                    // nothing an earlier attempt left running can write into it.
+                    let checkout = octos_core::new_work_checkout(&task_stem)?;
+                    let prepared =
+                        octos_core::prepare_fleet_worktree(&root, &work_root, &branch, &checkout)?;
+                    Ok((prepared, recover_from))
                 })
                 .await
                 .map_err(|e| eyre!("preflight: worktree prep join failed: {e}"))?
-                .map_err(|e| {
+                .map_err(|e: eyre::Report| {
                     eyre!("preflight: worktree prep for {fleet_id}/{task_id} failed: {e}")
                 })?;
+                working_dir = prepared.checkout.clone();
                 worktree_ctx = Some(WorktreeContext {
                     repo_root: prepared.repo_root.clone(),
                     branch: prepared.branch.clone(),
-                    base_commit: prepared.base_commit.clone(),
                     git_dir: prepared.git_dir.clone(),
+                    work_root: self.cfg.workspace_root.clone(),
+                    stem: stem.clone(),
+                    recover_from,
                 });
                 worktree_cleanup = Some(WorktreeCleanup {
                     repo_root: prepared.repo_root,
                     work_root: self.cfg.workspace_root.clone(),
                     checkout: prepared.checkout,
+                    stem: stem.clone(),
                 });
             }
         } else {
@@ -397,7 +463,8 @@ impl FleetWorkerPool {
             Ok(launch) => launch,
             Err(err) => {
                 // A store error AFTER a successful prep would orphan the
-                // just-created checkout — roll it back (keep the branch).
+                // just-created checkout — roll it back (keep the branch). An
+                // interrupted attempt's directory is not touched.
                 Self::rollback_prepared_checkout(worktree_cleanup.take()).await;
                 return Err(err);
             }
@@ -408,7 +475,8 @@ impl FleetWorkerPool {
             // no work is spawned. If THIS dispatch prepared a checkout (a
             // non-double-launch rejection — a double-launch skipped prep, leaving
             // `worktree_cleanup` None), roll it back so no orphaned checkout is
-            // left behind (keep the branch).
+            // left behind (keep the branch). An interrupted attempt's directory
+            // is not touched.
             Self::rollback_prepared_checkout(worktree_cleanup.take()).await;
             return Ok(Dispatched {
                 launch,
@@ -459,6 +527,9 @@ impl FleetWorkerPool {
         // `Terminated` (or `Escalated`) cleanup. The whole `[launch → complete]`
         // window is guarded with no gap. The store's four-part CAS makes the
         // cleanup a no-op if the attempt was already settled/superseded.
+        // The checkout to roll back if this launch is rejected below, before the
+        // attempt ever runs: the one THIS dispatch created (still empty).
+        let created_cleanup = worktree_cleanup.clone();
         let guard = LaunchGuard {
             store: store.clone(),
             fleet_id: fleet_id.clone(),
@@ -480,10 +551,11 @@ impl FleetWorkerPool {
         // on a now-narrowed grant). The preflight lock serialises same-task
         // DISPATCH but not a replan, so fence the plan revision: if it moved since
         // the snapshot, the grant may have changed under us — drop `guard` (which
-        // terminates the just-launched attempt AND rolls back the checkout,
-        // keeping the branch) and REJECT so the keeper re-dispatches against the
-        // fresh plan. Only worktree attempts are fenced (a scratch attempt is
-        // cwd-confined regardless of a grant change, so it needs no fence).
+        // terminates the just-launched attempt), roll back a checkout this
+        // dispatch created (keeping the branch), and REJECT so the keeper
+        // re-dispatches against the fresh plan. Only worktree attempts are fenced
+        // (a scratch attempt is cwd-confined regardless of a grant change, so it
+        // needs no fence).
         if worktree_ctx.is_some() {
             let current_revision = Fleet::bind(store.clone(), fleet_id.clone())
                 .view()
@@ -491,7 +563,11 @@ impl FleetWorkerPool {
                 .map(|v| v.revision)
                 .unwrap_or(u64::MAX); // an unreadable plan is treated as changed (fail safe)
             if current_revision != snapshot_revision {
-                // `guard` drops here → terminates the attempt + frees the checkout.
+                // Terminate the just-launched attempt. It never ran, so the
+                // checkout this dispatch created is still empty and is rolled
+                // back; an interrupted attempt's directory keeps its work.
+                drop(guard);
+                Self::rollback_prepared_checkout(created_cleanup).await;
                 return Err(eyre!(
                     "plan revision changed during worktree launch ({snapshot_revision} -> \
                      {current_revision}) for {fleet_id}/{task_id}; re-dispatch against the \
@@ -549,19 +625,27 @@ impl FleetWorkerPool {
             // checkout).
             if should_disarm(&outcome) {
                 let worktree = guard.disarm();
-                // COMPLETION cleanup: on a genuinely `Completed` attempt, remove
-                // the worktree checkout but KEEP the `fleet/*` branch — the
-                // branch is the deliverable (the deliverable auto-commit already
-                // landed inside `run_attempt`). On `Superseded`/`Aborted` the
-                // attempt is NOT ours (a newer attempt owns the task-stable
-                // checkout), so leave it untouched.
-                if matches!(outcome, AttemptOutcome::Completed { .. }) {
+                // COMPLETION cleanup: once the task is ACCEPTED, remove every
+                // directory of the task but KEEP the `fleet/*` branch — the
+                // branch is the deliverable, and it provably holds the verified
+                // commit (`run_attempt` committed it before verifying it). In
+                // EVERY other case the checkout stays: it may hold the only
+                // copy of work that was never committed (see
+                // `WorktreeCleanup`), and on `Superseded`/`Aborted` the attempt
+                // is not even ours (a newer attempt owns the task).
+                if matches!(
+                    outcome,
+                    AttemptOutcome::Completed {
+                        verdict: AcceptanceVerdict::Accepted { .. }
+                    }
+                ) {
                     if let Some(wt) = worktree {
                         let _ = tokio::task::spawn_blocking(move || {
-                            octos_core::remove_checkout_keep_branch(
+                            octos_core::sweep_task_checkouts(
                                 &wt.repo_root,
                                 &wt.work_root,
-                                &wt.checkout,
+                                &wt.stem,
+                                None,
                             );
                         })
                         .await;
@@ -642,26 +726,34 @@ struct LaunchGuard {
     /// on a cancel-drop settle (no fallible store re-fetch).
     reserved_tokens: u64,
     /// The worktree cleanup context when the attempt runs in a git worktree;
-    /// `None` for the scratch fallback. On an interrupted (armed) drop, the
-    /// checkout is best-effort removed with its `fleet/*` branch KEPT, so a dead
-    /// attempt doesn't leave a (locked) checkout blocking the next attempt's
-    /// re-add (and the branch stays as resumable progress). The containment
-    /// `work_root` guards the removal from escaping `fleet-work`.
+    /// `None` for the scratch fallback. Handed back by [`LaunchGuard::disarm`]
+    /// for the completion cleanup. An interrupted (armed) drop does NOT use it:
+    /// the checkout stays where it is, with whatever work it holds.
     worktree_cleanup: Option<WorktreeCleanup>,
     armed: bool,
 }
 
-/// The context needed to free a fleet worktree CHECKOUT while keeping its
-/// branch: the canonical repo root, the `fleet-work` containment root (a removal
-/// is refused if the checkout is not provably under it), and the checkout path.
-/// Carried by [`LaunchGuard`] (interrupt cleanup), returned by
-/// [`LaunchGuard::disarm`] (completion cleanup), and used for the prep→launch
-/// rollback.
+/// The context needed to free a fleet task's worktree directories while keeping
+/// its branch: the canonical repo root, the `fleet-work` containment root (a
+/// removal is refused if a directory is not provably under it), the checkout
+/// this dispatch created, and the task's `stem` (the name all of its
+/// directories start with). Carried by [`LaunchGuard`] and returned by
+/// [`LaunchGuard::disarm`] for the completion cleanup, and used for the
+/// prep→launch rollback.
+///
+/// A checkout may hold the ONLY copy of work that was never committed (the
+/// agent was cut off, the store failed mid-recovery, a snapshot could not be
+/// taken). It is therefore removed in exactly two cases: the task was ACCEPTED,
+/// so its branch provably holds the delivered commit; or this dispatch created
+/// it empty and no attempt ever ran in it. An interrupted or unaccepted attempt
+/// leaves it in place — the next attempt of the generation recovers what it
+/// holds, and a dispatch that has nothing to recover from it removes it.
 #[derive(Debug, Clone)]
 struct WorktreeCleanup {
     repo_root: PathBuf,
     work_root: PathBuf,
     checkout: PathBuf,
+    stem: PathBuf,
 }
 
 impl LaunchGuard {
@@ -698,7 +790,6 @@ impl Drop for LaunchGuard {
         let task_id = std::mem::take(&mut self.task_id);
         let attempt_id = std::mem::take(&mut self.attempt_id);
         let owner_epoch = self.owner_epoch;
-        let worktree = self.worktree_cleanup.take();
         let now = (self.clock)();
         // PR B — if the agent recorded an escalation before this run was
         // cancelled, PRECEDENCE goes to the escalation: settle NON-terminally
@@ -779,20 +870,10 @@ impl Drop for LaunchGuard {
                     "fleet worker: drop-guard completion failed (advisory; recovery reconciles)",
                 );
             }
-            // Best-effort: free the interrupted attempt's worktree checkout,
-            // KEEPING the `fleet/*` branch (the deliverable / resumable
-            // progress), so a dead attempt doesn't leave a locked checkout
-            // blocking the next attempt's re-add.
-            if let Some(wt) = worktree {
-                let _ = tokio::task::spawn_blocking(move || {
-                    octos_core::remove_checkout_keep_branch(
-                        &wt.repo_root,
-                        &wt.work_root,
-                        &wt.checkout,
-                    );
-                })
-                .await;
-            }
+            // The interrupted attempt's worktree checkout is deliberately LEFT
+            // where it is: it may hold uncommitted work (see
+            // `WorktreeCleanup`). The next attempt commits what it holds and
+            // retires it; a dispatch with nothing to recover from it removes it.
         });
     }
 }
@@ -855,6 +936,24 @@ mod tests {
     /// A pool over `provider` with the default test config (4/4 global/per-fleet
     /// concurrency, 30s deadline, `work` as the workspace root). Tests whose
     /// config IS the subject build their own `PoolConfig` instead.
+    /// The worktree directories of `task` that are on disk right now
+    /// (`<work>/<fleet>/<task>.…`): its work checkouts and clean checkouts.
+    fn task_dirs(work: &TempDir, fleet: &str, task: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(work.path().join(fleet)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{task}."))
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
     async fn pool_with(
         store: &Arc<FleetKernelStore>,
         provider: Arc<dyn LlmProvider>,
@@ -1290,9 +1389,9 @@ mod tests {
                 "[{name}] the worker's file must land on the fleet branch",
             );
             // The worktree checkout (worker cwd) was removed on completion.
-            let checkout = work.path().join("f1").join("a");
-            assert!(
-                !checkout.exists(),
+            assert_eq!(
+                task_dirs(&work, "f1", "a"),
+                Vec::<PathBuf>::new(),
                 "[{name}] checkout must be removed after completion (branch kept)",
             );
             assert_eq!(
@@ -1307,10 +1406,11 @@ mod tests {
     // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test]
-    async fn dispatch_reconciles_preexisting_worktree_on_relaunch() {
-        // A dead attempt left the branch + checkout behind (task-stable). A
-        // re-launch must RECONCILE them (remove + re-add off the branch) rather
-        // than fail on a colliding `worktree add -b`, and the worker runs.
+    async fn dispatch_removes_a_dead_attempts_empty_checkout_on_relaunch() {
+        // A dead attempt left the branch and a checkout behind — one it never
+        // populated, so there is nothing in it to recover. A re-launch must not
+        // fail on the branch being checked out there: the leftover is removed,
+        // the worker gets a directory of its own, and it runs.
         let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
             vec![task_spec_granted(
@@ -1324,8 +1424,8 @@ mod tests {
         else {
             return; // git unavailable
         };
-        let checkout = work.path().join("f1").join("a");
         // Simulate the leftover of a dead attempt: branch + checkout present.
+        let checkout = octos_core::new_work_checkout(&work.path().join("f1").join("a")).unwrap();
         octos_core::prepare_fleet_worktree(repo.path(), work.path(), "fleet/f1/a", &checkout)
             .expect("pre-create a leftover worktree");
         assert!(checkout.exists(), "leftover checkout present");
@@ -1351,9 +1451,14 @@ mod tests {
         assert!(git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"));
         assert!(
             git_branch_contains_file(repo.path(), "fleet/f1/a", "out.txt"),
-            "the worker commit must land after reconcile",
+            "the worker commit must land after the leftover is removed",
         );
-        assert!(!checkout.exists(), "checkout removed on completion");
+        assert!(!checkout.exists(), "the leftover checkout is removed");
+        assert_eq!(
+            task_dirs(&work, "f1", "a"),
+            Vec::<PathBuf>::new(),
+            "the worker's own checkout is removed on completion",
+        );
     }
 
     // POSIX-sh contract: interrupting a RUNNING attempt needs the attempt to
@@ -1363,10 +1468,10 @@ mod tests {
     // is covered by `worktree_terminated_when_backend_cannot_run_posix_sh`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn interrupted_worktree_attempt_removes_checkout_keeps_branch() {
+    async fn interrupted_worktree_attempt_keeps_checkout_and_branch() {
         // An interrupted worktree attempt: the LaunchGuard settles it terminal
-        // (child Failed) AND best-effort removes the checkout, KEEPING the
-        // fleet branch (so a dead attempt doesn't leave a locked checkout).
+        // (child Failed) and LEAVES the checkout — it may hold the only copy of
+        // work the attempt never committed — along with the fleet branch.
         let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
             vec![task_spec_granted("a", &[], vec![], host_grant())],
@@ -1388,8 +1493,13 @@ mod tests {
         assert!(matches!(d.launch, LaunchOutcome::Launched { .. }));
         let handle = d.handle.unwrap();
         wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
-        let checkout = work.path().join("f1").join("a");
-        assert!(checkout.exists(), "checkout present while the attempt runs");
+        let dirs = task_dirs(&work, "f1", "a");
+        assert_eq!(
+            dirs.len(),
+            1,
+            "one checkout while the attempt runs: {dirs:?}"
+        );
+        let checkout = dirs[0].clone();
 
         handle.abort();
 
@@ -1399,14 +1509,12 @@ mod tests {
             ChildStatus::Failed,
             "an interrupted attempt must end Failed via the drop-guard",
         );
-        // The checkout removal runs in the guard's detached cleanup task: poll.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while checkout.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Let the guard's detached settle task finish before asserting that it
+        // removed nothing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
-            !checkout.exists(),
-            "the interrupted attempt must remove its worktree checkout",
+            checkout.exists(),
+            "the interrupted attempt must keep its worktree checkout",
         );
         assert!(
             git_ref_exists(repo.path(), "refs/heads/fleet/f1/a"),
@@ -1462,7 +1570,7 @@ mod tests {
         // prep→launch rollback removes it (keeping the branch).
         // b depends on a → b is Planned (not Ready): launch_child rejects it, but
         // the pool preps its worktree first.
-        let Some((_sd, store, _repo, work)) = git_repo_fleet(
+        let Some((_sd, store, repo, work)) = git_repo_fleet(
             "f1",
             vec![
                 task_spec_granted("a", &[], vec![], host_grant()),
@@ -1478,10 +1586,14 @@ mod tests {
         let d = pool.dispatch("f1", "b").await.unwrap();
         assert_eq!(d.launch, LaunchOutcome::RejectedNotReady);
         assert!(d.handle.is_none());
-        let checkout = work.path().join("f1").join("b");
-        assert!(
-            !checkout.exists(),
+        assert_eq!(
+            task_dirs(&work, "f1", "b"),
+            Vec::<PathBuf>::new(),
             "a rejected-after-prep dispatch must roll back the orphaned checkout",
+        );
+        assert!(
+            !git_worktree_list(repo.path()).contains("fleet/f1/b"),
+            "and leave no worktree registered on the task branch",
         );
     }
 
@@ -1844,14 +1956,14 @@ mod tests {
             err.to_string().contains("revision changed"),
             "the CAS rejection must name the revision change, got: {err}",
         );
-        // The rolled-back checkout must not be orphaned (the guard drop frees it).
-        let checkout = work.path().join("f1").join("a");
+        // The checkout this dispatch created must not be orphaned.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while checkout.exists() && std::time::Instant::now() < deadline {
+        while !task_dirs(&work, "f1", "a").is_empty() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            !checkout.exists(),
+        assert_eq!(
+            task_dirs(&work, "f1", "a"),
+            Vec::<PathBuf>::new(),
             "a revision-CAS rejection must roll back the checkout",
         );
     }

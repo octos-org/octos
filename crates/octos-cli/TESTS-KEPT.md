@@ -454,6 +454,16 @@ Creation admission also retains these persistence regressions (T-0323):
 | 2 | `goal_tool::declared_inputs_tests::should_offer_task_inputs_to_the_planner_and_carry_them_onto_the_task` | `goal_plan` tells the keeper what declaring a task input does, and a declared input reaches the planned task. |
 | 5 | `goal_tool::declared_inputs_tests::should_reject_plan_when_a_tasks_inputs_are_malformed` | A plan with a malformed `inputs` (not a list, no path, unknown field) is rejected naming the task, instead of planning a task that silently lacks them. |
 
+## Durable worktree-task recovery (coding pilot, #3337)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `goal_tool::tests::should_make_the_named_command_an_acceptance_criterion_when_task_names_a_failing_test` | A planned task that names a failing test is accepted on exactly that command: it becomes the task's acceptance criterion and the task points at it. |
+| 5 | `goal_tool::tests::should_name_the_listed_criterion_when_failing_test_is_also_an_acceptance_command` | A failing test that is also listed as an acceptance command is one criterion, not two, so its recorded run on the base and its run on the fix are the same command. |
+| 4 | `goal_tool::tests::should_leave_task_ordinary_when_no_failing_test_is_named` | A plan that omits `failing_test`, or sends it as `null`, still plans an ordinary task instead of being refused. |
+| 5 | `goal_tool::tests::should_reject_plan_when_failing_test_is_not_a_command_string` | An empty or non-string `failing_test` refuses the plan and names the task, rather than planning an ordinary task that skips the failing-base check. |
+| 5 | `goal_tool::tests::should_describe_failing_test_in_the_plan_tool_schema` | The plan tool tells the keeper model which grant a failing test needs; without it such tasks are planned and then refused at dispatch. |
+
 ## Agent/peer profile-scoped delivery (#2081, UPCR-2026-R8C3A1D2E)
 
 | Cat. | Exact test | Guard |

@@ -34,8 +34,8 @@ use octos_core::task_inputs::DeclaredInput;
 use crate::grant::WorkerGrant;
 use crate::records::{
     AcceptanceCriterion, AcceptanceVerdict, ChildResultSnapshot, ChildStatus, DecisionKind,
-    DurablePlan, EscalationRequest, EvidenceRef, FleetBudget, FleetChildRecord, FleetStatus,
-    PlanTask, SCHEMA_VERSION,
+    DurablePlan, EscalationRequest, EvidenceRef, FailingTest, FleetBudget, FleetChildRecord,
+    FleetStatus, PlanTask, SCHEMA_VERSION, Verifier,
 };
 use crate::store::{CompleteOutcome, FleetKernelStore, PlanMutateOutcome};
 
@@ -62,6 +62,11 @@ pub struct TaskSpec {
     /// Files the worker needs to begin, delivered in its first model request
     /// (see [`octos_core::task_inputs`]). Empty for a task that declares none.
     pub inputs: Vec<DeclaredInput>,
+    /// The failing test the task is admitted on — see
+    /// [`PlanTask::failing_test`]. A `Some` is validated before any write: the
+    /// named criterion must be a `CommandExit { code: 0 }` with a command, and
+    /// the grant must be the full-trust grant a worktree requires.
+    pub failing_test: Option<FailingTest>,
 }
 
 impl From<TaskSpec> for PlanTask {
@@ -74,6 +79,7 @@ impl From<TaskSpec> for PlanTask {
             acceptance: s.acceptance,
             grant: s.grant,
             inputs: s.inputs,
+            failing_test: s.failing_test,
         }
     }
 }
@@ -150,6 +156,10 @@ pub struct TaskView {
     /// The inputs the task declared, projected from [`PlanTask::inputs`]. The
     /// executor delivers them in the worker's first model request.
     pub inputs: Vec<DeclaredInput>,
+    /// The failing test the task is admitted on, projected from
+    /// [`PlanTask::failing_test`]. The executor runs it on the base revision
+    /// before any edit.
+    pub failing_test: Option<FailingTest>,
     // ---- state (from the child) ----
     pub status: ChildStatus,
     pub verdict: Option<AcceptanceVerdict>,
@@ -346,6 +356,7 @@ impl Fleet {
                     acceptance: t.acceptance.clone(),
                     grant: t.grant.clone(),
                     inputs: t.inputs.clone(),
+                    failing_test: t.failing_test.clone(),
                     status: child.map(|c| c.status).unwrap_or(ChildStatus::Planned),
                     evidence: verdict_evidence(verdict.as_ref()),
                     verdict,
@@ -755,6 +766,9 @@ pub enum PlanGraphError {
     SplitIdReuse(String),
     /// `RetargetDeps` on a terminal (frozen-spec) task.
     RetargetTerminalTask(String),
+    /// A task names a failing test the executor could not admit it on (see
+    /// [`PlanTask::failing_test`]).
+    InvalidFailingTest { task: String, reason: String },
 }
 
 impl std::fmt::Display for PlanGraphError {
@@ -779,6 +793,12 @@ impl std::fmt::Display for PlanGraphError {
                 write!(
                     f,
                     "RetargetDeps: task {id:?} is terminal; its spec is frozen"
+                )
+            }
+            PlanGraphError::InvalidFailingTest { task, reason } => {
+                write!(
+                    f,
+                    "task {task:?} names a failing test it cannot be admitted on: {reason}"
                 )
             }
         }
@@ -897,6 +917,65 @@ fn validate_graph(tasks: &[PlanTask]) -> std::result::Result<(), PlanGraphError>
     }
     if let Some(cycle) = find_cycle(tasks) {
         return Err(PlanGraphError::Cycle(cycle));
+    }
+    for t in tasks {
+        validate_failing_test(t)?;
+    }
+    Ok(())
+}
+
+/// Check a task's named failing test against what the executor can actually
+/// honor, so an inadmissible task is refused before anything is written
+/// instead of failing at its first attempt:
+///
+/// - the named criterion exists and is a `CommandExit { code: 0 }` with a
+///   non-empty command (the only exit expectation the executor verifies);
+/// - the grant is the coherent full-trust grant (`FsGrant::Host` +
+///   `NetworkGrant::Full`) without which the pool allocates no git worktree —
+///   and without a worktree there is no base revision for the test to fail on.
+///
+/// A task that names no failing test has nothing to check here.
+fn validate_failing_test(task: &PlanTask) -> std::result::Result<(), PlanGraphError> {
+    let Some(goal) = &task.failing_test else {
+        return Ok(());
+    };
+    let invalid = |reason: String| PlanGraphError::InvalidFailingTest {
+        task: task.task_id.clone(),
+        reason,
+    };
+    let Some(criterion) = task.acceptance.iter().find(|c| c.id == goal.criterion) else {
+        return Err(invalid(format!(
+            "it names test criterion {:?}, which the task does not have",
+            goal.criterion
+        )));
+    };
+    match &criterion.verifier {
+        Verifier::CommandExit { cmd, code: 0 } if !cmd.trim().is_empty() => {}
+        Verifier::CommandExit { code: 0, .. } => {
+            return Err(invalid(format!(
+                "test criterion {:?} has an empty command",
+                goal.criterion
+            )));
+        }
+        Verifier::CommandExit { code, .. } => {
+            return Err(invalid(format!(
+                "test criterion {:?} expects exit code {code}; only 0 can be verified",
+                goal.criterion
+            )));
+        }
+        other => {
+            return Err(invalid(format!(
+                "test criterion {:?} must be a CommandExit, not {other:?}",
+                goal.criterion
+            )));
+        }
+    }
+    if !(task.grant.fs.is_host() && task.grant.network.allows_raw_egress()) {
+        return Err(invalid(
+            "it needs an isolated git worktree, which requires the full-trust grant \
+             (fs: host, network: full)"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -1042,6 +1121,7 @@ mod tests {
             acceptance: Vec::new(),
             grant: WorkerGrant::minimal(),
             inputs: Vec::new(),
+            failing_test: None,
         }
     }
 
@@ -2245,5 +2325,149 @@ mod tests {
                 );
             }
         }
+    }
+    /// A task spec that names a failing test: the full-trust grant a worktree
+    /// needs, one `CommandExit` criterion `test`, and `criterion` named as the
+    /// failing test.
+    fn failing_test_spec(id: &str, cmd: &str, code: i32, criterion: &str) -> TaskSpec {
+        TaskSpec {
+            acceptance: vec![AcceptanceCriterion {
+                id: "test".into(),
+                description: "the named test must pass".into(),
+                verifier: Verifier::CommandExit {
+                    cmd: cmd.into(),
+                    code,
+                },
+            }],
+            grant: WorkerGrant {
+                fs: crate::grant::FsGrant::Host,
+                network: crate::grant::NetworkGrant::Full,
+                ..WorkerGrant::minimal()
+            },
+            failing_test: Some(FailingTest {
+                criterion: criterion.into(),
+            }),
+            ..spec(id, &[])
+        }
+    }
+
+    async fn create_one(store: &Arc<FleetKernelStore>, task: TaskSpec) -> Result<Fleet> {
+        Fleet::create(
+            store.clone(),
+            "f1",
+            controller(),
+            None,
+            "default",
+            budget(1_000),
+            "obj",
+            vec![task],
+            0,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn should_persist_and_project_failing_test_when_spec_is_valid() {
+        let (_d, store) = fresh().await;
+        let fleet = create_one(
+            &store,
+            failing_test_spec("a", "cargo test named", 0, "test"),
+        )
+        .await
+        .expect("a task naming a valid failing test is admitted");
+
+        let plan = store.get_plan("f1").await.unwrap().unwrap();
+        assert_eq!(
+            plan.tasks[0].failing_test,
+            Some(FailingTest {
+                criterion: "test".into()
+            }),
+            "the named failing test is part of the durable plan",
+        );
+        let view = fleet.view().await.unwrap();
+        assert_eq!(view.tasks[0].failing_test, plan.tasks[0].failing_test);
+    }
+
+    #[tokio::test]
+    async fn should_reject_failing_test_and_write_nothing_when_admission_terms_are_invalid() {
+        let rows: Vec<(&str, TaskSpec)> = vec![
+            (
+                "names a criterion the task does not have",
+                failing_test_spec("a", "cargo test named", 0, "missing"),
+            ),
+            (
+                "expects a non-zero exit, which the executor cannot verify",
+                failing_test_spec("a", "cargo test named", 3, "test"),
+            ),
+            (
+                "has an empty command",
+                failing_test_spec("a", "   ", 0, "test"),
+            ),
+            (
+                "names a criterion that is not a command",
+                TaskSpec {
+                    acceptance: vec![AcceptanceCriterion {
+                        id: "test".into(),
+                        description: "a file".into(),
+                        verifier: Verifier::FileExists {
+                            path: "out.txt".into(),
+                        },
+                    }],
+                    ..failing_test_spec("a", "cargo test named", 0, "test")
+                },
+            ),
+            (
+                "lacks the full-trust grant an isolated worktree requires",
+                TaskSpec {
+                    grant: WorkerGrant::minimal(),
+                    ..failing_test_spec("a", "cargo test named", 0, "test")
+                },
+            ),
+        ];
+
+        for (name, task) in rows {
+            let (_d, store) = fresh().await;
+            let err = create_one(&store, task)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("[{name}] must be rejected"));
+            assert!(
+                matches!(
+                    err.downcast_ref::<PlanGraphError>(),
+                    Some(PlanGraphError::InvalidFailingTest { task, .. }) if task == "a"
+                ),
+                "[{name}] got {err:?}",
+            );
+            assert!(
+                store.get_fleet("f1").await.unwrap().is_none(),
+                "[{name}] a refused admission writes nothing",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_reject_edit_when_added_task_names_an_invalid_failing_test() {
+        let (_d, store) = fresh().await;
+        let fleet = create_one(&store, spec("a", &[])).await.unwrap();
+
+        let Err(err) = fleet
+            .apply_edit(
+                PlanEdit::AddTask(failing_test_spec("b", "cargo test named", 0, "missing")),
+                0,
+                1,
+            )
+            .await
+        else {
+            panic!("an edit that adds a task naming an invalid failing test must be rejected");
+        };
+        assert!(matches!(
+            err.downcast_ref::<PlanGraphError>(),
+            Some(PlanGraphError::InvalidFailingTest { task, .. }) if task == "b"
+        ));
+        assert_eq!(
+            store.get_plan("f1").await.unwrap().unwrap().tasks.len(),
+            1,
+            "the plan is unchanged",
+        );
     }
 }
