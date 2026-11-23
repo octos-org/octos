@@ -76,6 +76,10 @@ static PEER_SEND_INPUT_OCCURRENCE_SEQ: std::sync::atomic::AtomicU64 =
 pub enum PeerSendInputDelivery {
     /// Newly queued: the peer will process it as its next turn.
     Queued,
+    /// Newly queued, with declared inputs the host did not look at: the
+    /// peer's session is not live, so only the peer's turn can say which of
+    /// them it is given.
+    QueuedUnchecked,
     /// This same tool call (same occurrence id) was already queued, so the
     /// retry was not queued again. Not a new message to the peer.
     AlreadyQueued,
@@ -270,7 +274,8 @@ impl Tool for PeerSendInputTool {
             ctx.tool_id.clone()
         };
 
-        let with_inputs = match inputs.len() {
+        let declared = inputs.len();
+        let with_inputs = match declared {
             0 => String::new(),
             declared => format!(
                 "; the {declared} declared input(s) go into that turn's first model request"
@@ -303,6 +308,17 @@ impl Tool for PeerSendInputTool {
                 output: format!(
                     "message sent to peer {slug} — \
                      the peer will process it as its next turn{with_inputs}"
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            Ok(PeerSendInputDelivery::QueuedUnchecked) => Ok(ToolResult {
+                output: format!(
+                    "message sent to peer {slug} — the peer will process it as its next turn. \
+                     Its {} declared input(s) were NOT checked here: the peer's session is not \
+                     live, so the turn resolves them with the peer's own file access and tells \
+                     the peer if a required one cannot be delivered",
+                    declared
                 ),
                 success: true,
                 ..Default::default()

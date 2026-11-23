@@ -25,10 +25,13 @@
 //!   has changed since.
 //! - **A delivered image stays delivered, or the report says otherwise.** A
 //!   provider that would send a request again without its images, because the
-//!   endpoint refused them, fails the request instead when one of them is a
-//!   required input, and records an optional one it drops
+//!   endpoint refused them, fails the request instead when it is the one that
+//!   brings the model a required input, and records an optional one it drops
 //!   ([`octos_llm::vision::snapshot_input_image_bytes`]);
 //!   [`mark_dropped_images`] then corrects the report.
+//! - **Size decides before reading.** What a file's size alone rules out is
+//!   reported without reading the file, a file that cannot fit even alone is
+//!   let go as soon as that is known, and a check keeps none of what it reads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,6 +53,12 @@ use crate::tools::coding_tools::{MAX_MODEL_IMAGE_BYTES, VISION_FORMATS};
 /// `read_file` puts on a file it will read.
 pub const MAX_TEXT_INPUT_BYTES: u64 = 10_000_000;
 
+/// The most bytes of UTF-8 [`estimate_tokens`] counts as one token: four
+/// ASCII bytes, or one and a half characters of at most four bytes each. A
+/// text file of `n` bytes therefore costs at least `n / 6` tokens, which lets
+/// one that cannot fit be left out by its size, unread.
+const MOST_BYTES_PER_TOKEN: u64 = 6;
+
 /// Whose reading rules a declared path is held to: the worker's.
 #[derive(Debug, Clone, Copy)]
 pub enum InputAuthority<'a> {
@@ -60,6 +69,30 @@ pub enum InputAuthority<'a> {
     },
     /// A worker running in a session, whose file tools follow its scope.
     Session(&'a SessionScope),
+    /// A session whose `read_file` is confined to its workspace
+    /// (`ReadFileTool::with_confined_reads`): it reads nothing outside it,
+    /// and no images.
+    ConfinedSession(&'a SessionScope),
+    /// A worker that does not exist yet and will work in `base_dir` — a peer
+    /// in a git worktree of its own — asked about by the session that hands
+    /// it the task. Only `base_dir` is looked into, and only at a path the
+    /// asking session could itself read where it works, so that asking tells
+    /// it nothing its own tools would not.
+    WorkingDir {
+        base_dir: &'a Path,
+        asker: &'a SessionScope,
+        asker_confined: bool,
+    },
+}
+
+/// The path a session's `read_file` would open for `declared`.
+fn session_path(scope: &SessionScope, declared: &str, confined: bool) -> Result<PathBuf, String> {
+    let path = crate::tools::resolve_path_for_session_scope_read(scope, declared)
+        .map_err(str::to_owned)?;
+    if confined && !path.starts_with(scope.workspace()) {
+        return Err("path outside workspace".to_owned());
+    }
+    Ok(path)
 }
 
 impl InputAuthority<'_> {
@@ -74,13 +107,42 @@ impl InputAuthority<'_> {
                 Ok((path, root))
             }
             Self::Session(scope) => {
-                let path = crate::tools::resolve_path_for_session_scope_read(scope, declared)
-                    .map_err(str::to_owned)?;
+                let path = session_path(scope, declared, false)?;
                 let root = path
                     .starts_with(scope.workspace())
                     .then_some(scope.workspace());
                 Ok((path, root))
             }
+            Self::ConfinedSession(scope) => {
+                let path = session_path(scope, declared, true)?;
+                Ok((path, Some(scope.workspace())))
+            }
+            Self::WorkingDir {
+                base_dir,
+                asker,
+                asker_confined,
+            } => {
+                session_path(asker, declared, *asker_confined)?;
+                let path = crate::tools::resolve_path_with_scope(
+                    base_dir,
+                    declared,
+                    FilesystemScope::Workspace,
+                )
+                .map_err(|_| "outside the worker's working directory".to_owned())?;
+                Ok((path, Some(*base_dir)))
+            }
+        }
+    }
+
+    /// Why this worker is shown no image, when its own `read_file` shows none.
+    fn refuses_images(&self) -> Option<&'static str> {
+        match self {
+            Self::ConfinedSession(_)
+            | Self::WorkingDir {
+                asker_confined: true,
+                ..
+            } => Some("an image, and image reads are unavailable in this confined workspace"),
+            _ => None,
         }
     }
 }
@@ -128,16 +190,28 @@ impl ResolvedInputs {
             message.content.push_str(&self.text);
         }
         for path in &self.media {
-            let identity = vision::image_identity(path);
-            if !message
-                .media
-                .iter()
-                .any(|have| vision::image_identity(have) == identity)
-            {
-                message.media.push(path.clone());
+            // An image the message already carries is sent once, as the
+            // snapshot read here: a copy the sender attached gives way to it.
+            match message.media.iter().position(|have| same_image(have, path)) {
+                Some(at) => message.media[at] = path.clone(),
+                None => message.media.push(path.clone()),
             }
         }
     }
+}
+
+/// Whether `have`, an image a message already carries, is the image frozen at
+/// `snapshot`: a snapshot of the same bytes, or a file that holds them.
+fn same_image(have: &str, snapshot: &str) -> bool {
+    if vision::image_identity(have) == vision::image_identity(snapshot) {
+        return true;
+    }
+    let digest = Path::new(snapshot)
+        .file_stem()
+        .and_then(|stem| stem.to_str());
+    vision::image_identity(have).starts_with("path:")
+        && vision::read_media_no_follow(have, None)
+            .is_ok_and(|bytes| Some(format!("{:x}", Sha256::digest(&bytes)).as_str()) == digest)
 }
 
 /// A required input could not be delivered. `report` says which, and why,
@@ -261,11 +335,19 @@ pub fn mark_dropped_images(report: &mut InputReport, media: &[String]) -> Vec<St
 fn resolve(
     inputs: &[DeclaredInput],
     cx: &InputContext<'_>,
-    freeze_images: bool,
+    // Whether what is read is kept to be attached (a check keeps nothing).
+    keep: bool,
 ) -> Result<ResolvedInputs, InputDeliveryError> {
     if inputs.is_empty() {
         return Ok(ResolvedInputs::default());
     }
+    let no_images = cx
+        .authority
+        .refuses_images()
+        .or((!cx.accepts_images).then_some(
+            "an image, and the model is configured without image input; read it from its path if a \
+         tool can describe it",
+        ));
 
     // 1. Read every declared file the worker may read, once.
     let mut slots: Vec<Slot> = Vec::with_capacity(inputs.len());
@@ -283,7 +365,29 @@ fn resolve(
                 }
                 None => {
                     by_path.insert(path.clone(), slots.len());
-                    match read_candidate(input, &path, root, cx.accepts_images) {
+                    let read = read_candidate(input, &path, root, no_images, cx.budget_tokens)
+                        .and_then(|mut candidate| {
+                            candidate.cost = candidate.cost(slots.len() + 1, &input.path);
+                            if candidate.cost > cx.budget_tokens {
+                                // On its own it cannot fit, whatever else is
+                                // declared, so it is not held until the
+                                // budget is shared out below.
+                                return Err((
+                                    OmitReason::OverBudget,
+                                    format!(
+                                        "needs about {} tokens; the first request has room for {}",
+                                        candidate.cost, cx.budget_tokens
+                                    ),
+                                ));
+                            }
+                            if !keep {
+                                // A check holds one file at a time, however
+                                // many are declared.
+                                candidate.bytes = Vec::new();
+                            }
+                            Ok(candidate)
+                        });
+                    match read {
                         Ok(candidate) if candidate.form == InputForm::Image => {
                             match image_by_digest.get(&candidate.sha256) {
                                 Some(&first) => {
@@ -313,9 +417,8 @@ fn resolve(
     //    the order declared. An input that does not fit is left out whole.
     let costs: Vec<u32> = slots
         .iter()
-        .enumerate()
-        .map(|(index, slot)| match &slot.state {
-            State::Candidate(candidate) => candidate.cost(index + 1, &slot.path),
+        .map(|slot| match &slot.state {
+            State::Candidate(candidate) => candidate.cost,
             _ => 0,
         })
         .collect();
@@ -369,7 +472,7 @@ fn resolve(
         if candidate.form != InputForm::Image {
             continue;
         }
-        if !freeze_images {
+        if !keep {
             continue;
         }
         match vision::snapshot_input_image_bytes(&candidate.bytes, slot.required) {
@@ -398,7 +501,7 @@ fn resolve(
                 outcome: match &slot.state {
                     State::Candidate(candidate) => InputOutcome::Delivered {
                         form: candidate.form,
-                        bytes: candidate.bytes.len() as u64,
+                        bytes: candidate.len,
                         sha256: candidate.sha256.clone(),
                         tokens: *cost,
                     },
@@ -423,7 +526,11 @@ fn resolve(
     if report.undelivered_required().next().is_some() {
         return Err(InputDeliveryError { report });
     }
-    let text = render(&slots, &report);
+    let text = if keep {
+        render(&slots, &report)
+    } else {
+        String::new()
+    };
     Ok(ResolvedInputs {
         text,
         media,
@@ -465,7 +572,12 @@ impl State {
 
 struct Candidate {
     form: InputForm,
+    /// The file, whole; emptied once a check has taken what it reports.
     bytes: Vec<u8>,
+    /// The file's size.
+    len: u64,
+    /// What delivering it costs, in estimated tokens.
+    cost: u32,
     sha256: String,
     /// Position among the attached images, from 1; 0 until attached.
     image_number: usize,
@@ -492,7 +604,9 @@ fn read_candidate(
     input: &DeclaredInput,
     path: &Path,
     root: Option<&Path>,
-    accepts_images: bool,
+    // Why the worker is shown no image, when it is shown none.
+    no_images: Option<&'static str>,
+    budget_tokens: u32,
 ) -> Result<Candidate, (OmitReason, String)> {
     let meta = std::fs::symlink_metadata(path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => (OmitReason::Missing, "no file at this path".to_owned()),
@@ -507,18 +621,45 @@ fn read_candidate(
     if !meta.is_file() {
         return Err((OmitReason::Unsupported, "not a regular file".to_owned()));
     }
-    if meta.len() > vision::MAX_MEDIA_BYTES {
+    // What the size alone decides is decided before the file is read: a
+    // declaration can name many files, and each is held whole once read.
+    let len = meta.len();
+    let image_only = input.kind == InputKind::Image;
+    if image_only && len > MAX_MODEL_IMAGE_BYTES {
+        return Err((OmitReason::Unsupported, oversized_image(len)));
+    }
+    if len > MAX_TEXT_INPUT_BYTES {
         return Err((
             OmitReason::Unsupported,
             format!(
-                "{} bytes; no input larger than {} is delivered",
-                meta.len(),
-                vision::MAX_MEDIA_BYTES
+                "{len} bytes; no text or data input larger than {MAX_TEXT_INPUT_BYTES} is \
+                 delivered, and no image larger than {MAX_MODEL_IMAGE_BYTES}"
+            ),
+        ));
+    }
+    // (A file declared without a kind may be an image, whose cost is not its
+    // size; it is read, and left out below once it is known to be text.)
+    let least_tokens = len / MOST_BYTES_PER_TOKEN;
+    let text_only = matches!(input.kind, InputKind::Text | InputKind::Data);
+    if text_only && least_tokens > u64::from(budget_tokens) {
+        return Err((
+            OmitReason::OverBudget,
+            format!(
+                "{len} bytes, at least {least_tokens} tokens; the first request has room for \
+                 {budget_tokens}"
             ),
         ));
     }
     let bytes = vision::read_media_no_follow(&path.to_string_lossy(), root)
         .map_err(|err| (OmitReason::Unreadable, err.to_string()))?;
+    // What was read is what is measured from here on.
+    let len = bytes.len() as u64;
+    if len > MAX_TEXT_INPUT_BYTES {
+        return Err((
+            OmitReason::Unsupported,
+            format!("{len} bytes; the file grew past {MAX_TEXT_INPUT_BYTES} while it was read"),
+        ));
+    }
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     if let Some(expected) = &input.sha256 {
         if !expected.eq_ignore_ascii_case(&sha256) {
@@ -584,40 +725,28 @@ fn read_candidate(
                 ),
             ));
         }
-        if bytes.len() as u64 > MAX_MODEL_IMAGE_BYTES {
-            return Err((
-                OmitReason::Unsupported,
-                format!(
-                    "{} bytes; over the {MAX_MODEL_IMAGE_BYTES}-byte limit for an image in a \
-                     model request; downscale it",
-                    bytes.len()
-                ),
-            ));
+        if len > MAX_MODEL_IMAGE_BYTES {
+            return Err((OmitReason::Unsupported, oversized_image(len)));
         }
-    }
-    if form == InputForm::Image && !accepts_images {
-        return Err((
-            OmitReason::Unsupported,
-            "an image, and the model is configured without image input; read it from its path \
-             if a tool can describe it"
-                .to_owned(),
-        ));
-    }
-    if form != InputForm::Image && meta.len() > MAX_TEXT_INPUT_BYTES {
-        return Err((
-            OmitReason::Unsupported,
-            format!(
-                "{} bytes; no text or data input larger than {MAX_TEXT_INPUT_BYTES} is delivered",
-                meta.len()
-            ),
-        ));
+        if let Some(why) = no_images {
+            return Err((OmitReason::Unsupported, why.to_owned()));
+        }
     }
     Ok(Candidate {
         form,
         bytes,
+        len,
+        cost: 0,
         sha256,
         image_number: 0,
     })
+}
+
+fn oversized_image(len: u64) -> String {
+    format!(
+        "{len} bytes; over the {MAX_MODEL_IMAGE_BYTES}-byte limit for an image in a model \
+         request; downscale it"
+    )
 }
 
 /// The data format a path names, by its extension.
@@ -936,6 +1065,202 @@ mod tests {
         assert!(resolved.text.contains("in the workspace\n"));
         assert_eq!(omitted(&resolved.report.inputs[1]).0, OmitReason::Denied);
         assert!(!resolved.text.contains("TOP-SECRET"));
+    }
+
+    #[test]
+    fn should_hold_a_confined_session_to_what_its_read_file_reads() {
+        let ws = Workspace::new();
+        let granted = Workspace::new();
+        granted.write("shared.md", "granted outside the workspace\n");
+        ws.write("notes.md", "in the workspace\n")
+            .write("p.png", PNG);
+        let scope = SessionScope::solo(ws.root.clone(), vec![granted.root.clone()]).unwrap();
+        let shared = granted.root.join("shared.md");
+        let inputs = [
+            DeclaredInput::required("notes.md"),
+            DeclaredInput::optional(shared.to_string_lossy()),
+            DeclaredInput::optional("p.png"),
+        ];
+        let resolve_as = |authority| {
+            resolve_declared_inputs(
+                &inputs,
+                &InputContext {
+                    authority,
+                    ..ws.cx()
+                },
+            )
+            .unwrap()
+        };
+
+        // The session's ordinary read tool reaches all three...
+        let open = resolve_as(InputAuthority::Session(&scope));
+        assert!(open.text.contains("granted outside the workspace\n"));
+        assert_eq!(open.media.len(), 1);
+        // ...its confined one only the text inside the workspace.
+        let confined = resolve_as(InputAuthority::ConfinedSession(&scope));
+        assert!(confined.text.contains("in the workspace\n"));
+        assert!(!confined.text.contains("granted outside the workspace"));
+        assert_eq!(
+            omitted(&confined.report.inputs[1]),
+            (OmitReason::Denied, "path outside workspace")
+        );
+        let (reason, detail) = omitted(&confined.report.inputs[2]);
+        assert_eq!(reason, OmitReason::Unsupported);
+        assert!(detail.contains("image reads are unavailable"), "{detail}");
+        assert!(confined.media.is_empty());
+    }
+
+    #[test]
+    fn should_look_only_in_a_future_workers_directory_and_only_where_the_asker_may_read() {
+        // The asking session's directory holds an uncommitted file and a
+        // hidden chat; the worker's own checkout holds the committed files —
+        // among them a copy of that chat's notes.
+        let asker = Workspace::new();
+        let checkout = Workspace::new();
+        asker
+            .write("notes.md", "committed\n")
+            .write("draft.md", "not committed\n")
+            .write("chats/c1/notes.md", "hidden from the asker\n");
+        checkout
+            .write("notes.md", "committed\n")
+            .write("chats/c1/notes.md", "hidden from the asker\n");
+        let scope = SessionScope::solo(asker.root.clone(), Vec::new())
+            .unwrap()
+            .with_hidden_folders(vec![asker.root.join("chats")])
+            .unwrap();
+
+        let report = check_declared_inputs(
+            &[
+                DeclaredInput::required("notes.md"),
+                DeclaredInput::required("draft.md"),
+                DeclaredInput {
+                    sha256: Some("0".repeat(64)),
+                    ..DeclaredInput::optional("chats/c1/notes.md")
+                },
+            ],
+            InputAuthority::WorkingDir {
+                base_dir: &checkout.root,
+                asker: &scope,
+                asker_confined: false,
+            },
+        );
+
+        assert_eq!(delivered_form(&report.inputs[0]), InputForm::Text);
+        // What the asker can read in its own directory is not what the
+        // worker will find in its checkout.
+        assert_eq!(omitted(&report.inputs[1]).0, OmitReason::Missing);
+        // A path the asker may not read is not looked at, in either place:
+        // neither that it is there nor that the pin is wrong.
+        let (reason, detail) = omitted(&report.inputs[2]);
+        assert_eq!(reason, OmitReason::Denied);
+        assert!(!detail.contains("sha256"), "{detail}");
+    }
+
+    #[test]
+    fn should_decide_by_size_what_size_decides_without_reading_the_file() {
+        let ws = Workspace::new();
+        let mut large_image = PNG.to_vec();
+        large_image.resize(MAX_MODEL_IMAGE_BYTES as usize + 1, 0);
+        ws.write("render.png", &large_image)
+            .write("log.txt", "x".repeat(80_000))
+            .write("dump.bin", vec![b'x'; MAX_TEXT_INPUT_BYTES as usize + 1]);
+        // A pin no file matches: a file that is read is reported `Changed`.
+        let unread = |path: &str, kind| DeclaredInput {
+            kind,
+            sha256: Some("0".repeat(64)),
+            ..DeclaredInput::optional(path)
+        };
+
+        let resolved = resolve_declared_inputs(
+            &[
+                unread("render.png", InputKind::Image),
+                unread("log.txt", InputKind::Text),
+                unread("dump.bin", InputKind::Auto),
+            ],
+            &ws.cx(),
+        )
+        .unwrap();
+
+        let (reason, detail) = omitted(&resolved.report.inputs[0]);
+        assert_eq!(reason, OmitReason::Unsupported);
+        assert!(detail.contains("over the 5242880-byte limit"), "{detail}");
+        // 80 000 bytes are at least 13 333 tokens, and there is room for 10 000.
+        let (reason, detail) = omitted(&resolved.report.inputs[1]);
+        assert_eq!(reason, OmitReason::OverBudget);
+        assert!(detail.contains("at least 13333 tokens"), "{detail}");
+        assert_eq!(
+            omitted(&resolved.report.inputs[2]).0,
+            OmitReason::Unsupported
+        );
+
+        // The bound the size rule rests on: no text costs less than a token
+        // per six bytes, whatever it is written in.
+        for text in [
+            "plain ascii text ",
+            "汉字和假名かな",
+            "😀😃😄😁",
+            "mixed 混合 😀 ",
+        ] {
+            let text = text.repeat(64);
+            assert!(
+                u64::from(estimate_tokens(&text)) >= text.len() as u64 / MOST_BYTES_PER_TOKEN,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_report_a_checked_file_as_resolving_it_would_while_keeping_none_of_it() {
+        let ws = Workspace::new();
+        ws.write("a.txt", "alpha\n".repeat(200))
+            .write("p.png", PNG)
+            .write("big.txt", "x".repeat(60_000));
+        let inputs = [
+            DeclaredInput::required("a.txt"),
+            DeclaredInput::required("p.png"),
+            DeclaredInput::optional("big.txt"),
+        ];
+
+        let checked = check_declared_inputs(&inputs, ws.cx().authority);
+        let resolved = resolve_declared_inputs(&inputs, &ws.cx()).unwrap();
+
+        // Size, digest and cost are those of the file, though a check drops
+        // its bytes once it has them...
+        assert_eq!(checked.inputs[0], resolved.report.inputs[0]);
+        assert_eq!(checked.inputs[1], resolved.report.inputs[1]);
+        // ...and a check assumes room for everything, where a request has
+        // room for 10 000 tokens: the file that cannot fit even alone is left
+        // out before the budget is shared out.
+        assert_eq!(delivered_form(&checked.inputs[2]), InputForm::Text);
+        let (reason, detail) = omitted(&resolved.report.inputs[2]);
+        assert_eq!(reason, OmitReason::OverBudget);
+        assert!(
+            detail.contains("the first request has room for 10000"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn should_send_an_image_the_sender_also_attached_once_as_the_frozen_input() {
+        let ws = Workspace::new();
+        ws.write("p.png", PNG).write("other.png", {
+            let mut other = PNG.to_vec();
+            other.push(0);
+            other
+        });
+        let resolved =
+            resolve_declared_inputs(&[DeclaredInput::required("p.png")], &ws.cx()).unwrap();
+        let attached = ws.root.join("p.png").to_string_lossy().into_owned();
+        let other = ws.root.join("other.png").to_string_lossy().into_owned();
+        let mut message = Message::user("look at this");
+        message.media = vec![other.clone(), attached];
+
+        resolved.attach_to(&mut message);
+
+        // The copy gives way to the snapshot, which is what marks the image
+        // as one its task requires; a different image stays as it was.
+        assert_eq!(message.media, [other, resolved.media[0].clone()]);
+        assert!(vision::is_required_input_snapshot(&message.media[1]));
     }
 
     #[test]

@@ -20,7 +20,19 @@ At staging the server checks the declaration with the calling session's
 the handoff, and nothing is staged. A hidden folder, denied path, or unavailable
 session scope is left to the peer session's own read access; the note says only
 that its first request resolves it, never whether the file exists, its size, or
-its digest.
+its digest. A peer staged in a git worktree of its own does not work in the
+calling session's directory: only its checkout is looked into, so a file the
+caller has not committed is reported missing, and only at a path the calling
+session may itself read.
+
+A file's size decides what it can before the file is read: nothing over 10 MB
+is delivered, no image over 5 MiB, and a file declared `text` or `data` that
+cannot fit the request's budget at one token per six bytes is left out unread.
+A check keeps none of what it reads.
+
+A session whose `read_file` is confined to its workspace (a host-scoped serve)
+is given declared inputs under the same rule: nothing outside the workspace, and
+no images.
 
 At the first `turn/start` of the peer's session — the conversation has no
 message yet — the server reads the declared files under that session's own read
@@ -42,10 +54,15 @@ one line per turn that was due inputs.
 
 A delivered image stays delivered, or the report says otherwise. When an
 endpoint refuses image parts, the OpenAI-compatible provider sends a request
-again without its images so the turn can go on. A request that carries a
-required input image is not sent again without it: it fails with the refusal,
-and the peer's turn ends errored with that reason, so a peer never does its task
-without an image its task requires. An optional input image is dropped by that
+again without its images so the turn can go on. The request that brings the
+model a required input image — no reply follows the message that carries it —
+is not sent again without it: it fails with the refusal, and the peer's turn
+ends errored with that reason, so a peer never starts its task without an image
+its task requires. Once the model has answered that message, a later request to
+an endpoint that refuses images falls back like any other, so a change of model
+does not end the conversation. A provider with several lanes takes images only
+when every lane does, so an image is never called delivered on one lane and
+stripped by another. An optional input image is dropped by that
 retry like any other, and the request that goes out without it says so: the
 manifest line that called the image delivered reads `NOT delivered
 (unsupported)` in that request, while the committed message is left as it was.
@@ -55,6 +72,9 @@ report with that image as left out (unsupported) and names it under
 
 Because the inputs are part of the committed first message, later turns replay
 them from the transcript as they were first read, and are not given them again.
+An image the client also attached to that message is sent once, as the snapshot
+read here. The summary a turn-end hook is handed is of the text the turn was
+sent, without the inputs attached to it.
 
 ### A message to an existing peer
 
@@ -62,9 +82,10 @@ The `peer_send_input` tool takes the same optional `inputs` list: the files the
 task in its message needs. The server checks it with the live peer session's
 `SessionScope` when that runtime is available; otherwise it carries the
 declaration to the owning turn without learning whether the files exist, their
-type, size, or digest. A required input that is not there refuses the send, with
-every input's state, and nothing is queued. A sha256 mismatch reports only that
-it does not match, never any part of the file's actual digest.
+type, size, or digest, and the tool result says the inputs were not checked. A
+required input that is not there refuses the send, with every input's state, and
+nothing is queued. A sha256 mismatch reports only that it does not match, never
+any part of the file's actual digest.
 
 The declaration is queued and persisted with the message, as continuation
 metadata, and moves with it when a reopen re-homes the message to the peer's new

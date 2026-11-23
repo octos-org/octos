@@ -109,7 +109,10 @@ pub(super) async fn rpc(
                 message,
             );
             receipts.push(match outcome {
-                Ok(octos_agent::PeerSendInputDelivery::Queued) => {
+                Ok(
+                    octos_agent::PeerSendInputDelivery::Queued
+                    | octos_agent::PeerSendInputDelivery::QueuedUnchecked,
+                ) => {
                     json!({"agent_id": target.agent_id, "status": "queued"})
                 }
                 Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued) => {
