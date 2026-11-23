@@ -168,13 +168,15 @@ async fn model_needing(needs: Vec<Need>) -> MockServer {
     server
 }
 
-/// What the provider sent, request by request.
+/// The chat requests the provider sent, one by one. A provider may also ask
+/// the endpoint about its model; those are not requests of the conversation.
 async fn sent(server: &MockServer) -> Vec<Value> {
     server
         .received_requests()
         .await
         .unwrap()
         .iter()
+        .filter(|request| request.url.path().ends_with("/chat/completions"))
         .map(|request| serde_json::from_slice(&request.body).unwrap())
         .collect()
 }
