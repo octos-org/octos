@@ -336,6 +336,7 @@ mod tests {
                 &staged.slug,
                 "restore-followup",
                 "check the existing document",
+                None,
             );
         assert_eq!(
             queued,
