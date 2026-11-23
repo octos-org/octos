@@ -1,5 +1,12 @@
 # Repair image-to-editable reconstruction failures
 
+For a source-image reconstruction, pass the registered OCR observations to the native
+builder on every repair. Keep the design hash, canvas, occurrence ID, line text and full
+polygon together. The runtime can discover a matching `ocr.json` beside the page or
+accept the bound page field `source_ocr`. Preserve the measured position of each word;
+the visual reader resolves its meaning, notices omissions and flags faulty detections.
+Check the build receipt's `ocr_placement` and the rendered page after a proposed move.
+
 Use this procedure when designed source images are readable but native conversion loses labels, moves copy into another object, or overflows retained artwork. Continue with the producer's own source and design; this reference supplies no page layout or supervisor approval gate.
 
 ## Reconcile occurrences, not just strings

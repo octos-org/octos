@@ -1,5 +1,24 @@
 # Text reflow and obstacle-aware placement
 
+For image reconstruction, keep the original Paddle OCR line IDs, transcription, canvas
+pixel boxes and TL/TR/BR/BL polygons together throughout a repair. Match the reference
+word to the measured ink of the editable text. A chip or card can contain several labels
+with different centers.
+
+`build` and `cycle` pick up an `ocr.json` beside the page spec when its
+`source_sha256` matches the page's bound `design`. Use the page's `source_ocr`
+asset field to specify another registered file. The observation supplies `canvas`
+as a width/height pair and `lines` with `id`, `text`, `box` and an optional
+`polygon`. The runtime measures native glyphs, uses the polygon baseline when available,
+and translates misplaced single-line text to its source anchor. It keeps the authored
+wording, font size and frame dimensions. The build receipt records each correction in
+`ocr_placement`. Check the rendered result for weight, fitting and perspective.
+
+When an OCR reading is wrong, retain the verified wording. For a geometrically bad
+detection, mark that line `geometry_status: "rejected"` in a source-reviewed
+observation or provide its verified polygon and envelope. Ambiguous repeated words
+need a matching occurrence ID. Unmatched text stays with the maker.
+
 These mechanics support the existing production peer and reviewer. They do not
 generate a new design, alter copy, shrink type, or replace visual acceptance.
 

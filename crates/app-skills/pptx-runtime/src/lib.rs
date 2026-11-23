@@ -17,6 +17,7 @@ pub mod intent_evidence;
 pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
+mod ocr_placement;
 pub mod operations;
 pub mod placement;
 pub mod qa;

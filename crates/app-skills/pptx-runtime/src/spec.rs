@@ -30,6 +30,8 @@ pub struct Page {
     pub background: Value,
     #[serde(default)]
     pub design: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ocr: Option<Value>,
     pub copy: BTreeMap<String, String>,
     #[serde(default)]
     pub regions: BTreeMap<String, Value>,
@@ -340,7 +342,7 @@ pub fn normalized(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn asset(ctx: &Context, v: &mut Value, base: &Path) -> Result<()> {
+pub(crate) fn asset(ctx: &Context, v: &mut Value, base: &Path) -> Result<()> {
     let p = v
         .as_str()
         .or_else(|| v.get("path").and_then(Value::as_str))
@@ -393,6 +395,7 @@ pub fn load_with_sources(
         if let Some(d) = p.get_mut("design").filter(|d| !d.is_null()) {
             asset(ctx, d, &parent).with_context(|| format!("page {page_id}: design"))?;
         }
+        crate::ocr_placement::bind(ctx, p, &parent, &mut sources)?;
         if let Some(layers) = p.get_mut("artwork_layers") {
             for layer in layers
                 .as_array_mut()
