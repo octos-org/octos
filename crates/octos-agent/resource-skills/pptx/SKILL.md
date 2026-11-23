@@ -7,6 +7,8 @@ description: "制作或修改可编辑 PPTX，尤其适用于沿用既有插画�
 
 制作模型负责内容、设计、看图与修复；独立评审会话负责复核实际交付稿。工具负责文件、字体计算、实际渲染、测量和证据整理；工具成功或检查项全绿不等于视觉通过。普通文案、解释或只读检查不自动启动整稿重做。
 
+有参考图的可编辑重建，协调员把用户点名的字形、倾角要求写入逐页计划的 `source_typography`，保留原图位置或测量 ID。审阅员放大对照原图和当前 PPTX 渲染图，分别核对字形倾斜、整行基线角度及原生文字对象。原图里看得见但读不清的笔画也要登记。局部返修只关闭已核实的问题，整页通过还需核对先前未解决项和其余原图细节。
+
 新环境首次制作时先按 [portable runtime](references/portable-runtime.md) 检查依赖，
 调用随包的 `pptx_tool`（`action: doctor`）；具体接口见 [Rust runtime](references/rust-runtime.md)，技能目录来自当前 catalog。
 不依赖已有评测目录，不把安装完成称为视觉验收通过。
@@ -15,11 +17,37 @@ description: "制作或修改可编辑 PPTX，尤其适用于沿用既有插画�
 
 ## 制作与返修必须使用 peer，并落实退出标准
 
+协调者自行选择符合约束的合并方式。评分口径有争议时交给独立仲裁 peer，工具能力不足时交给技术 peer；同一根因只调查一次，各页仍由原 reviewer 验收。旧裁定里的 `task_owner` 也按这两条路径接回。已验证所有授权修法都无法达到门槛时，记录阻塞证据并结束该次尝试，不申请人工豁免，不以重复评审代替修复。
+
+独立技术报告一经发布，交回原 reviewer 在原裁定上绑定。报告字段或路径写错只修登记；正在测量的同一问题只等现有 peer 回报。所有剩余页面均已登记受阻时，协调者写明未交付页和原因，关闭本任务已消费的监视器，并将已有目标置为 blocked。相同证据不再触发制作、仲裁或全稿复审。
+
 制作、重做或修复 PPTX 成品时，采用“协调主会话＋制作 peer＋独立评审 peer”，Rust 提供 QC 测量与证据校验；用户明确指定其他模式时以用户要求为准。启动前读 [peer 评审与退出](references/peer-review-exit.md)。Octos 必须实际调用 `peer_handoff`，保存真实会话回执并确认制作与评审双方能直接看图；不能以同一模型自评、普通后台脚本或仅写了分工说明冒充 peer。既有两会话运行保留其真实记录，不为改变角色名称中途重启。
 
-制作 peer 独占改稿；评审者查看实际 PPTX 渲染，按证据把缺陷交回同一个 peer。先约定必修项、可选微调、停滞窗口和用户已有预算。必修项关闭且整稿复核通过就交付；连续无实质改善就退出当前修法；真实阻塞或预算耗尽时交回未完成结果。偏好性微调不能无限重开返修。
+整稿多页制作或重建，默认在共享设计约定冻结后采用**一页一个制作 peer**，同页返修继续交给原 owner，独立 reviewer 不制作页面。先列出全部页面、真实 session ID、独占路径和依赖；共享母版/样式只设一个 writer。名额有限时保留每页独立 owner、按宿主能力分批运行，不静默退回一个 peer 包多页；用户明确选择其他分工时从其要求。实际并发用运行区间证明，不能用分工表冒充。局部修改复用未改页的有效验收，不为此重开整稿。具体做法见 [independent pages](references/independent-pages.md)。
 
-Octos 制作 peer 同时按 [continuation evidence](references/continuation-evidence.md) 初始化并核验现有退出策略。**技能已安装、policy 文件存在、peer 已启动，都不证明内核已消费检查证据。** 首个完整修复检查周期后必须确认运行时状态与该证据一致；缺口要明确报告并处理，不能继续声称阈值已启用。保留已运行任务的历史，不静默改写冻结实验。
+共享工作区的宿主若支持 `peer_send_input.pptx_batch`，优先使用两份固定角色模板。全稿要求只写一次到 v2 页面计划的 `shared_brief`，每行填写 maker/reviewer 会话、候选与审阅路径、本页 `spec`、`reference` 和可选 `instructions`。全稿在计划顶层声明同一份 `canvas`（`width_px`、`height_px`、`width_in`、`height_in`），每页沿用相同物理尺寸。新任务若未指定，原生工具会优先取首页规格，其次按首页原图比例推导，并随模板发给所有人。原图复刻时，制作员先出可编辑单页。候选页发布即派给本页审阅员，由其对照原图、该版 PPTX 的渲染图和原生对象，集中记录影响交付的差异。冻结计划后调用 `pptx_tool({"action":"page_assignments"})`，把返回的 `peer_send_input` 对象原样传给同名宿主工具，一次派出所有就绪工作。仍有页面在制时，协调员先用 `peer_gather({"with_cursor":true})` 读现有交稿，再把返回的 `cursor` 传给 `after_cursor`，用 `wait_ms` 等下一条交稿。页面一交稿即可唤醒等待，勿用 shell `sleep` 轮询文件。收到交稿时刷新整张表并发送，已派出的任务自动去重。`only_page` 可优先处理一页；等待、恢复会话或处理部分派工失败时，先对全表补派。若某页的 peer 已结束本轮且留下可恢复的未完成工作，读取真实轮次，用 `page_assignments(only_page, resume_after_round)` 派给原负责人接着做。同一轮续做只入队一次。相同派工只入队一次；逐项查看失败回执与实际执行事件。见 [派工流程](references/independent-pages.md)。
+
+每页简报只带本页输入、冻结的设计约定和本页输出位置。其他页的会话、临时文件和进度都不是本页依赖。页内把互不依赖的工作同时派出。实际渲染一就绪，独立 reviewer 就能看图，同时 Rust 可以检查同一份 PPTX 的原生对象。两份结果针对同一版候选后再签收。
+
+新建可独立制作的多页任务默认采用逐页终审。若 handoff 回执只给了 slug、topic 或内部任务编号，把身份确认放进各 peer 的首条并行简报：分别运行 `pptx_tool({"action":"doctor","check_renderer":false})` 并用 `peer_publish` 回传原样的 `continuation.host_identity`。协调者收齐后用这些值填计划；`peer_send_input` 继续使用 slug。先确认 `doctor.page_first_gate.per_page_delivery`，在版本 2 页面计划中给每页指定不同的 maker 和独立 `reviewer_session`，再由协调者用 `evidence_init(verification_mode:"per_page")` 冻结计划。各页自行准备素材、制作、用 DeckCraft 按交付规格渲染；该页 reviewer 打开实际候选和参考，逐项签收原文、插画、可读性和原生可编辑性，返修直接回该页 maker。若 doctor 返回 `page_first_gate.progress_output`，每个页面签收后工具自动更新同一个可编辑进度稿。向用户提供这个文件的路径；迟到的页按计划顺序插入。若回执含 `progress_error`，协调者用 `page_progress` 恢复进度稿，保留已有逐页签收。最后一次跨页同步是 `page_assemble`，协调者用返回的回执调用 `evidence_assembled(assembly,qa)` 生成逐页签收汇总并核实交付。已冻结单独整稿终审的历史任务或用户明确要求合并后另审成稿时，使用原整稿审核路径。
+
+制作 owner 全覆盖不等于评审与返修已并行覆盖。协调者每轮先核对全部未完成页面及当前 peer 执行状态，把所有已就绪且相互独立的制作、评审、返修派出，再做长时间整稿审计或等待。有已授权、已连接的空闲独立 reviewer 时，不把其他就绪页面都排在同一忙碌 reviewer 后面；真实依赖须逐页写明，已验收页无需为填满名额重开。先读 `help topic:page_dispatch`，按当前 schema 用 `page_dispatch` 检查声明的派工覆盖，并结合 `page_gate` 的逐页 `work_stage` / `candidate_current` 整理未完成工作。它不派工、不打分、不授权，也不证明 peer 实际执行；这不是新的内核 EndTurn 门禁。
+
+使用页面 JSON 与原生构建回执的整稿 page-first 流程，首次制作前按 `help topic:page_gate` 建立 `.octos/pptx-page-plan.json`，确认 `doctor.page_first_gate.supported` 与 `active`。每页由独立 reviewer 对**当前确切候选**打分，默认至少 95/100（用户明确要求优先）、零 critical、无未关闭必修项。全部页面通过后才合并；包括试验稿在内，不提前构建多页 PPTX。支持该能力的原生 `build`/`cycle`/`batch` 在写出多页文件前复核门禁。旧版本或没有源数据/构建回执的路线明确只有派工与验收约定，不伪造回执、不宣称已硬拦截。逐页终审任务以页面 reviewer 对实际单页交付文件的签收作为最终视觉结论。
+
+新任务由一个指定 peer 在实际 profile 上跑通共用工具。其他已就绪的页面同时派给各自 maker，先读各自原图、核对原文并准备可编辑对象。共用工具验证通过后并行构建。每页绑定交付的底图原文件，核对画布与渲染尺寸、reviewer 实收像素、评审提交和外环接续。在计划中固定计分项、允许保留位图的范围及各页独立 reviewer。在逐页计划中用 `approved_background` 记录底图路径和哈希，供发布时核对。
+
+宿主 `doctor.page_first_gate.review_submission` 为真时，优先用 `cycle(publish_candidate:true, freeze_inputs:true)` 发布单页，reviewer 用候选交接包或 `page_gate(only_page)` 返回的 `review_request_template` 填写四项实际观察、证据与评分，用 `page_review_submit` 对该 `candidate_id` 一次提交。Maker 读取发布结果的 `review_dispatch` 和 `next`。宿主已派工并通知协调者时即可结束。需补发或旧宿主没有回执时，使用 `peer_publish(handoff_id=candidate_id)`。Reviewer 和仲裁员提交后读取 `repair_dispatch` 与 `next`。原生检查已证实的缺陷直接派给原制作员，需要看图确认的缺陷派给独立仲裁员。确认后唤醒制作员，有异议则唤醒原 Reviewer。只有需要补发或缺少回执时才使用 `peer_publish(handoff_id=verdict_id)`。相同交付重试复用该 ID，协调者按页派下一步，无需等其他页面。保留有效审核引用；报告格式更正和派工重试不新建 PPTX。下面的 [independent pages](references/independent-pages.md) 包含字段与旧版本兼容方式。
+
+先约定必修项、可选微调、停滞窗口和用户已有预算。必修项关闭且整稿复核通过就交付；连续无实质改善就退出当前修法；真实阻塞或预算耗尽时交回未完成结果。偏好性微调不能无限重开返修。
+
+等待 peer 时先用 `peer_list` 查当前回合状态，以 `peer_gather` 的 `wait_ms:0` 或不带等待时间读取已有结果；分别看当前执行状态和历史结果，旧结果的完成文字不能覆盖新一轮的运行/排队状态。已结束的回合不再等下一次黑板变化。先派出其他就绪独立工作，只有相关工作仍在运行时才使用有界等待；黑板变化和等待超时本身都不证明当前回合已完成。
+
+交回当前轮等待自动唤醒前，按 [independent pages 的唤醒检查](references/independent-pages.md#verify-the-next-publication-can-wake-the-coordinator) 核对当前阶段实际会发布的位置、真实未完成任务和原生续跑链路。制作者候选、评审结果与 peer 结束事件是不同的触发源；只监视评审目录会漏掉制作完成。`peer_results_ready` 提示、monitor 的 `active`、已有结果文件都不能单独证明外环会自动继续。整批汇总可能等待其他 peer，须核对遗留排队输入与连接；仅由有权 owner 通过原生接口退役已确认无剩余工作的辅助 peer，不删除队列或重置历史。用一次真实交付后的外环接续、下一步派工记录验证修复。
+
+区分回合结束与任务结束：制作或评审 peer 仍在运行、正常等待结果或按评审返修时，任务保持 `in_progress`。尚未达到 QA 标准本身不构成 `blocked`。只有具体输入、权限、配额或工具故障实际阻断后续工作，且没有可行的已授权路径时，才报告 `blocked` 并保留证据。
+
+Octos 制作流程按 [continuation evidence](references/continuation-evidence.md) 初始化并核验现有退出策略。共享工作区只有一个整稿策略 owner，由协调者管理；页面 maker 不各自覆盖同一策略。独立工作区可各自管理自己的策略。**技能已安装、policy 文件存在、peer 已启动，都不证明内核已消费检查证据。** 首个完整修复检查周期后必须确认运行时状态与该证据一致；缺口要明确报告并处理，不能继续声称阈值已启用。保留已运行任务的历史，不静默改写冻结实验。
 
 ## 先确定设计路径
 
@@ -39,15 +67,15 @@ Octos 制作 peer 同时按 [continuation evidence](references/continuation-evid
 
 ## 常用制作路径
 
-1. 确定内容版本、页数、比例、字体和可编辑范围。最新文稿决定说什么，用户认可的参考决定如何画。固定的是内容与图文关系，不是旧稿的文本框数量、对象 ID 或一句话一个框的切法；在建立排版与验收约束前，先区分需要编辑的文字片段与底图已有的图形符号，保留可核对的内容映射。已记录的约束不能偷偷删除来绕过检查。实际查看参考图；可用时调用 `pptx_tool` 的 `ocr` 获取文本和四角候选，按原文、出现次数和周围图形核对，不能按识别顺序机械配字。OCR 辅助定位，不能替代原文。保留被指定的旧版。
+1. 确定内容版本、页数、比例、字体和可编辑范围。最新文稿决定说什么，用户认可的参考决定如何画。固定的是内容与图文关系，不是旧稿的文本框数量、对象 ID 或一句话一个框的切法；在建立排版与验收约束前，先区分需要编辑的文字片段与底图已有的图形符号，保留可核对的内容映射。已记录的约束不能偷偷删除来绕过检查。让能直接看图的模型读取参考图，按原文、出现次数和周围图形核对。小字先看原分辨率局部；仍有歧义或需要文字框的像素坐标时，按需用原生 `ocr` 获取候选并核对。模型估出的框需经测量才能用于精确排版。保留被指定的旧版。
 2. 对“无字插画位图＋原生文字”，使用 [native builder](references/native-builder.md)，只编写页面数据。共享字体与构建实现复用一次。独立视觉对象的标签分别定位；不要把多个卡片的标签塞进一个靠空行对齐的文本框。
    遇到倾斜铭牌、斜向文字或透视面，按 [标签几何](references/label-geometry.md) 测量具体标签四角，重建局部文字框及旋转；检查字形与斜边、基线的关系。整个场景面板不能替代局部标签边界，旋转也不等于透视变形。
 3. 先从底图确定局部放字区域、方向及同类字号，再用 `pptx_tool` 的 `fit` 定位字形；同类文字声明 `typography_groups` 并使用 `group` 固定共同字号，放不下时看具体冲突，不按每个 OCR 框分别放大或缩小。跨多个图形的文字可用 `split_text` 保留原文映射后拆框。接口见 [字体提案与修订](references/fit-and-revise.md)。实际渲染与测量共用 DeckCraft 字体引擎，不以测量代替看图。
    同组标签已有明确局部 owner 时，用 `layout_region` 一次比较几个共同字号的完整方案；工具联合检查行数、邻接文字和声明的障碍，返回实际 PPTX 预览。底图已有的箭头/运算符可在冻结契约前用 `represent_symbol` 保留原文映射，不能重复叠字或删除原文；文字和数字不适用。见 [语义与区域排版](references/semantic-authoring.md)。
-4. 用 `cycle` 一次完成构建、重开、全稿/无字稿 PNG 和检查；批量修正数据用 `patch`，新候选用新目录。有参考设计的页必须声明 `design`；`cycle` 自动为每页生成整页差分与待审区域，不能只挑封面或已知缺陷比较。在现有 review 的 `comparisons` 中逐页记录观察并分类所有标记区域；缺失、过期或未判定不能算通过。未改变的设计/底图/渲染可复用已有证据，勿重新审查无变化的页。用 `crop` 扩展局部，另看 `visual_review_queue` 的完整归属区域与未标记区域；差分与零越界都不能代替看图。无参考的原生页面不虚构参考。接口及旧稿补检见 [Rust runtime](references/rust-runtime.md)。
+4. 制作/返修阶段每个 maker 用带 `page` 选择器的单页 `cycle` 完成构建、重开、全稿/无字稿 PNG 和检查；全部页面独立验收通过后，优先用 `page_assemble` 按计划顺序合并已审核的实际单页 PPTX。逐页终审模式用 `evidence_assembled(assembly,qa)` 核验合并包并汇总各页签收，再读 `evidence_status` 核实宿主已接收。明确要求合并后终审的任务另按整稿路径提交 `assembly_review_submit`。批量修正数据用 `patch`，新候选用新目录。有参考设计的页必须声明 `design`；逐页完整分类差分标记与未标记区域，不只挑封面或已知缺陷。缺失、过期或未判定不能算通过。复用未改部分的有效证据，用 `crop` 看有上下文的局部；差分与零越界不能代替看图。无参考的原生页面不虚构参考。接口及旧稿补检见 [Rust runtime](references/rust-runtime.md)。
 5. 按 [三项独立核对](references/review-evidence.md) 检查最终 PPTX：原稿与原生文字的完整意思、有字设计与无字底图的图形变化、实际渲染的阅读与标签归属。另按 [视觉验收](references/visual-review.md) 比较整页图文关系、信息密度和全稿节奏。全页检查不局限于检测器标记的对象；密集区域用清晰的上下文裁图。检查结果中的未知项保留为未知，复用未改变部分的有效证据。首个可读 cycle 完成文件/构建检查就发布交接，不先进行完整逐对象视觉自审；完整审查由独立 Reviewer 负责。制作 peer 返修后只自查改动及相邻对象，再发布新候选，按退出标准完成，不要求用户逐轮批准。
 
-Maker 首次发布前只核对构建成功、文件存在与页数，不制作完整 review_pack、不填逐对象验收模板，也不等待“自己满意”。完整首轮视觉审查只由 Reviewer 执行；Maker 可直接查看必要的局部图来实施修复。首次可读的 `cycle` 就把返回值中的 `peer_review_handoff` 数据交给评审主会话；它不是工具名，不要搜索或调用同名工具，也不自动发送通知。Octos 制作 peer 用 `peer_publish` 发布中间成果，协调者用 `peer_gather` 读取并用 `peer_send_input` 派发评审，不能先自修几十轮。该字段绑定实际文件；评审与后续制作复用同一组缺陷 ID，参见 peer 退出规则。
+Maker 首次发布前只核对构建成功、文件存在与页数，不制作完整 review_pack、不填逐对象验收模板，也不等待“自己满意”。完整首轮视觉审查只由 Reviewer 执行；Maker 可直接查看必要的局部图来实施修复。在首次可读的 `cycle` 发布候选。已按页派工的宿主直接唤醒指定审阅员，Maker 按 `page_publication.next` 结束或补发。旧宿主由 Maker 用 `peer_publish` 提交交接数据，协调者读取后派发。该字段绑定实际文件；评审与后续制作复用同一组缺陷 ID，参见 peer 退出规则。
 
 生成新插画属于用户另行指定的美术任务。已有底图的可编辑制作和文字返修直接使用绑定的素材，不调用图像生成或编辑工具处理底图。用户要求箭头、图标或表格也可编辑时，按约定使用原生形状、图表或矢量对象，并说明实际可编辑范围。
 
@@ -82,7 +110,7 @@ Maker 首次发布前只核对构建成功、文件存在与页数，不制作�
 
 参考图重建中遇到重影、小字错位或倾斜标签越界时，制作员和独审员都用[同一区域的三图对照](references/label-comparison.md#compare-a-registered-region)定位问题。把原图、当前候选隐藏原生文字后的渲染、同一候选显示文字的渲染合成一张可读的局部图。独审员在能看到三个区域的回合记录观察，再核对修订后的整页。局部结论只覆盖实际看过的对象。
 
-使用新版 Rust 工具时，先用 `review_pack` 读整页关系，再按 `view_batches` 逐组读原图／底稿／实际 PPTX 的原像素局部图；不把整稿图片一次塞给模型，也不以 OCR 结论替代看图。同时检查工具返回的 `relation_signals`，对测得的倾角／偏移逐项说明缺陷、有意设计或未知；“有意设计”还须引用该信号 `intentional_options` 中的 `support_id`，无依据保留未知；不能用保留左起点解释原图居中关系丢失。用 `review_submit` 绑定验收记录，避免手抄哈希。按 [对象级视觉证据](references/object-visual-review.md) 为每个文字对象记录归属、越界、对齐、方向、字体五项简短观察。工具会把漏检对象、未知判断和过期版本留为未完成；同页发生修改后必须复核最终渲染。修前登记缺陷、预先冻结独立视觉验证路径和局部证据复用见 [review lifecycle](references/review-lifecycle.md)。判断由任务选定模型作出，不隐式改用其他视觉模型。
+使用新版 Rust 工具时，多页 `review_pack` 默认只返回逐页请求计划，不生成整稿大证据包。Reviewer 按计划生成各页包并 `review_submit`；协调者用 `review_merge` 合并同一 cycle 的独立证据，再 `evidence_record` / `evidence_status`。先用第一页验证完整证据交接，不能等整稿评分后才发现无法收尾。先用 `review_pack` 读整页关系，再按 `view_batches` 逐组读原图／底稿／实际 PPTX 的原像素局部图；不把整稿图片一次塞给模型，也不以 OCR 结论替代看图。同时检查工具返回的 `relation_signals`，对测得的倾角／偏移逐项说明缺陷、有意设计或未知；“有意设计”还须引用该信号 `intentional_options` 中的 `support_id`，无依据保留未知；不能用保留左起点解释原图居中关系丢失。用 `review_submit` 绑定验收记录，避免手抄哈希。按 [对象级视觉证据](references/object-visual-review.md) 为每个文字对象记录归属、越界、对齐、方向、字体五项简短观察。工具会把漏检对象、未知判断和过期版本留为未完成；同页发生修改后必须复核最终渲染。修前登记缺陷、预先冻结独立视觉验证路径和局部证据复用见 [review lifecycle](references/review-lifecycle.md)。判断由任务选定模型作出，不隐式改用其他视觉模型。
 
 - 以实际交付 PPTX 为检查对象。调用 `pptx_tool` 的 `inspect` 做限定结构检查；DeckCraft 成功不能证明 PowerPoint 能打开。测试过哪些应用就报告哪些。
 - 查看最终实际渲染，核对文字与原文、数字/公式/单位、重复次数、字体、对齐、卡片归属、遮挡和小字。标题统一要求来自用户/风格约定。缺少 owner region 或整张大面板作为 owner，均不能证明局部标签摆放正确。

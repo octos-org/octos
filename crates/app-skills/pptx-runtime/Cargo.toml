@@ -24,6 +24,7 @@ tempfile = "3"
 zip = { version = "9.2.2", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 fs2 = "0.4"
+unicode-segmentation = "1"
 
 [lints.rust]
 unsafe_code = "deny"

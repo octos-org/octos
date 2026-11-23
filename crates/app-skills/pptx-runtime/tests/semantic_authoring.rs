@@ -216,3 +216,46 @@ fn invalid_artwork_patch_does_not_save_partial_text_changes() {
         original
     );
 }
+
+#[test]
+fn page_reference_inherits_missing_artwork_with_editable_text_excluded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = fixture(tmp.path());
+    let mut manifest = ctx.json("source.json").unwrap();
+    let page = manifest["pages"][0].clone();
+    ctx.write_json("worker.json", &page).unwrap();
+    let reference = ctx.binding("art.png").unwrap();
+    let prep = json!({"graphics":[{"id":"figure","box":[300,100,100,70],"treatment":"crop"},
+                                  {"box":[0,0,800,450],"treatment":"native"}]});
+    let measurements = json!({"canvas":[800,450],"sourceSha256":reference["sha256"],
+        "lines":[{"id":"line","box":[320,118,12,8]},{"id":"engraving","box":[355,120,10,10]}]});
+    ctx.write_json("prep.json", &prep).unwrap();
+    ctx.write_json("measurements.json", &measurements).unwrap();
+    manifest["pages"] = json!([{"path":"worker.json","source_artwork":{
+        "preparation":"prep.json","image":reference,"measurements":"measurements.json"}}]);
+    ctx.write_json("root.json", &manifest).unwrap();
+    let req = |output| json!({"action":"build","spec":"root.json","output":output});
+    ctx.execute(req("new")).unwrap();
+    let resolved = ctx.json("new/resolved-spec.json").unwrap();
+    let layers = resolved["pages"][0]["artwork_layers"].as_array().unwrap();
+    assert_eq!(layers.len(), 1);
+    assert_eq!(
+        layers[0]["source_crop"]["exclude"],
+        json!([[320, 118, 12, 8]])
+    );
+    let doc = octos_pptx::deck::open(&ctx, &ctx.path("new/editable.pptx").unwrap()).unwrap();
+    let slide = &doc.slides[0];
+    assert_eq!(slide.shapes[1].name, "octos:artwork-layer:figure");
+    assert!(slide.shapes[2].name.starts_with("octos:text:"));
+    // A repeated build from the resolved page keeps the adopted figure only once.
+    ctx.replace_json("worker.json", &resolved["pages"][0])
+        .unwrap();
+    ctx.execute(req("repeated")).unwrap();
+    assert_eq!(ctx.json("repeated/resolved-spec.json").unwrap(), resolved);
+    // Measurements for a different reference cannot produce an editable file.
+    let mut wrong = measurements;
+    wrong["sourceSha256"] = json!("different-image");
+    ctx.replace_json("measurements.json", &wrong).unwrap();
+    assert!(ctx.execute(req("bad")).is_err());
+    assert!(!tmp.path().join("bad/editable.pptx").exists());
+}

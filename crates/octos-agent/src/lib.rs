@@ -220,7 +220,7 @@ pub use tools::{
     HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, HttpMcpAgent,
     ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool, McpAgentBackend,
     McpAgentBackendConfig, MemoryLoadTool, MemoryNoteTool, MemorySearchTool, MessageTool,
-    MofaDescribeContentTypeTool, MofaMakeTool, OccurrenceClaim, PeerCloseCallback, PeerCloseTool,
+    MofaDescribeContentTypeTool, MofaMakeTool, OccurrenceClaim, PeerCheckpointInboxTool, PeerCloseCallback, PeerCloseTool,
     PeerForkCallback, PeerForkTool, PeerGatherCallback, PeerGatherTool, PeerHandoffCallback,
     PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool, PeerListCallback, PeerListTool,
     PeerPublishCallback, PeerPublishTool, PeerReopenCallback, PeerReopenTool, PeerRespondAnswer,

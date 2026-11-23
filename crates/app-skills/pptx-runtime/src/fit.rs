@@ -505,7 +505,7 @@ fn prepare_group(spec: &crate::spec::Spec, request: &Value, value: &Value) -> Re
     })
 }
 
-fn set_size(shape: &mut deckcraft_engine::model::Shape, size: f64) {
+pub(crate) fn set_size(shape: &mut deckcraft_engine::model::Shape, size: f64) {
     if let Some(body) = &mut shape.text {
         for para in &mut body.paragraphs {
             para.def_props.size = Some(size);

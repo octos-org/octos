@@ -927,7 +927,9 @@ pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_fork::{PeerForkCallback, PeerForkTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
+mod peer_checkpoint_inbox;
 mod peer_publish;
+pub use peer_checkpoint_inbox::PeerCheckpointInboxTool;
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };

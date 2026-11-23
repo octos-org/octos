@@ -18,8 +18,42 @@ fn same_identity(a: &str, b: &str) -> bool {
     a.strip_prefix("session:").unwrap_or(a) == b.strip_prefix("session:").unwrap_or(b)
 }
 
+pub fn per_page(ctx: &Context) -> Result<bool> {
+    Ok(load_plan(ctx)?["mode"] == "per_page")
+}
+
+pub(crate) fn workspace_plan(ctx: &Context, request: &Value, owner: &str) -> Result<Value> {
+    if request.get("verification_mode").is_none()
+        && ctx.path(crate::page_gate::PLAN)?.try_exists()?
+    {
+        let roster = ctx.json(crate::page_gate::PLAN)?;
+        if roster["schema_version"] == 2
+            && roster["pages"]
+                .as_array()
+                .is_some_and(|pages| pages.len() > 1)
+        {
+            return per_page_plan(request);
+        }
+    }
+    plan(request, owner)
+}
+
+fn per_page_plan(request: &Value) -> Result<Value> {
+    ensure!(
+        request.get("reviewer_agent").is_none(),
+        "assign a separate reviewer_session to each plan page"
+    );
+    Ok(json!({"mode":"per_page","repair_gate":crate::repair_gate::VERSION,"fidelity_contract":crate::fidelity::CONTRACT}))
+}
+
 pub fn plan(request: &Value, owner: &str) -> Result<Value> {
-    match request["verification_mode"].as_str().unwrap_or("strict") {
+    let mode = match request.get("verification_mode") {
+        Some(mode) => mode
+            .as_str()
+            .context("verification_mode must be a string")?,
+        None => "strict",
+    };
+    match mode {
         "strict" => Ok(json!({"mode":"strict","fidelity_contract":crate::fidelity::CONTRACT})),
         "independent_visual" => {
             let reviewer = string(request, "reviewer_agent")?;
@@ -43,7 +77,8 @@ pub fn plan(request: &Value, owner: &str) -> Result<Value> {
                 "native_failures_overridable":false,"eligible_unknown_codes":["OWNER_UNVERIFIED","OWNER_BOUNDARY_UNVERIFIED","COMPOSITE_INK_UNVERIFIED","ARTWORK_CONTACT_UNVERIFIED"]}),
             )
         }
-        _ => anyhow::bail!("verification_mode must be strict or independent_visual"),
+        "per_page" => per_page_plan(request),
+        _ => anyhow::bail!("verification_mode must be strict, independent_visual or per_page"),
     }
 }
 pub fn permitted(ctx: &Context) -> Result<bool> {
@@ -99,10 +134,17 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
         .context("review_routes::authorized: missing required value")?
         .remove("attestation");
     ensure!(
-        receipt["schema"] == "pptx-review-attestation-v1"
-            && receipt["cycle"] == *cycle
+        receipt["cycle"] == *cycle
             && receipt["review_sha256"] == crate::fs::digest(&serde_json::to_vec(&body)?),
         "review attestation is stale or belongs to different evidence"
+    );
+    if receipt["schema"] == crate::review_merge::SCHEMA {
+        crate::review_merge::validate(ctx, policy, &body, &receipt, cycle)?;
+        return Ok(true);
+    }
+    ensure!(
+        receipt["schema"] == "pptx-review-attestation-v1",
+        "unknown review receipt schema"
     );
     let reviewer = string(&receipt, "reviewer")?;
     Ok(["reviewer_agent", "arbiter_agent"]

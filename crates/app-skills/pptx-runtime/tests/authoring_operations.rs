@@ -25,6 +25,80 @@ fn parts() -> Value {
 }
 
 #[test]
+fn batch_fits_a_native_label_without_smaller_partial_output_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = fixture(dir.path());
+    ctx.execute(json!({"action":"build","spec":"source.json","output":"original"}))
+        .unwrap();
+    let path = ctx.path("original/editable.pptx").unwrap();
+    let before = sha_file(&path).unwrap();
+    let document = octos_pptx::deck::open(&ctx, &path).unwrap();
+    let label = document.slides[0]
+        .shapes
+        .iter()
+        .find(|s| s.name == "octos:text:caption")
+        .unwrap();
+    let id = label.id.0;
+    let fit = |rect: [f64; 4]| {
+        json!({"command":"text.fitSingleLine",
+        "params":{"id":id,"box":rect,"min_pt":10}})
+    };
+    let good = fit([0., 0., 180., 50.]);
+    let bad = fit([0., 0., 2., 2.]);
+    let error = ctx
+        .execute(json!({"action":"batch","input":"original/editable.pptx",
+        "output":"partial.pptx","commands":[good.clone(),bad]}))
+        .unwrap_err();
+    assert!(error.to_string().contains("allowed minimum"));
+    assert!(!dir.path().join("partial.pptx").exists());
+    assert_eq!(before, sha_file(&path).unwrap());
+    let other = document.slides[0]
+        .shapes
+        .iter()
+        .find(|s| s.name == "octos:text:other")
+        .unwrap()
+        .id
+        .0;
+    let conflicts = ctx
+        .execute(json!({"action":"batch","input":"original/editable.pptx",
+        "output":"conflict.pptx","commands":[
+          {"command":"text.fitSingleLine","params":{"id":id,"box":[0,0,100,30],"min_pt":24}},
+          {"command":"text.fitSingleLine","params":{"id":other,"box":[0,0,100,30],"min_pt":25}}
+        ]}))
+        .unwrap_err()
+        .to_string();
+    for detail in [
+        "octos:text:caption",
+        "17 pt",
+        "24 pt",
+        "octos:text:other",
+        "20 pt",
+        "25 pt",
+    ] {
+        assert!(conflicts.contains(detail), "{conflicts}");
+    }
+    assert!(!dir.path().join("conflict.pptx").exists());
+    let result = ctx
+        .execute(json!({"action":"batch","input":"original/editable.pptx",
+        "output":"complete.pptx","commands":[good]}))
+        .unwrap();
+    assert_eq!(result["results"][0]["size_pt"], 17.);
+    let reparsed = octos_pptx::deck::open(&ctx, &ctx.path("complete.pptx").unwrap()).unwrap();
+    assert_eq!(
+        reparsed.slides[0]
+            .shapes
+            .iter()
+            .find(|s| s.id == label.id)
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .text(),
+        "Before → After"
+    );
+}
+
+#[test]
 fn split_keeps_canonical_copy_and_tracks_every_unicode_character_through_render() {
     let temp = tempfile::tempdir().unwrap();
     let ctx = fixture(temp.path());

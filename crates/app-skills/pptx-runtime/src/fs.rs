@@ -8,7 +8,44 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(crate) struct WorkspaceLock(pub(crate) std::fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // A child may have inherited the descriptor before exec.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Context {
+    fn open_lock(&self, name: &str) -> Result<std::fs::File> {
+        let path = self.path(name)?;
+        let parent = path.parent().context("missing lock directory")?;
+        fs::create_dir_all(parent)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.path(path)?)?;
+        Ok(file)
+    }
+
+    pub(crate) fn wait_for_lock(&self, name: &str) -> Result<WorkspaceLock> {
+        let file = self.open_lock(name)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(WorkspaceLock(file))
+    }
+
+    pub(crate) fn lock_file(&self, name: &str) -> Result<WorkspaceLock> {
+        let file = self.open_lock(name)?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("another writer is active; retry after its publication")?;
+        Ok(WorkspaceLock(file))
+    }
+
     pub fn path(&self, p: impl AsRef<Path>) -> Result<PathBuf> {
         let p = p.as_ref();
         let joined = if p.is_absolute() {
@@ -26,15 +63,20 @@ impl Context {
             return Ok(real);
         }
         let mut ancestor = joined.clone();
-        while !ancestor.exists() {
-            // Reject dangling symlinks too.
-            ensure!(
-                fs::symlink_metadata(&ancestor).is_err(),
-                "unresolved path is a symlink"
-            );
-            ensure!(ancestor.pop(), "path has no existing ancestor");
+        loop {
+            match fs::symlink_metadata(&ancestor) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(ancestor.pop(), "path has no existing ancestor");
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
-        let real = ancestor.canonicalize()?;
+        // A peer may have created a shared directory during the walk.
+        // Canonicalization still rejects dangling links and checks the root.
+        let real = ancestor
+            .canonicalize()
+            .context("cannot resolve workspace path or symlink")?;
         ensure!(real.starts_with(&self.root), "symlink escapes workspace");
         let suffix = joined.strip_prefix(&ancestor)?;
         ensure!(
@@ -49,7 +91,7 @@ impl Context {
         let p = self.path(p)?;
         ensure!(p.is_file(), "not a regular file: {}", p.display());
         ensure!(
-            fs::metadata(&p)?.len() <= 256 * 1024 * 1024,
+            fs::metadata(&p)?.len() <= MAX_FILE_BYTES,
             "file exceeds 256 MiB"
         );
         Ok(fs::read(p)?)
@@ -74,13 +116,14 @@ impl Context {
         self.write_new(p, &serde_json::to_vec_pretty(v)?)
     }
     pub fn replace_json(&self, p: impl AsRef<Path>, v: &Value) -> Result<()> {
+        self.replace_bytes(p, &serde_json::to_vec_pretty(v)?)
+    }
+    pub(crate) fn replace_bytes(&self, p: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
         let p = self.path(p)?;
-        let parent = p
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("missing parent"))?;
+        let parent = p.parent().context("missing parent")?;
         fs::create_dir_all(parent)?;
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        tmp.write_all(&serde_json::to_vec_pretty(v)?)?;
+        tmp.write_all(bytes)?;
         tmp.as_file().sync_all()?;
         tmp.persist(p).map_err(|e| e.error)?;
         Ok(())

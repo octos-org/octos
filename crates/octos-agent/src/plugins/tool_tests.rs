@@ -285,3 +285,48 @@ async fn plugin_model_media_survives_real_process_envelope() {
         b"\x89PNG\r\n\x1a\n"
     );
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn structured_plugin_result_is_delivered_only_in_the_bound_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("publication.sh");
+    write_test_script(
+        &script,
+        r#"#!/bin/sh
+cat >/dev/null
+printf '%s' '{"output":"original","success":true,"result":{"ready":true}}'
+"#,
+    );
+    let tool = PluginTool::new("test".into(), make_tool_def("publish", "fixture"), script)
+        .with_result_handler(|owner, request, result| {
+            assert_eq!(owner, "session:maker");
+            assert_eq!(request["action"], "page_publish");
+            result["delivered"] = json!(result["ready"] == true);
+            true
+        });
+    let request = json!({"action":"page_publish","owner":"untrusted"});
+    assert_eq!(tool.execute(&request).await.unwrap().output, "original");
+    let ctx = crate::tools::ToolContext {
+        continuation_owner: Some("session:maker".into()),
+        ..crate::tools::ToolContext::zero()
+    };
+    let outcome = crate::tools::TOOL_CTX
+        .scope(ctx.clone(), tool.execute(&request))
+        .await
+        .unwrap();
+    assert!(outcome.success);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&outcome.output).unwrap()["delivered"],
+        true
+    );
+    let rebound = tool.clone_with_work_dir(dir.path().to_owned());
+    assert_eq!(
+        crate::tools::TOOL_CTX
+            .scope(ctx, rebound.execute(&request))
+            .await
+            .unwrap()
+            .output,
+        "original"
+    );
+}

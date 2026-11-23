@@ -33,6 +33,18 @@ pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec
     read_media_no_follow_inner(Path::new(path), scope_root, || {})
 }
 
+/// Bounded read below a trusted workspace root. Relative paths and all ancestor
+/// components are checked by the same descriptor-relative walk as attachments.
+pub fn read_workspace_bytes_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>> {
+    eyre::ensure!(
+        relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_))),
+        "expected a workspace-relative file"
+    );
+    read_workspace_media(&root.join(relative), root, || {})
+}
+
 fn read_media_no_follow_inner<F: FnOnce()>(
     path: &Path,
     scope_root: Option<&Path>,

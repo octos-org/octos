@@ -635,6 +635,9 @@ pub(crate) fn measure_ink(
     )
 }
 pub fn compare(ctx: &Context, r: &Value) -> Result<Value> {
+    if r.get("regions").is_some() {
+        return crate::region_comparison::compare(ctx, r);
+    }
     if r.get("background").is_some() {
         return crate::visual_diff::compare(ctx, r);
     }
@@ -678,15 +681,66 @@ pub fn compare(ctx: &Context, r: &Value) -> Result<Value> {
         json!({"before":ctx.binding(a_path)?,"after":ctx.binding(b_path)?,"panel":ctx.binding(output)?,"changed_pixels":changed,"mean_channel_error":total as f64/(a.width()as f64*a.height()as f64*3.),"quality_approved":false,"note":"Pixel change does not establish improvement. Panel: before, after, difference."}),
     )
 }
+/// A source can have a PNG filename and a JPEG payload. Inspect the header
+/// without allocating a decoded page when only pixel dimensions are needed.
+pub(crate) fn image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    Ok(image::ImageReader::open(path)?.with_guessed_format()?.into_dimensions()?)
+}
+
 pub fn load_image(ctx: &Context, path: &Path) -> Result<image::DynamicImage> {
-    let data = ctx.read(path)?;
-    let reader = image::ImageReader::new(Cursor::new(&data)).with_guessed_format()?;
+    decode_image(&ctx.read(path)?)
+}
+
+pub(crate) fn decode_image(data: &[u8]) -> Result<image::DynamicImage> {
+    let reader = image::ImageReader::new(Cursor::new(data)).with_guessed_format()?;
     let dims = reader.into_dimensions()?;
     ensure!(
         u64::from(dims.0) * u64::from(dims.1) <= 64 * 1024 * 1024,
         "image exceeds 64 megapixels"
     );
-    Ok(image::load_from_memory(&data)?)
+    Ok(image::load_from_memory(data)?)
+}
+
+/// Produce a whole-page view for the host's 5 MiB image reader. The binding
+/// identifies the exact bytes decoded, including when the input changes later.
+pub fn review_preview(ctx: &Context, r: &Value) -> Result<Value> {
+    let source = ctx.path(string(r, "input")?)?;
+    let output = ctx.path(string(r, "output")?)?;
+    ensure!(
+        source != output && output.extension().is_some_and(|ext| ext == "png"),
+        "choose a separate PNG destination for the review view"
+    );
+    let data = ctx.read(&source)?;
+    let image = decode_image(&data)?;
+    let source_size = [image.width(), image.height()];
+    let view = if image.width().max(image.height()) > 1024 {
+        image.thumbnail(1024, 1024)
+    } else {
+        image
+    };
+    let dimensions = [view.width(), view.height()];
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(view.to_rgba8())
+        .write_to(&mut encoded, image::ImageFormat::Png)?;
+    let bytes = encoded.into_inner();
+    ensure!(
+        bytes.len() <= 5 * 1024 * 1024,
+        "review view exceeds host image limit"
+    );
+    match ctx.write_new(&output, &bytes) {
+        Ok(_) => (),
+        Err(_) if output.is_file() => ensure!(
+            ctx.read(&output)? == bytes,
+            "review view destination contains other bytes"
+        ),
+        Err(error) => return Err(error),
+    }
+    let preview = ctx.binding(&output)?;
+    Ok(
+        json!({"input":{"path":source.strip_prefix(&ctx.root)?.to_str().context("non-UTF8 source")?,
+        "sha256":crate::fs::digest(&data)}, "source_size":source_size, "preview":preview,
+        "dimensions":dimensions, "model_media":[preview["path"]], "quality_approved":false}),
+    )
 }
 pub fn save_image(
     ctx: &Context,
