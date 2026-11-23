@@ -415,6 +415,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     }
 
     let reserved = [
+        "source_line_coverage",
         "repair_gate",
         "native_text_baseline",
         "kind",
@@ -510,6 +511,8 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     validate(ctx, &plan, &mut verdict)?;
     let previous: Option<Value> = old.as_deref().map(serde_json::from_slice).transpose()?;
     crate::source_detail_review::validate(ctx, row, &candidate, previous.as_ref(), &verdict)?;
+    let lines=crate::page_source_lines::assess(ctx,&candidate,&verdict)?;
+    if lines["total"]!=0 {verdict["source_line_coverage"]=lines;}
     if crate::repair_gate::guarded(ctx)? && verdict["accepted"] == false {
         crate::repair_gate::validate(ctx, &plan, &candidate, &verdict)?;
         if disposition(&verdict).is_none()

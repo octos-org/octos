@@ -496,6 +496,7 @@ pub fn publish(ctx: &Context, request: &Value) -> Result<Value> {
             ctx, row, &candidate, head.as_ref().map(|h| &h.0),
             &mut publication["handoff"]["review_request_template"]["verdict"],
         )?;
+        crate::page_source_lines::template(ctx,&candidate,&mut publication["handoff"]["review_request_template"])?;
     }
     if !observation.is_null() { publication["repair_observation"] = observation; }
     Ok(publication)
@@ -533,6 +534,18 @@ fn review_for_candidate(
         "review is for a different candidate; review the exact current artifact, including postbuild repairs"
     );
     crate::page_verdict::verify_scores(p, &review)?;
+    if review["accepted"] == true
+        && crate::page_source_lines::check_accepted_scope(ctx, &ctx.json(ctx.verify(candidate)?)?)? > 0
+    {
+            let digest = nonempty(&binding, "sha256")?;
+            ensure!(
+                review["kind"] == crate::page_verdict::KIND
+                    && ctx
+                        .read(format!(".octos/page-verdicts/{digest}.json"))
+                        .is_ok_and(|bytes| crate::fs::digest(&bytes) == digest),
+                "source-line acceptance requires the independent peer's archived page_review_submit receipt"
+            );
+    }
     crate::assembly_evidence::validate_page_checks(ctx, &review)?;
     review["score"]
         .as_f64()
@@ -679,8 +692,8 @@ pub(crate) fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
     }
     state["candidate_current"] = json!(true);
     let result = read_review_head(ctx, p, row).and_then(|head| {
-        if p["schema_version"] == 2 && head.0["candidate_sha256"] != binding["sha256"] {
-            // This is an optimistic-concurrency token, never a score for the new candidate.
+        if p["schema_version"] == 2 && (head.0["candidate_sha256"] != binding["sha256"] || head.0["source_line_coverage"].is_object()) {
+            // Source discovery can reopen review even on the same candidate.
             state["replaces_verdict_id"] = json!(crate::page_verdict::token("verdict", &head.1)?);
         }
         review_for_candidate(ctx, p, &binding, head)
@@ -818,6 +831,7 @@ pub(crate) fn check_scope(ctx: &Context, only_page: Option<&str>) -> Result<Valu
                 ctx, row, &candidate, head.as_ref().map(|h| &h.0),
                 &mut result["review_request_template"]["verdict"],
             )?;
+            crate::page_source_lines::template(ctx,&candidate,&mut result["review_request_template"])?;
         }
         return Ok(result);
     }

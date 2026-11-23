@@ -39,6 +39,9 @@ pub fn freeze(ctx: &Context, spec: &Spec) -> Result<Vec<Value>> {
     if !page["design"].is_null() {
         relative_asset(ctx, &mut page["design"])?;
     }
+    if !page["source_ocr"].is_null() {
+        relative_asset(ctx, &mut page["source_ocr"])?;
+    }
     if let Some(layers) = page.get_mut("artwork_layers").and_then(Value::as_array_mut) {
         for layer in layers {
             relative_asset(ctx, &mut layer["image"])?;

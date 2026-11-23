@@ -1992,3 +1992,32 @@ fn missing_native_labels_stay_with_page_maker_while_shared_locks_are_held() {
     let receipt = ctx.json(ctx.verify(&fixed["page_publication"]["repair_observation"]["receipt"]).unwrap()).unwrap();
     assert_eq!(ctx.json(ctx.verify(&accepted["archive"]).unwrap()).unwrap()["artifact"]["sha256"],receipt["proposed_artifact_sha256"]);
 }
+
+#[test]
+fn per_page_verdict_requires_current_source_line_reviews_before_assembly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = fixture(dir.path());
+    edit(&ctx, "alpha.json", |p| p["design"] = json!("design.png"));
+    let hash = ctx.binding("design.png").unwrap()["sha256"].clone();
+    ctx.write_json("measurements.json",&json!({"source_sha256":hash,"canvas":[40,30],"lines":[{"id":"t07","text":"alpha","box":[1,2,10,8]}]})).unwrap();
+    let intake = json!({"action":"source_lines","page":"alpha","design":"design.png","ocr":"measurements.json"});
+    ctx.execute(intake.clone()).unwrap();
+    ctx.continuation_owner = Some("maker-alpha".into());
+    let made=ctx.execute(json!({"action":"cycle","page":"alpha","spec":"deck.json","output":"line-cycle","publish_candidate":true,"freeze_inputs":true,"width":64})).unwrap();
+    let id = made["page_publication"]["candidate_id"].clone();
+    ctx.continuation_owner = Some("reviewer".into());
+    let mut req = json!({"action":"page_review_submit","page":"alpha","candidate_id":id,"verdict":{"accepted":true,"score":96,"critical_defects":[],"open_required_findings":[],"evidence":["evidence.json"]}});
+    let err = ctx.execute(req.clone()).unwrap_err();
+    assert!(err.to_string().contains("pending source lines"), "{err:#}");
+    req["verdict"]["source_line_reviews"] = json!([{"page":"alpha","source_line_id":"t07","status":"native","observation":"Synthetic candidate carries the original label"}]);
+    ctx.execute(req).unwrap();
+    assert_eq!(gate(&ctx)["accepted_pages"], 1);
+    let mut added = intake;
+    added["additional_lines"] = json!([{"id":"manual","text":"missed","box":[17,12,5,7]}]);
+    ctx.execute(added).unwrap();
+    assert_eq!(
+        gate(&ctx)["accepted_pages"],
+        0,
+        "a newly found line invalidates the old acceptance"
+    );
+}

@@ -180,6 +180,25 @@ pub fn bound_cycle(ctx: &Context, path: &Path) -> Result<(Value, Spec)> {
             ctx.verify(design)?;
         }
     }
+    let mut tracked = false;
+    for file in spec
+        .pages
+        .iter()
+        .filter_map(|page| page.source_ocr.as_ref())
+    {
+        tracked |= ctx.json(ctx.verify(file)?)?["schema"] == "octos-source-lines-v1";
+    }
+    if tracked || v.get("source_lines").is_some() {
+        let lines = crate::source_lines::inventory(ctx, &spec)?;
+        ensure!(
+            v["source_lines"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                == lines,
+            "source line inventory differs from the bound spec"
+        );
+    }
     for kind in ["editable", "blank"] {
         let r = &v["renders"][kind];
         ensure!(r["input"] == v[kind], "render input differs from {kind}");

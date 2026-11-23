@@ -49,6 +49,7 @@ pub(crate) fn derive(
         );
         for (field, keys) in [
             ("object_reviews", &["page", "object_id"][..]),
+            ("source_line_reviews", &["page", "source_line_id"][..]),
             ("comparisons", &["page"][..]),
             ("relation_reviews", &["id"][..]),
             ("measurement_reviews", &["id"][..]),

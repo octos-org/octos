@@ -240,3 +240,5 @@ texture seams, erase glyphs automatically, or make raster text editable. Schemas
 are in the production skill's native-builder and rust-runtime references.
 
 For a deck assembled from accepted page artifacts, use the [assembled delivery review](references/assembled-delivery.md). With per-page delivery the coordinator supplies the assembly receipt and QA path to `evidence_assembled`. An explicitly requested independent whole-deck review uses the separate rendered-deck procedure.
+
+For reconstruction from an original image, use `source_lines` before making the first spec. Keep the returned source IDs on editable objects, repair by the same IDs, and complete the independent per-line review on the actual candidate. See `references/placement.md` and `references/review-lifecycle.md`.

@@ -236,7 +236,7 @@ pub fn blank(doc: &Presentation) -> Presentation {
 }
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
-    let (spec, mut sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    let (mut spec, mut sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
     ensure!(
         r["publish_candidate"] != true || (r["action"] == "cycle" && spec.pages.len() == 1),
         "publish_candidate requires a one-page cycle"
@@ -263,6 +263,7 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
         }
         sources = crate::page_snapshot::freeze(ctx, &spec)?;
     }
+    let ocr_placement=crate::ocr_placement::apply(ctx,&mut spec)?;
     let doc = from_spec(ctx, &spec)?;
     let full = out.join("editable.pptx");
     let full_bytes = file::save_bytes(&doc, "pptx")?;
@@ -293,6 +294,13 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     result["sources"] = json!(sources);
     if !missing.is_empty() {
         result["missing_editable_copy"] = json!(missing);
+    }
+    let lines = crate::source_lines::inventory(ctx, &spec)?;
+    if !lines.is_empty() {
+        result["source_lines"] = json!(lines);
+    }
+    if !ocr_placement.is_empty() {
+        result["ocr_placement"] = json!(ocr_placement);
     }
     if let Some(width) = render_width {
         result["renders"] = json!({"editable":render_to(ctx,&full_doc,&full,&out.join("rendered"),width)?,"blank":render_to(ctx,&blank_doc,&blank,&out.join("blank-rendered"),width)?});

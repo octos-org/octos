@@ -19,6 +19,7 @@ pub mod intent_evidence;
 pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
+mod ocr_placement;
 pub mod operations;
 mod page_assembly;
 mod page_assignments;
@@ -27,6 +28,7 @@ pub mod page_dispatch;
 pub mod page_gate;
 mod page_render_refresh;
 mod page_snapshot;
+mod page_source_lines;
 mod page_verdict;
 mod repair_gate;
 mod repair_commands;
@@ -34,10 +36,12 @@ mod repair_text;
 pub mod placement;
 pub mod qa;
 pub mod raster_overlap;
+mod region_comparison;
 pub mod region_layout;
 pub mod relations;
-mod region_comparison;
 mod renderer_probe;
+mod repair_gate;
+mod repair_text;
 pub mod review;
 pub mod review_merge;
 pub mod review_reuse;
@@ -45,6 +49,7 @@ pub mod review_routes;
 pub mod source_artwork;
 mod source_detail_review;
 mod source_copy_review;
+mod source_lines;
 pub mod spec;
 pub mod typography;
 pub mod visual_diff;
@@ -107,7 +112,7 @@ impl Context {
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["source_copy_review","operations","review_view","review_preview","finding_register","doctor","page_gate","page_progress","page_assignments","page_dispatch","page_publish","page_review_submit","page_repair_decide","page_assemble","assembly_review_submit","evidence_assembled","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_blocked","evidence_status"],
+                "actions":["source_lines","source_copy_review","operations","review_view","review_preview","finding_register","doctor","page_gate","page_progress","page_assignments","page_dispatch","page_publish","page_review_submit","page_repair_decide","page_assemble","assembly_review_submit","evidence_assembled","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_blocked","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
@@ -118,6 +123,7 @@ impl Context {
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),
+            "source_lines" => source_lines::intake(self,&request),
             "build" | "cycle" => deck::build(self, &request),
             "page_gate" => page_gate::check_scope(self, request.get("only_page").map(|v| v.as_str().context("only_page must name a page")).transpose()?),
             "page_progress" => page_assembly::progress::reconcile(self, &request),

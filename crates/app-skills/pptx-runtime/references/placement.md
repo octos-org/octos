@@ -1,5 +1,24 @@
 # Text reflow and obstacle-aware placement
 
+For image reconstruction, keep the original Paddle OCR line IDs, transcription, canvas
+pixel boxes and TL/TR/BR/BL polygons together throughout a repair. Match the reference
+word to the measured ink of the editable text. A chip or card can contain several labels
+with different centers.
+
+`build` and `cycle` pick up an `ocr.json` beside the page spec when its
+`source_sha256` matches the page's bound `design`. Use the page's `source_ocr`
+asset field to specify another registered file. The observation supplies `canvas`
+as a width/height pair and `lines` with `id`, `text`, `box` and an optional
+`polygon`. The runtime measures native glyphs, uses the polygon baseline when available,
+and translates misplaced single-line text to its source anchor. It keeps the authored
+wording, font size and frame dimensions. The build receipt records each correction in
+`ocr_placement`. Check the rendered result for weight, fitting and perspective.
+
+When an OCR reading is wrong, retain the verified wording. For a geometrically bad
+detection, mark that line `geometry_status: "rejected"` in a source-reviewed
+observation or provide its verified polygon and envelope. Ambiguous repeated words
+need a matching occurrence ID. Unmatched text stays with the maker.
+
 These mechanics support the existing production peer and reviewer. They do not
 generate a new design, alter copy, shrink type, or replace visual acceptance.
 
@@ -58,3 +77,13 @@ Registration is an application-level gate, not OS isolation from arbitrary shell
 writes. Protect verifier/policy files at the host when adversarial isolation is
 needed. Geometry and edge clearance still do not establish semantic ownership
 or a whole-deck visual pass. Keep unresolved reference/boundary evidence unknown.
+
+### Source line IDs across attempts
+
+Start reconstruction with `{"action":"source_lines","page":"p1","design":"assets/original.png","ocr":"inputs/lines.json"}`. The OCR input identifies the design by SHA-256, gives its coordinate canvas and contains a `lines` array. Keep detector IDs when present. Rust derives an ID from the source box when an ID is absent. IDs are local to the page and original image. Coincident anonymous boxes require distinct explicit IDs.
+
+Use `source_line_ids:["t07"]` on native text. A unique transcript or an existing matching copy/object ID can initialize the link on older specs. Repeated text needs an unambiguous ID. Patch the saved or original spec using `patch` and provide both `set.text` and `copy` for a transcript correction. A split keeps the source IDs on the original copy's fragments. A multiline frame can cite more than one line; its geometry requires visual inspection.
+
+If a reader finds text that OCR missed, call `source_lines` with the same page and design and `additional_lines:[{"text":"…","box":[x,y,width,height]}]` in the registered canvas. When starting from visual observations alone, use the original image's pixel coordinates. Inspect `source_ocr` and the returned line IDs. An omitted row stays in the inventory. A correction to the authored text keeps the original observation available for comparison. The runtime serializes additions per source page and binds each build to its own inventory snapshot.
+
+Explicit intake pins the original to this task page. A repair draft may omit the design path and recover it from intake. A different original needs its own page identity or task workspace.

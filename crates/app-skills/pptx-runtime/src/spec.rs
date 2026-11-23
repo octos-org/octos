@@ -55,6 +55,8 @@ pub struct Page {
     pub background: Value,
     #[serde(default)]
     pub design: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ocr: Option<Value>,
     pub copy: BTreeMap<String, String>,
     #[serde(default)]
     pub regions: BTreeMap<String, Value>,
@@ -96,6 +98,8 @@ pub struct Text {
     pub region: Option<String>,
     #[serde(default)]
     pub copy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_line_ids: Vec<String>,
     /// Half-open Unicode-scalar offsets in normalized authoritative copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy_range: Option<[usize; 2]>,
@@ -427,6 +431,7 @@ fn load_with_asset_scope(
             if let Some(d) = p.get_mut("design").filter(|d| !d.is_null()) {
                 asset(ctx, d, &parent).with_context(|| format!("page {page_id}: design"))?;
             }
+            crate::ocr_placement::bind(ctx,p,&parent,&mut sources)?;
             if let Some(layers) = p.get_mut("artwork_layers") {
                 for layer in layers
                     .as_array_mut()
@@ -464,6 +469,9 @@ fn load_with_asset_scope(
     if let Some(id) = page {
         spec.pages.retain(|p| p.id == id);
         ensure!(spec.pages.len() == 1, "unknown page {id}");
+    }
+    for page in &mut spec.pages {
+        if asset_page.is_none_or(|id|id==page.id) {crate::source_lines::link(ctx,page)?;}
     }
     for binding in &sources {
         ctx.verify(binding)?;
@@ -542,7 +550,7 @@ pub fn patch(ctx: &Context, r: &Value) -> Result<Value> {
         {
             if !matches!(
                 k.as_str(),
-                "box" | "rotation" | "format" | "style" | "region" | "text"
+                "box" | "rotation" | "format" | "style" | "region" | "text" | "source_line_ids"
             ) {
                 bail!("unsupported edit field {k}")
             }

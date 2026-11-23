@@ -43,7 +43,9 @@ fn per_page_plan(request: &Value) -> Result<Value> {
         request.get("reviewer_agent").is_none(),
         "assign a separate reviewer_session to each plan page"
     );
-    Ok(json!({"mode":"per_page","repair_gate":crate::repair_gate::VERSION,"fidelity_contract":crate::fidelity::CONTRACT}))
+    Ok(
+        json!({"mode":"per_page","repair_gate":crate::repair_gate::VERSION,"fidelity_contract":crate::fidelity::CONTRACT}),
+    )
 }
 
 pub fn plan(request: &Value, owner: &str) -> Result<Value> {
@@ -128,16 +130,9 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
     if plan["mode"] != "independent_visual" || !review["attestation"].is_object() {
         return Ok(false);
     }
-    let receipt = ctx.json(ctx.verify(&review["attestation"])?)?;
-    let mut body = review.clone();
-    body.as_object_mut()
-        .context("review_routes::authorized: missing required value")?
-        .remove("attestation");
-    ensure!(
-        receipt["cycle"] == *cycle
-            && receipt["review_sha256"] == crate::fs::digest(&serde_json::to_vec(&body)?),
-        "review attestation is stale or belongs to different evidence"
-    );
+    let Some((receipt, body)) = line_attestation(ctx, review, cycle)? else {
+        return Ok(false);
+    };
     if receipt["schema"] == crate::review_merge::SCHEMA {
         crate::review_merge::validate(ctx, policy, &body, &receipt, cycle)?;
         return Ok(true);
@@ -147,12 +142,56 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
         "unknown review receipt schema"
     );
     let reviewer = string(&receipt, "reviewer")?;
-    Ok(["reviewer_agent", "arbiter_agent"]
-        .iter()
-        .any(|k| plan[k].as_str().is_some_and(|r| same_identity(r, reviewer)))
-        && !policy["owner_agent"]
+    Ok(["reviewer_agent", "arbiter_agent"].iter().any(|k| {
+        plan[k]
             .as_str()
-            .is_some_and(|o| same_identity(o, reviewer)))
+            .is_some_and(|r| same_identity(r, &reviewer))
+    }) && !policy["owner_agent"]
+        .as_str()
+        .is_some_and(|o| same_identity(o, &reviewer)))
+}
+
+/// A strict job may use a distinct runtime peer without a preassigned visual arbiter.
+/// Named independent-visual routes remain restricted to their designated reviewer.
+pub(crate) fn independent_line_reviewer(
+    ctx: &Context,
+    policy: &Value,
+    review: &Value,
+    cycle: &Value,
+    authorized: bool,
+) -> Result<bool> {
+    if authorized || load_plan(ctx)?["mode"] != "strict" {
+        return Ok(authorized);
+    }
+    let Some((receipt, _)) = line_attestation(ctx, review, cycle)? else {
+        return Ok(false);
+    };
+    Ok(receipt["schema"] == "pptx-review-attestation-v1"
+        && receipt["reviewer"]
+            .as_str()
+            .zip(policy["owner_agent"].as_str())
+            .is_some_and(|(peer, owner)| !same_identity(peer, owner)))
+}
+
+fn line_attestation(
+    ctx: &Context,
+    review: &Value,
+    cycle: &Value,
+) -> Result<Option<(Value, Value)>> {
+    if !review["attestation"].is_object() {
+        return Ok(None);
+    }
+    let receipt = ctx.json(ctx.verify(&review["attestation"])?)?;
+    let mut body = review.clone();
+    body.as_object_mut()
+        .context("invalid review")?
+        .remove("attestation");
+    ensure!(
+        receipt["cycle"] == *cycle
+            && receipt["review_sha256"] == crate::fs::digest(&serde_json::to_vec(&body)?),
+        "review attestation is stale or belongs to different evidence"
+    );
+    Ok(Some((receipt, body)))
 }
 
 pub fn arbiter_authorized(
