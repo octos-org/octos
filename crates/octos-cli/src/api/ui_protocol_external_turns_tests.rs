@@ -260,6 +260,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
     let [finished, unstarted, interrupted, other] = [(); 4].map(|_| TurnId::new());
     // The ledger's session folders: a new one per session that wrote.
     let ledger_root = dir.path().join("ui-protocol");
+    let mut restart_data_dir: Option<PathBuf> = None;
     let folders = || {
         let entries = std::fs::read_dir(&ledger_root).unwrap();
         entries
@@ -294,6 +295,7 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         fx.entry.start(&chat, other.clone(), "other").await.unwrap();
         assert_eq!(fx.ended(&chat, &other).await, TurnRecord::Completed);
         unreadable_folder = folders().difference(&before).next().unwrap().clone();
+        restart_data_dir = Some(fx.profile.data_dir.clone());
     }
     let files: Vec<PathBuf> = std::fs::read_dir(&unreadable_folder)
         .unwrap()
@@ -302,6 +304,30 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
     for file in &files {
         std::fs::rename(file, file.with_extension("held")).unwrap();
         std::fs::create_dir(file).unwrap();
+    }
+
+    // The first fixture's redb handle (profiles/<p>/data/episodes.redb) is
+    // released only when the last task holding it actually ends, which can
+    // lag the scope drop on a current-thread runtime — the second serve()
+    // then panics with "Database already open" (Nightly/ARM64 flake,
+    // blocking several PRs on 2026-11-21..23). Poll the store open until the
+    // first instance's lock is really gone before serving again.
+    let restart_data_dir = restart_data_dir.expect("first fixture ran");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match octos_memory::EpisodeStore::open(&restart_data_dir).await {
+            Ok(released) => {
+                drop(released);
+                break;
+            }
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first fixture's episode store never released: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
 
     let fx = serve(dir.path(), llm.clone()).await;
