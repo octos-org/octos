@@ -16779,6 +16779,25 @@ struct RawPeerToolsRegisterParams {
     options: crate::peers::host_tools::ToolSetOptions,
 }
 
+/// The live scope of the peer session a `peer_send_input` declaration is for.
+/// A cache miss is not a filesystem answer: the sender-side check is deferred
+/// to the turn that owns the peer session.
+fn peer_send_input_scope(
+    state: &AppState,
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    peers_root: &Path,
+    identifier: &str,
+) -> Option<Arc<octos_core::SessionScope>> {
+    let slug = resolve_peer_name_to_slug(peers_root, identifier)?;
+    let target = peer_wire_registry().resolve(&peer_wire_key(&profile.profile_id, &slug))?;
+    state
+        .session_cache
+        .peek(profile, &target)?
+        .agent
+        .session_scope()
+        .cloned()
+}
+
 /// One `peer_send_input` call of the session `origin_session` (its turn
 /// `turn_id`) in profile `profile_id`: authorize it, then deliver the input.
 /// A host-owned app peer's input goes to its host connection as `peer/input`
@@ -16790,6 +16809,7 @@ fn deliver_peer_send_input(
     origin_session: &str,
     turn_id: &TurnId,
     req: octos_agent::PeerSendInputRequest,
+    input_scope: Option<std::sync::Arc<octos_core::SessionScope>>,
 ) -> Result<octos_agent::PeerSendInputDelivery, String> {
     // Resolve the identifier (peer NAME or slug) to the actual
     // slug BEFORE any auth / path / wire op — names are the
@@ -16829,10 +16849,11 @@ fn deliver_peer_send_input(
                  declared inputs cannot be delivered to it — name the files in the message"
             ));
         }
+        let key = peer_wire_key(profile_id, &slug);
         if crate::session_actor::peer_inbox_registry()
             .lock()
             .unwrap()
-            .contains_key(&peer_wire_key(profile_id, &slug))
+            .contains_key(&key)
         {
             return Err(format!(
                 "peer session '{slug}' is served by the gateway, which does not deliver \
@@ -16842,7 +16863,7 @@ fn deliver_peer_send_input(
         let dir = staged_peer_dir(peers_root, &slug).ok_or_else(|| {
             format!("peer '{slug}' no longer exists (its staged directory was removed)")
         })?;
-        crate::peers::first_inputs::check_for_message(&dir, &req.inputs)?
+        crate::peers::first_inputs::check_for_message(&dir, &req.inputs, input_scope.as_deref())?
     };
     invalidate_peer_lifetime_for_input(peers_root, &slug)
         .map_err(|error| format!("cannot persist peer input lifetime: {error}"))?;
@@ -39942,6 +39963,7 @@ async fn run_standalone_turn(
                 session_runtime.workspace_root.clone(),
                 session_id.clone(),
                 session_runtime.profile.profile_id.clone(),
+                session_runtime.agent.session_scope().cloned(),
                 // #peer-model — the configured `sub_provider` lane keys a
                 // `peer_handoff` may name; validated in the callback.
                 session_runtime
@@ -40143,12 +40165,19 @@ async fn run_standalone_turn(
                             &req.message,
                         );
                     }
+                    let input_scope = peer_send_input_scope(
+                        &team_state,
+                        &team_runtime,
+                        &send_peers_root,
+                        &req.slug,
+                    );
                     deliver_peer_send_input(
                         &send_profile_id,
                         &send_peers_root,
                         &send_origin_session,
                         &send_turn_id,
                         req,
+                        input_scope,
                     )
                 });
             let answer = peer_send_input_answer_callback(

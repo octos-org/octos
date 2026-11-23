@@ -2397,6 +2397,7 @@ pub(crate) fn stage_peer_with_budget(
         token_budget,
         host_binding,
         &[],
+        None,
     )
 }
 
@@ -2419,6 +2420,7 @@ pub(crate) fn stage_peer_with_inputs(
     token_budget: Option<u64>,
     host_binding: Option<&app_binding::PeerHostBinding>,
     inputs: &[octos_core::task_inputs::DeclaredInput],
+    session_scope: Option<std::sync::Arc<octos_core::SessionScope>>,
 ) -> Result<StagedPeer, RpcError> {
     if token_budget == Some(0) {
         return Err(RpcError::invalid_params(
@@ -2632,7 +2634,13 @@ pub(crate) fn stage_peer_with_inputs(
 
     // First-turn inputs: recorded BEFORE `brief.md` like the goal above, and
     // before the build-cache slot so a refused declaration holds none.
-    let inputs_report = match first_inputs::record_at_staging(&peer_dir, &cwd, worktree, inputs) {
+    let inputs_report = match first_inputs::record_at_staging(
+        &peer_dir,
+        &cwd,
+        worktree,
+        inputs,
+        session_scope.as_deref(),
+    ) {
         Ok(report) => report,
         Err(err) => {
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
@@ -3018,11 +3026,13 @@ pub(crate) fn resolve_peer_worktree(
 /// per-turn handoff counter enforcing [`PEER_HANDOFFS_PER_TURN_MAX`].
 /// `emit_staged` abstracts the durable notification send so tests can
 /// observe the event without a live WS connection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_peer_handoff_callback(
     peers_root: PathBuf,
     workspace_root: PathBuf,
     originating_session: SessionKey,
     profile_id: String,
+    session_scope: Option<std::sync::Arc<octos_core::SessionScope>>,
     // #peer-model — the KEYS of the profile's configured `sub_providers`
     // (model lanes). A `peer_handoff` naming a matching lane records it beside
     // the brief so the peer runs its turns on that provider; an unknown lane
@@ -3083,6 +3093,7 @@ pub(crate) fn build_peer_handoff_callback(
             request.token_budget,
             None,
             &request.inputs,
+            session_scope.clone(),
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -4544,6 +4555,7 @@ pub(crate) fn fork_staged_peer(
         token_budget,
         None,
         &inputs,
+        None,
     )
     .map_err(|err| format!("failed to stage the fork: {err:?}"))?;
     let new_slug = staged.slug;

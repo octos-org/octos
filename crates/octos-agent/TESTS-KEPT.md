@@ -203,6 +203,7 @@
 | `task_inputs::tests::should_deliver_text_data_and_an_image_whole_when_they_fit` | 5 | Text, data and an image are each delivered whole, with a digest and a manifest line; the image as frozen media. |
 | `task_inputs::tests::should_deny_a_path_the_worker_may_not_read` | 3 | A path outside the worker's filesystem authority is left out as denied and never read. |
 | `task_inputs::tests::should_hold_a_session_worker_to_its_session_scope` | 3 | A session worker's inputs are held to that session's scope, as its file tools are. |
+| `task_inputs::tests::should_not_leak_the_actual_digest_when_a_pin_mismatches` | 3 | A sha256 mismatch reports only the mismatch, never the file's actual digest prefix. |
 | `task_inputs::tests::should_leave_out_whole_optional_inputs_when_the_budget_runs_out` | 5 | Over budget, an optional input is left out whole with the reason; nothing is cut to fit. |
 | `task_inputs::tests::should_say_an_image_is_unsupported_when_the_model_takes_no_images` | 5 | An image for a model that takes none is reported unsupported, not attached. |
 | `task_inputs::tests::should_deliver_a_file_once_when_it_is_declared_twice` | 4 | A file declared twice is delivered once; the repeat is reported as a duplicate. |

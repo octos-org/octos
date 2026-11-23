@@ -488,11 +488,7 @@ fn read_candidate(
         if !expected.eq_ignore_ascii_case(&sha256) {
             return Err((
                 OmitReason::Changed,
-                format!(
-                    "declared with sha256 {}; the file now has {}",
-                    short_digest(expected),
-                    short_digest(&sha256)
-                ),
+                "the file does not match its declared sha256".to_owned(),
             ));
         }
     }
@@ -853,6 +849,25 @@ mod tests {
             resolve_declared_inputs(&[DeclaredInput::required(secret.to_string_lossy())], &host)
                 .unwrap();
         assert!(resolved.text.contains("TOP-SECRET"));
+    }
+
+    #[test]
+    fn should_not_leak_the_actual_digest_when_a_pin_mismatches() {
+        let ws = Workspace::new();
+        ws.write("notes.md", "actual content\n");
+        let actual = sha256(b"actual content\n");
+        let input = DeclaredInput {
+            sha256: Some("0".repeat(64)),
+            ..DeclaredInput::required("notes.md")
+        };
+
+        let error = resolve_declared_inputs(&[input], &ws.cx()).unwrap_err();
+        let (reason, detail) = omitted(&error.report.inputs[0]);
+
+        assert_eq!(reason, OmitReason::Changed);
+        assert_eq!(detail, "the file does not match its declared sha256");
+        assert!(!detail.contains(&actual[..12]), "{detail}");
+        assert!(!detail.contains("000000000000"), "{detail}");
     }
 
     #[test]
