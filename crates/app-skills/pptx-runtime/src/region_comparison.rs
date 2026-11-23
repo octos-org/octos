@@ -61,10 +61,10 @@ pub(crate) fn compare(ctx: &Context, request: &Value) -> Result<Value> {
         let mut before_sum = [0_u64; 3];
         let mut after_sum = [0_u64; 3];
         let mut abs_sum = [0_u64; 3];
-        for iy in y..y + h {
-            for ix in x..x + w {
-                let a = before.get_pixel(ix, iy);
-                let b = after.get_pixel(ix, iy);
+        for pixel_y in y..y + h {
+            for pixel_x in x..x + w {
+                let a = before.get_pixel(pixel_x, pixel_y);
+                let b = after.get_pixel(pixel_x, pixel_y);
                 for c in 0..3 {
                     before_sum[c] += u64::from(a[c]);
                     after_sum[c] += u64::from(b[c]);
