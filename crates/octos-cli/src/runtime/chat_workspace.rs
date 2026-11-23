@@ -955,7 +955,21 @@ mod server_root_tests {
             // normalized by the server-root filesystem.
             let sessions = new_profile.join("sessions");
             std::fs::create_dir_all(&sessions).unwrap();
-            std::os::unix::fs::symlink(&sessions, new_profile.join("SESSIONS")).unwrap();
+            // #3326 (macOS APFS, BH3GEI 11-23): the SIMULATION is only needed
+            // on a case-SENSITIVE filesystem. On a case-folding filesystem
+            // `sessions` and `SESSIONS` already name the same directory entry,
+            // so symlink(SESSIONS -> sessions) fails EEXIST. Probe the host FS
+            // once (write a lower-case file, read it back by its upper-case
+            // name); when it already folds case, skip the symlink — the FS is
+            // the case-fold, and folds_case()/lookup() assertions below run
+            // exactly as on a case-sensitive host.
+            let probe = new_profile.join(".octos-casefold-probe");
+            std::fs::write(&probe, b"probe").unwrap();
+            let fs_folds_case = new_profile.join(".OCTOS-CASEFOLD-PROBE").exists();
+            std::fs::remove_file(&probe).ok();
+            if !fs_folds_case {
+                std::os::unix::fs::symlink(&sessions, new_profile.join("SESSIONS")).unwrap();
+            }
             assert!(folds_case(&new_profile));
             let variant = SessionKey::with_profile("new", "api", "LATE-CHAT");
             let error = lookup(&new_profile, &variant).expect_err("case variant is not the chat");
