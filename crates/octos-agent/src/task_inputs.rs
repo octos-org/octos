@@ -23,6 +23,12 @@
 //!   ([`octos_llm::vision::snapshot_image_bytes`]), so a retry, or a later
 //!   request that replays the message, sends the same pixels even if the file
 //!   has changed since.
+//! - **A delivered image stays delivered, or the report says otherwise.** A
+//!   provider that would send a request again without its images, because the
+//!   endpoint refused them, fails the request instead when one of them is a
+//!   required input, and records an optional one it drops
+//!   ([`octos_llm::vision::snapshot_input_image_bytes`]);
+//!   [`mark_dropped_images`] then corrects the report.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -222,6 +228,36 @@ pub fn check_declared_inputs(
     }
 }
 
+/// Correct `report` for the delivered images a request went out without: an
+/// endpoint refused image parts, and the provider sent the request again
+/// text-only. `media` is the delivered images' snapshots, in the order the
+/// report delivers them ([`ResolvedInputs::media`]). Returns the paths of the
+/// inputs it corrected; ask once the requests that carry them have been made.
+pub fn mark_dropped_images(report: &mut InputReport, media: &[String]) -> Vec<String> {
+    let delivered_images = report.inputs.iter_mut().filter(|record| {
+        matches!(
+            record.outcome,
+            InputOutcome::Delivered {
+                form: InputForm::Image,
+                ..
+            }
+        )
+    });
+    let mut dropped = Vec::new();
+    for (record, snapshot) in delivered_images.zip(media) {
+        if vision::take_input_image_dropped(snapshot) {
+            record.outcome = InputOutcome::Omitted {
+                reason: OmitReason::Unsupported,
+                detail: "the endpoint refused image input, and the request was sent again \
+                         without this image"
+                    .into(),
+            };
+            dropped.push(record.path.clone());
+        }
+    }
+    dropped
+}
+
 fn resolve(
     inputs: &[DeclaredInput],
     cx: &InputContext<'_>,
@@ -336,7 +372,7 @@ fn resolve(
         if !freeze_images {
             continue;
         }
-        match vision::snapshot_image_bytes(&candidate.bytes) {
+        match vision::snapshot_input_image_bytes(&candidate.bytes, slot.required) {
             Ok(snapshot) => {
                 media.push(snapshot.to_string_lossy().into_owned());
                 candidate.image_number = media.len();
@@ -664,12 +700,18 @@ fn render(slots: &[Slot], report: &InputReport) -> String {
         let number = index + 1;
         match (&slot.state, &record.outcome) {
             (State::Candidate(candidate), InputOutcome::Delivered { bytes, sha256, .. }) => {
+                // An image's line uses the words a provider replaces when a
+                // request has to go out without the image.
                 let how = match candidate.form {
-                    InputForm::Image => format!("as attached image {}", candidate.image_number),
-                    form => format!("below as {}", form.as_str()),
+                    InputForm::Image => format!(
+                        "{} {}",
+                        vision::INPUT_IMAGE_DELIVERED,
+                        candidate.image_number
+                    ),
+                    form => format!("delivered below as {}", form.as_str()),
                 };
                 out.push_str(&format!(
-                    "{number}. `{}` — delivered {how} ({bytes} bytes, sha256 {})\n",
+                    "{number}. `{}` — {how} ({bytes} bytes, sha256 {})\n",
                     slot.path,
                     short_digest(sha256),
                 ));

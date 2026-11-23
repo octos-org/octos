@@ -150,3 +150,4 @@ T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同
 | `first_inputs_tests::should_send_no_request_when_required_inputs_exceed_the_models_context` | 5 | Required inputs over the model's input budget are not truncated; the task terminates as over budget, with no request. |
 | `first_inputs_tests::should_say_in_the_first_request_which_optional_inputs_were_left_out` | 5 | Optional inputs that were left out are named with their reasons in the first request, and the task runs. |
 | `first_inputs_tests::should_never_call_an_image_too_large_for_a_model_request_delivered` | 5 | An image over the request limit is reported unsupported and is not attached. |
+| `first_inputs_tests::should_fail_a_task_whose_required_image_the_endpoint_refuses_instead_of_running_it_blind` | 1 | Against an endpoint that refuses image parts: a task with a required image makes one request and terminates with the reason; with the image optional the request goes again without it and the task runs. |

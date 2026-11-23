@@ -113,11 +113,27 @@ fn has(body: &Value, need: &Need) -> bool {
 /// Start the model. It asks for whatever it still needs, all at once (the
 /// best a model without the files can do), and answers when it has it all.
 async fn model_needing(needs: Vec<Need>) -> MockServer {
+    model(needs, true).await
+}
+
+/// The model behind an endpoint that takes no image parts: a request with one
+/// is refused, the way a text-only proxy in front of a vision model refuses
+/// it. Any other request is answered.
+async fn model_refusing_images() -> MockServer {
+    model(Vec::new(), false).await
+}
+
+async fn model(needs: Vec<Need>, takes_images: bool) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(move |request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if !takes_images && !request_images(&body).is_empty() {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": { "message": "This model does not support image input" },
+                }));
+            }
             let missing: Vec<&Need> = needs.iter().filter(|need| !has(&body, need)).collect();
             let streaming = body["stream"] == true;
             let (message, finish) = if missing.is_empty() {
@@ -577,5 +593,69 @@ async fn should_never_call_an_image_too_large_for_a_model_request_delivered() {
     assert!(
         reason.contains("`renders/original.png` (unsupported"),
         "{reason}"
+    );
+}
+
+#[tokio::test]
+async fn should_fail_a_task_whose_required_image_the_endpoint_refuses_instead_of_running_it_blind()
+{
+    let page_task = |input| TaskSpec {
+        title: "Review slide 3 against its render".into(),
+        detail: "Say what is wrong in the render `renders/page-03.png`.".into(),
+        inputs: vec![input],
+        ..task_spec("a", &[], vec![])
+    };
+    let work = TempDir::new().unwrap();
+    write(work.path(), "renders/page-03.png", PAGE_IMAGE);
+
+    // Required: the refused request is the only one. It is not sent again
+    // without the image, and the task does not pass.
+    let server = model_refusing_images().await;
+    let required = run(
+        page_task(DeclaredInput::required("renders/page-03.png")),
+        &work,
+        provider_at(&server),
+        &server,
+    )
+    .await;
+    assert_eq!(required.requests.len(), 1, "{:#?}", required.requests);
+    assert_eq!(request_images(&required.requests[0]).len(), 1);
+    let reason = terminated_reason(&required.outcome);
+    assert!(
+        reason.contains("required image not delivered: the endpoint refuses image input"),
+        "{reason}"
+    );
+
+    // Optional: the request goes again without the image, and the task runs.
+    let server = model_refusing_images().await;
+    let optional = run(
+        page_task(DeclaredInput::optional("renders/page-03.png")),
+        &work,
+        provider_at(&server),
+        &server,
+    )
+    .await;
+    assert_eq!(optional.requests.len(), 2, "{:#?}", optional.requests);
+    assert!(request_images(&optional.requests[1]).is_empty());
+    // What that request tells the model matches what it carries.
+    let (first, again) = (
+        request_text(&optional.requests[0]),
+        request_text(&optional.requests[1]),
+    );
+    assert!(first.contains("— delivered as attached image 1"), "{first}");
+    assert!(
+        again.contains("— NOT delivered (unsupported): the endpoint refuses image input"),
+        "{again}"
+    );
+    assert!(!again.contains("delivered as attached image"), "{again}");
+    assert!(
+        matches!(
+            optional.outcome,
+            AttemptOutcome::Completed {
+                verdict: AcceptanceVerdict::Accepted { .. }
+            }
+        ),
+        "{:?}",
+        optional.outcome
     );
 }

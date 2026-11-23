@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use octos_agent::policy::FilesystemScope;
 use octos_agent::task_inputs::{
-    InputAuthority, InputContext, check_declared_inputs, input_budget_tokens,
+    InputAuthority, InputContext, check_declared_inputs, input_budget_tokens, mark_dropped_images,
     resolve_declared_inputs,
 };
 use octos_core::task_inputs::{
@@ -325,15 +325,15 @@ pub(crate) async fn attach_to_message(
         )
     })
     .await;
-    let (delivered, report) = match resolved {
+    let (delivered, report, images) = match resolved {
         Ok(Ok(resolved)) => {
             resolved.attach_to(message);
-            (true, resolved.report)
+            (true, resolved.report, resolved.media)
         }
         Ok(Err(err)) => {
             message.content.push_str("\n\n");
             message.content.push_str(&err.notice());
-            (false, err.report)
+            (false, err.report, Vec::new())
         }
         Err(error) => {
             warn!(peer = slug, %error, "reading peer inputs failed; none delivered");
@@ -358,13 +358,46 @@ pub(crate) async fn attach_to_message(
             report.summary()
         );
     }
+    // `images` are the delivered images' snapshots, kept so the record can be
+    // corrected if the turn's requests go out without them after all.
     let record = serde_json::json!({
         "turn_id": turn_id,
         "delivered": delivered,
         "report": report,
+        "images": images,
     });
     if let Err(error) = peer_io::append_peer_line(&peer_dir, REPORT_LEAF, &format!("{record}\n")) {
         warn!(peer = slug, %error, "failed to record the peer's input report");
+    }
+}
+
+/// Correct the record of `turn_id`'s inputs when the turn's requests went out
+/// without some of its delivered images: the endpoint refused image parts and
+/// the provider sent the request again text-only. The corrected report is
+/// appended as a further line. Called when a peer's turn ends.
+pub(crate) fn record_dropped_images(peer_dir: &Path, turn_id: &str) {
+    let last = peer_io::read_peer_file(peer_dir, REPORT_LEAF, peer_io::PEER_FILE_READ_CAP_LARGE)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body.lines().last()?).ok());
+    let Some(mut record) = last.filter(|record| record["turn_id"] == turn_id) else {
+        return;
+    };
+    let images: Vec<String> = serde_json::from_value(record["images"].take()).unwrap_or_default();
+    let Ok(mut report) = serde_json::from_value::<InputReport>(record["report"].take()) else {
+        return;
+    };
+    let dropped = mark_dropped_images(&mut report, &images);
+    if dropped.is_empty() {
+        return;
+    }
+    warn!(
+        turn = turn_id,
+        ?dropped,
+        "the endpoint refused image input; the peer's requests went out without these inputs"
+    );
+    record["report"] = serde_json::json!(report);
+    record["images_dropped"] = serde_json::json!(dropped);
+    if let Err(error) = peer_io::append_peer_line(peer_dir, REPORT_LEAF, &format!("{record}\n")) {
+        warn!(turn = turn_id, %error, "failed to correct the peer's input report");
     }
 }
 

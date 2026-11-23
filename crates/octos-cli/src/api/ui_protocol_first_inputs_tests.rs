@@ -926,3 +926,74 @@ async fn should_refuse_a_message_whose_required_input_is_missing_and_tell_the_pe
         Some(OmitReason::Missing)
     );
 }
+
+/// From here on the endpoint behind `server` takes no image parts: a request
+/// with one is refused, as a text-only proxy in front of a vision model does.
+async fn refusing_images(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("\"image_url\""))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": { "message": "This model does not support image input" },
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_fail_a_peers_turn_for_a_refused_required_image_and_correct_the_report_for_an_optional_one()
+ {
+    let fx = fixture(Vec::new(), None).await;
+    page_workspace(&fx);
+    refusing_images(&fx.server).await;
+    let peers = fx.data_dir.join("peers");
+
+    // Required: the refused request is the only one, and the turn fails with
+    // the reason instead of running without the image.
+    let (result, blind) = hand_off(&fx, "Page Blind", Some(json!(["renders/page-03.png"]))).await;
+    assert!(result.success, "{}", result.output);
+    let blind = blind.unwrap();
+    peer_turn(&fx, &blind, BRIEF).await;
+    assert_eq!(sent(&fx.server).await.len(), 1);
+    let said = std::fs::read_to_string(peers.join(&blind.slug).join("result.md")).unwrap();
+    assert!(
+        said.contains("outcome: errored")
+            && said.contains("required image not delivered: the endpoint refuses image input"),
+        "{said}"
+    );
+
+    // Optional: the request goes again without it, and the report that called
+    // the image delivered is corrected.
+    let (result, degraded) = hand_off(
+        &fx,
+        "Page Degraded",
+        Some(json!([
+            "pages/page-03.json",
+            { "path": "renders/page-03.png", "required": false },
+        ])),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    let degraded = degraded.unwrap();
+    peer_turn(&fx, &degraded, BRIEF).await;
+    let requests = sent(&fx.server).await;
+    assert_eq!(requests.len(), 3, "{requests:#?}");
+    assert!(request_images(&requests[2]).is_empty());
+    let text = request_text(&requests[2]);
+    assert!(text.contains(PAGE_DATA));
+    // What that request tells the model matches what it carries.
+    assert!(
+        text.contains("`renders/page-03.png` — NOT delivered (unsupported): the endpoint refuses"),
+        "{text}"
+    );
+    assert!(!text.contains("delivered as attached image"), "{text}");
+    assert!(!text.contains("user-uploaded files"), "{text}");
+    let records = crate::peers::first_inputs::delivery_records(&peers, &degraded.slug);
+    assert_eq!(records.len(), 2, "as sent, then as it went out");
+    assert_eq!(omit_reason(&records[0].1, "renders/page-03.png"), None);
+    assert_eq!(
+        omit_reason(&records[1].1, "renders/page-03.png"),
+        Some(OmitReason::Unsupported)
+    );
+}

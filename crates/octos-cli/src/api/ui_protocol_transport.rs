@@ -18278,6 +18278,10 @@ fn write_peer_result_if_peer_session(
     let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
         return;
     };
+    // UPCR-2026-RBC0874AA — the turn's requests are made: if the endpoint
+    // refused image parts and they went out without an optional declared
+    // image, the report that called it delivered is corrected.
+    crate::peers::first_inputs::record_dropped_images(&peer_dir, &turn_id.0.to_string());
     if let Err(error) = charge_peer_token_budget(
         &runtime.data_dir.join("peers"),
         slug,

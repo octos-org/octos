@@ -632,6 +632,29 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 }
 
 const SNAPSHOT_PREFIX: &str = "octos-image-snapshot-";
+/// Directory prefix of the snapshot of a declared task input image
+/// ([`snapshot_input_image_bytes`]). It extends [`SNAPSHOT_PREFIX`], so every
+/// rule for snapshots holds for these too.
+const INPUT_SNAPSHOT_PREFIX: &str = "octos-image-snapshot-input-";
+/// The same, for an input its task requires.
+const REQUIRED_INPUT_SNAPSHOT_PREFIX: &str = "octos-image-snapshot-input-required-";
+
+/// How a message says a declared input image is in it; the attachment's
+/// number follows. The task-input manifest uses these words, so that a
+/// request that goes out without the image can say so in their place
+/// ([`INPUT_IMAGE_WITHHELD`]) instead of telling the model it has an image it
+/// has not.
+pub const INPUT_IMAGE_DELIVERED: &str = "delivered as attached image";
+/// What [`INPUT_IMAGE_DELIVERED`] becomes in a request without the image.
+pub const INPUT_IMAGE_WITHHELD: &str = "NOT delivered (unsupported): the endpoint refuses image \
+    input, so this request is without attached image";
+
+/// Declared input images that a request went out without, until their task's
+/// owner asks ([`take_input_image_dropped`]). Bounded: an owner that never
+/// asks costs the oldest entries, not memory.
+static DROPPED_INPUT_IMAGES: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const DROPPED_INPUT_IMAGES_KEPT: usize = 1024;
 
 /// Freeze already-authorized media before the tool result enters history.
 /// Private, read-only copies survive process restart; the original path is
@@ -646,6 +669,66 @@ pub fn snapshot_image(path: &str, scope_root: Option<&Path>) -> Result<std::path
 }
 
 pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
+    snapshot_bytes_under(bytes, SNAPSHOT_PREFIX)
+}
+
+/// Freeze a declared task input image. What becomes of such an image is
+/// reported to its task's owner, so a provider that answers an endpoint's
+/// refusal of image parts by sending the request again without them
+///
+/// - fails the request instead when it carries a `required` one
+///   ([`is_required_input_snapshot`]): a model never does a task without an
+///   image the task requires;
+/// - records an optional one as dropped ([`note_input_image_dropped`]), so the
+///   report that called it delivered can be corrected.
+pub fn snapshot_input_image_bytes(bytes: &[u8], required: bool) -> Result<std::path::PathBuf> {
+    let prefix = if required {
+        REQUIRED_INPUT_SNAPSHOT_PREFIX
+    } else {
+        INPUT_SNAPSHOT_PREFIX
+    };
+    snapshot_bytes_under(bytes, prefix)
+}
+
+/// Whether `path` is the snapshot of a declared input image.
+pub fn is_input_snapshot(path: &str) -> bool {
+    in_snapshot_dir(path, INPUT_SNAPSHOT_PREFIX)
+}
+
+/// Whether `path` is the snapshot of a declared input image its task requires.
+pub fn is_required_input_snapshot(path: &str) -> bool {
+    in_snapshot_dir(path, REQUIRED_INPUT_SNAPSHOT_PREFIX)
+}
+
+/// Record that a request went out without the declared input image at `path`.
+/// Any other path is not recorded.
+pub fn note_input_image_dropped(path: &str) {
+    if !is_input_snapshot(path) {
+        return;
+    }
+    let mut dropped = DROPPED_INPUT_IMAGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if dropped.iter().any(|known| known == path) {
+        return;
+    }
+    if dropped.len() == DROPPED_INPUT_IMAGES_KEPT {
+        dropped.pop_front();
+    }
+    dropped.push_back(path.to_owned());
+}
+
+/// Whether a request went out without the declared input image at `path`
+/// since this was last asked of it.
+pub fn take_input_image_dropped(path: &str) -> bool {
+    let mut dropped = DROPPED_INPUT_IMAGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let found = dropped.iter().position(|known| known == path);
+    found.is_some_and(|index| dropped.remove(index).is_some())
+}
+
+fn snapshot_bytes_under(bytes: &[u8], prefix: &str) -> Result<std::path::PathBuf> {
     use std::io::Write;
     eyre::ensure!(
         bytes.len() as u64 <= MAX_MEDIA_BYTES,
@@ -676,9 +759,7 @@ pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
         !std::fs::symlink_metadata(&root)?.file_type().is_symlink(),
         "media snapshot directory must not be a symlink"
     );
-    let directory = tempfile::Builder::new()
-        .prefix(SNAPSHOT_PREFIX)
-        .tempdir_in(root)?;
+    let directory = tempfile::Builder::new().prefix(prefix).tempdir_in(root)?;
     let path = directory
         .path()
         .join(format!("{:x}.{extension}", Sha256::digest(bytes)));
@@ -696,10 +777,14 @@ pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
 }
 
 fn is_snapshot(path: &str) -> bool {
+    in_snapshot_dir(path, SNAPSHOT_PREFIX)
+}
+
+fn in_snapshot_dir(path: &str, prefix: &str) -> bool {
     Path::new(path)
         .parent()
         .and_then(Path::file_name)
-        .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX))
+        .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
 }
 
 /// Snapshots have a content digest as their filename but private, random parent

@@ -40,6 +40,19 @@ reason instead, and the turn still runs, because a peer reports back only by
 running. The decision is also recorded in `peers/<slug>/inputs-report.jsonl`,
 one line per turn that was due inputs.
 
+A delivered image stays delivered, or the report says otherwise. When an
+endpoint refuses image parts, the OpenAI-compatible provider sends a request
+again without its images so the turn can go on. A request that carries a
+required input image is not sent again without it: it fails with the refusal,
+and the peer's turn ends errored with that reason, so a peer never does its task
+without an image its task requires. An optional input image is dropped by that
+retry like any other, and the request that goes out without it says so: the
+manifest line that called the image delivered reads `NOT delivered
+(unsupported)` in that request, while the committed message is left as it was.
+When the turn ends, a further line in `inputs-report.jsonl` repeats the turn's
+report with that image as left out (unsupported) and names it under
+`images_dropped`.
+
 Because the inputs are part of the committed first message, later turns replay
 them from the transcript as they were first read, and are not given them again.
 
