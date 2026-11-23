@@ -73,6 +73,13 @@ async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
     }
 }
 
+/// A serve process over a directory of its own, and its model.
+async fn served() -> (tempfile::TempDir, Fixture, Arc<ScriptedLlm>) {
+    let (dir, llm) = (tempfile::tempdir().unwrap(), scripted());
+    let fx = serve(dir.path(), llm.clone()).await;
+    (dir, fx, llm)
+}
+
 /// `serve` again over `dir`, as after a restart. A new process finds the
 /// episode store closed. In this process the last serve's turn tasks can
 /// still hold it for a moment after their turns ended, and nothing signals
@@ -112,6 +119,30 @@ impl Fixture {
         panic!("turn {} did not end", turn_id.0);
     }
 
+    /// Start `text` as `turn_id` in `chat`, which must not be refused.
+    async fn run(&self, chat: &BoundChat, turn_id: &TurnId, text: &str) -> Started {
+        self.entry.start(chat, turn_id.clone(), text).await.unwrap()
+    }
+
+    /// Start `text` as `turn` in session `id` on `ws`, as a client's
+    /// `turn/start` does.
+    async fn socket_start(&self, ws: &WsConnection, id: &SessionKey, turn: &TurnId, text: &str) {
+        handle_turn_start(
+            ws,
+            &self.state,
+            &self.ledger,
+            &self.contracts,
+            &active_turns_registry(),
+            &Arc::default(),
+            Some(CHAT_PROFILE),
+            None,
+            ConnectionUiFeatures::default(),
+            "start".into(),
+            turn_start_params(id, turn, text),
+        )
+        .await;
+    }
+
     /// The turn's durable rows: each method, and an envelope's payload type
     /// and text.
     fn rows(&self, chat: &BoundChat, turn_id: &TurnId) -> Vec<String> {
@@ -131,8 +162,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn only_an_existing_chat_of_a_served_profile_can_be_bound() {
-    let dir = tempfile::tempdir().unwrap();
-    let fx = serve(dir.path(), scripted()).await;
+    let (_dir, fx, _) = served().await;
     let error = BoundProfile::verify(&fx.state, "nobody").await.unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "profile_unresolved");
 
@@ -184,9 +214,7 @@ async fn only_an_existing_chat_of_a_served_profile_can_be_bound() {
 
 #[tokio::test]
 async fn a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let llm = scripted();
-    let fx = serve(dir.path(), llm.clone()).await;
+    let (_dir, fx, llm) = served().await;
     let (by_socket, by_entry) = (
         fx.chat(&unique("socket")).await,
         fx.chat(&unique("entry")).await,
@@ -195,22 +223,9 @@ async fn a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_wri
 
     let (ws, _frames) = ws_connection_for_test(1024);
     ws.set_external(true);
-    handle_turn_start(
-        &ws,
-        &fx.state,
-        &fx.ledger,
-        &fx.contracts,
-        &active_turns_registry(),
-        &Arc::default(),
-        Some(CHAT_PROFILE),
-        None,
-        ConnectionUiFeatures::default(),
-        "start".into(),
-        turn_start_params(by_socket.session_id(), &socket_turn, "hello"),
-    )
-    .await;
-    let started = fx.entry.start(&by_entry, entry_turn.clone(), "hello").await;
-    assert_eq!(started.unwrap(), Started::Now);
+    fx.socket_start(&ws, by_socket.session_id(), &socket_turn, "hello")
+        .await;
+    assert_eq!(fx.run(&by_entry, &entry_turn, "hello").await, Started::Now);
 
     assert_eq!(
         fx.ended(&by_socket, &socket_turn).await,
@@ -240,26 +255,18 @@ async fn a_turn_on_the_ledger_connection_writes_what_an_external_socket_turn_wri
 
 #[tokio::test]
 async fn a_turn_id_runs_once_and_only_in_its_own_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let llm = scripted();
-    let fx = serve(dir.path(), llm.clone()).await;
+    let (_dir, fx, llm) = served().await;
     let (chat, other) = (
         fx.chat(&unique("once")).await,
         fx.chat(&unique("other")).await,
     );
     let turn = TurnId::new();
-    let start = || fx.entry.start(&chat, turn.clone(), "hold once");
-    assert_eq!(start().await.unwrap(), Started::Now);
-    assert_eq!(
-        start().await.unwrap(),
-        Started::Already(TurnRecord::Running)
-    );
+    let start = || fx.run(&chat, &turn, "hold once");
+    assert_eq!(start().await, Started::Now);
+    assert_eq!(start().await, Started::Already(TurnRecord::Running));
     llm.release.add_permits(1);
     assert_eq!(fx.ended(&chat, &turn).await, TurnRecord::Completed);
-    assert_eq!(
-        start().await.unwrap(),
-        Started::Already(TurnRecord::Completed)
-    );
+    assert_eq!(start().await, Started::Already(TurnRecord::Completed));
     assert_eq!(*llm.prompts.lock().unwrap(), ["hold once"]);
     // The same id is no turn of another chat.
     assert_eq!(
@@ -270,8 +277,7 @@ async fn a_turn_id_runs_once_and_only_in_its_own_chat() {
 
 #[tokio::test]
 async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let llm = scripted();
+    let (dir, fx, llm) = served().await;
     let (key, unreadable) = (unique("restart"), unique("unreadable"));
     let [finished, unstarted, interrupted, other] = [(); 4].map(|_| TurnId::new());
     // The ledger's session folders: a new one per session that wrote.
@@ -282,35 +288,30 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
             .map(|entry| entry.unwrap().path())
             .collect::<HashSet<_>>()
     };
-    let unreadable_folder;
-    {
-        let fx = serve(dir.path(), llm.clone()).await;
-        let chat = fx.chat(&key).await;
-        fx.entry
-            .start(&chat, finished.clone(), "before")
-            .await
-            .unwrap();
-        assert_eq!(fx.ended(&chat, &finished).await, TurnRecord::Completed);
-        // Recorded, then the server stopped before admitting it.
-        record_dispatch(&fx.profile.data_dir, &key, &unstarted).unwrap();
-        // Recorded and started, then the server stopped mid-turn.
-        record_dispatch(&fx.profile.data_dir, &key, &interrupted).unwrap();
-        let started = octos_core::ui_protocol::TurnStartedEvent {
-            session_id: key.clone(),
-            turn_id: interrupted.clone(),
-            timestamp: chrono::Utc::now(),
-            topic: None,
-        };
-        fx.ledger
-            .try_append_notification(UiNotification::TurnStarted(started))
-            .unwrap();
-        // Ended in another chat, whose ledger cannot be read after the restart.
-        let before = folders();
-        let chat = fx.chat(&unreadable).await;
-        fx.entry.start(&chat, other.clone(), "other").await.unwrap();
-        assert_eq!(fx.ended(&chat, &other).await, TurnRecord::Completed);
-        unreadable_folder = folders().difference(&before).next().unwrap().clone();
-    }
+    let chat = fx.chat(&key).await;
+    fx.run(&chat, &finished, "before").await;
+    assert_eq!(fx.ended(&chat, &finished).await, TurnRecord::Completed);
+    // Recorded, then the server stopped before admitting it.
+    record_dispatch(&fx.profile.data_dir, &key, &unstarted).unwrap();
+    // Recorded and started, then the server stopped mid-turn.
+    record_dispatch(&fx.profile.data_dir, &key, &interrupted).unwrap();
+    let started = octos_core::ui_protocol::TurnStartedEvent {
+        session_id: key.clone(),
+        turn_id: interrupted.clone(),
+        timestamp: chrono::Utc::now(),
+        topic: None,
+    };
+    fx.ledger
+        .try_append_notification(UiNotification::TurnStarted(started))
+        .unwrap();
+    // Ended in another chat, whose ledger cannot be read after the restart.
+    let before = folders();
+    let chat = fx.chat(&unreadable).await;
+    fx.run(&chat, &other, "other").await;
+    assert_eq!(fx.ended(&chat, &other).await, TurnRecord::Completed);
+    let unreadable_folder = folders().difference(&before).next().unwrap().clone();
+    // The server stops.
+    drop(fx);
     let files: Vec<PathBuf> = std::fs::read_dir(&unreadable_folder)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -365,12 +366,10 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
         [(unstarted.clone(), Some(TurnRecord::NotStarted))]
     );
     let chat = BoundChat::verify(fx.profile.clone(), key.clone()).unwrap();
-    let start =
-        async |turn: &TurnId, text| fx.entry.start(&chat, turn.clone(), text).await.unwrap();
-    assert_eq!(start(&unstarted, "after").await, Started::Now);
+    assert_eq!(fx.run(&chat, &unstarted, "after").await, Started::Now);
     assert_eq!(fx.ended(&chat, &unstarted).await, TurnRecord::Completed);
     assert_eq!(
-        start(&interrupted, "again").await,
+        fx.run(&chat, &interrupted, "again").await,
         Started::Already(TurnRecord::Orphaned)
     );
     assert_eq!(*llm.prompts.lock().unwrap(), ["before", "other", "after"]);
@@ -378,16 +377,13 @@ async fn after_a_restart_each_recorded_turn_is_settled_by_its_exact_id() {
 
 #[tokio::test]
 async fn the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope() {
-    let dir = tempfile::tempdir().unwrap();
-    let llm = scripted();
-    let fx = serve(dir.path(), llm.clone()).await;
+    let (_dir, fx, llm) = served().await;
     let chat = fx.chat(&unique("own")).await;
     let session = chat.session_id().clone();
 
     let (ws, _frames) = ws_connection_for_test(1024);
-    let raise =
-        |connection| g1_raise_approval(connection, &fx.ledger, &fx.contracts, &fx.state, &session);
-    let (theirs_task, theirs) = raise(&ws).await;
+    let (theirs_task, theirs) =
+        g1_raise_approval(&ws, &fx.ledger, &fx.contracts, &fx.state, &session).await;
     let (ours_task, ours) = g1_raise_approval(
         &fx.entry.connection,
         &fx.ledger,
@@ -424,20 +420,8 @@ async fn the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope() {
 
     // A turn the socket started is not this entry's to stop.
     let socket_turn = TurnId::new();
-    handle_turn_start(
-        &ws,
-        &fx.state,
-        &fx.ledger,
-        &fx.contracts,
-        &active_turns_registry(),
-        &Arc::default(),
-        Some(CHAT_PROFILE),
-        None,
-        ConnectionUiFeatures::default(),
-        "start".into(),
-        turn_start_params(&session, &socket_turn, "hold theirs"),
-    )
-    .await;
+    fx.socket_start(&ws, &session, &socket_turn, "hold theirs")
+        .await;
     assert!(
         fx.entry
             .interrupt(&chat, socket_turn.clone())
@@ -448,10 +432,7 @@ async fn the_entry_answers_and_stops_only_its_own_turns_and_records_no_scope() {
     assert_eq!(fx.ended(&chat, &socket_turn).await, TurnRecord::Completed);
 
     let own_turn = TurnId::new();
-    fx.entry
-        .start(&chat, own_turn.clone(), "hold ours")
-        .await
-        .unwrap();
+    fx.run(&chat, &own_turn, "hold ours").await;
     fx.entry.interrupt(&chat, own_turn.clone()).await.unwrap();
     assert_eq!(fx.ended(&chat, &own_turn).await, TurnRecord::Interrupted);
 }
