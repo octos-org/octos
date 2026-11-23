@@ -700,9 +700,14 @@ mod tests {
             .mount(&server)
             .await;
         let p = crate::openai::OpenAIProvider::new("test", "my-model").with_base_url(server.uri());
-        for text in ["short".to_string(), "x".repeat(3600)] {
+        for text in ["short".to_string(), "x".repeat(2800), "x".repeat(3600)] {
             let messages = [Message::user(text)];
-            let expected = 200.min(1000 - p.estimate_request_tokens(&messages, &[]));
+            let estimate = p.estimate_request_tokens(&messages, &[]);
+            let expected = 200.min(
+                1000u32
+                    .saturating_sub(estimate + estimate.div_ceil(4).min(150))
+                    .max(1),
+            );
             let _ = p.chat(&messages, &[], &ChatConfig::default()).await;
             let requests = server.received_requests().await.unwrap();
             let body: serde_json::Value =

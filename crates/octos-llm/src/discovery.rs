@@ -288,9 +288,14 @@ pub(crate) trait ModelOutputDiscovery: crate::LlmProvider {
         };
         let limits = cache
             .0
-            .get_or_try_init(|| probe_output_limits(root, key, protocol, self.model_id()))
+            .get_or_init(|| async {
+                // An optional metadata route can be unavailable on an otherwise usable endpoint.
+                probe_output_limits(root, key, protocol, self.model_id())
+                    .await
+                    .unwrap_or_default()
+            })
             .await;
-        if let Ok(Some((window, output))) = limits {
+        if let Some((window, output)) = limits {
             let mut resolved = config.clone();
             resolved.max_tokens = Some(crate::context::fit_output(
                 *output,
@@ -326,7 +331,7 @@ async fn probe_output_limits(
             .push(model);
     }
     let mut request = CLIENT.get(url);
-    if !key.is_empty() {
+    if !key.is_empty() && key != "no-key" {
         request = match protocol {
             DiscoveryProtocol::OpenAICompatible => request.bearer_auth(key),
             DiscoveryProtocol::AnthropicMessages => request

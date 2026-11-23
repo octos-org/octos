@@ -243,7 +243,15 @@ pub(crate) fn fit_output(output: u32, window: u32, estimated_input: u32) -> u32 
     if window == 0 {
         output
     } else {
-        output.min(window.saturating_sub(estimated_input).max(1))
+        // Wire token counts are estimated. Reserve headroom for dense prompts while
+        // leaving the full native output allowance available for short requests.
+        let margin = estimated_input.div_ceil(4).min((window / 100) * 15);
+        output.min(
+            window
+                .saturating_sub(estimated_input)
+                .saturating_sub(margin)
+                .max(1),
+        )
     }
 }
 

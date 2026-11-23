@@ -165,14 +165,14 @@ impl AnthropicProvider {
         messages: &[Message],
         tools: &[ToolSpec],
         config: &ChatConfig,
-    ) -> Result<u32> {
+    ) -> u32 {
         let config = self.output_config(config, messages, tools).await;
         self.request_output_tokens(&config, messages, tools)
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "Messages requires max_tokens but no output maximum is available for {}",
-                    self.model
-                )
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    "Messages endpoint has no advertised output limit; using 4096 tokens"
+                );
+                4096
             })
     }
 
@@ -489,7 +489,7 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let max_tokens = self.output_budget(messages, tools, config).await?;
+        let max_tokens = self.output_budget(messages, tools, config).await;
         let request = self.build_request(messages, tools, config, max_tokens);
         self.trace_prompt_cache_input(&request, config);
 
@@ -540,7 +540,7 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let max_tokens = self.output_budget(messages, tools, config).await?;
+        let max_tokens = self.output_budget(messages, tools, config).await;
         let request = self.build_request(messages, tools, config, max_tokens);
         self.trace_prompt_cache_input(&request, config);
 
@@ -1858,8 +1858,41 @@ mod tests {
         let p = AnthropicProvider::new("test", "new-model").with_base_url(server.uri());
         let config = ChatConfig::default();
         for _ in 0..2 {
-            let output = p.output_budget(&[], &[], &config).await.unwrap();
+            let output = p.output_budget(&[], &[], &config).await;
             assert_eq!(p.build_request(&[], &[], &config, output).max_tokens, 85000);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_messages_metadata_is_cached_and_falls_back() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models/unlisted"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test", "unlisted").with_base_url(server.uri());
+        let messages = [Message::user("hi")];
+        let config = ChatConfig::default();
+        let _ = tokio::join!(
+            provider.chat(&messages, &[], &config),
+            provider.chat_stream(&messages, &[], &config)
+        );
+        let requests = server.received_requests().await.unwrap();
+        for req in requests.iter().filter(|r| r.method == "POST") {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(body["max_tokens"], 4096);
         }
     }
 
