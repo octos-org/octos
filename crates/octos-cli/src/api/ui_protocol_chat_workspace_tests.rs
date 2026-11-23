@@ -94,31 +94,38 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     }
 
     // Read-only and offline by default; never the network or the host.
-    let permission = effective_session_permission_state(&state, &a).selection;
+    let permission = effective_session_permission_state(&state, &a, None).selection;
     assert_eq!(permission.mode, PermissionProfileMode::ReadOnly);
     assert_eq!(permission.network, PermissionNetworkPolicy::Deny);
     let set = |mode, network| {
-        permission_profile_set_result(
-            &state,
-            PermissionProfileSetParams {
-                session_id: b.clone(),
-                update: octos_core::ui_protocol::PermissionProfileUpdate {
-                    mode,
-                    network,
-                    approval_policy: None,
+        let state = state.clone();
+        let b = b.clone();
+        async move {
+            permission_profile_set_result(
+                &state,
+                PermissionProfileSetParams {
+                    session_id: b,
+                    update: octos_core::ui_protocol::PermissionProfileUpdate {
+                        mode,
+                        network,
+                        approval_policy: None,
+                    },
+                    runtime_mode: None,
                 },
-                runtime_mode: None,
-            },
-        )
-        .map(|set| set.current.mode)
-        .map_err(error_kind)
+                None,
+                None,
+            )
+            .await
+            .map(|set| set.current.mode)
+            .map_err(error_kind)
+        }
     };
     let bound = Err(json!("chat_permission_bound"));
     let full = Some(PermissionProfileMode::DangerFullAccess);
-    assert_eq!(set(None, Some(PermissionNetworkPolicy::Allow)), bound);
-    assert_eq!(set(full, None), bound);
+    assert_eq!(set(None, Some(PermissionNetworkPolicy::Allow)).await, bound);
+    assert_eq!(set(full, None).await, bound);
     let write = PermissionProfileMode::WorkspaceWrite;
-    assert_eq!(set(Some(write), None), Ok(write));
+    assert_eq!(set(Some(write), None).await, Ok(write));
 
     let list = |features| {
         let params = SessionListParams {
@@ -173,8 +180,11 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     std::os::unix::fs::symlink(&elsewhere, &root_b).unwrap();
     let unavailable = json!("chat_workspace_unavailable");
     assert_eq!(open(&b, Some(&elsewhere)), Err(unavailable.clone()));
-    assert_eq!(create_chat(&state, b.clone()).await, Err(unavailable));
-    assert_eq!(set(full, None), bound);
+    assert_eq!(
+        create_chat(&state, b.clone()).await,
+        Err(unavailable.clone())
+    );
+    assert_eq!(set(full, None).await, Err(json!("runtime_unavailable")));
     assert!(writable_runtime(&profile, &b, &elsewhere).await.is_err());
     assert!(delete(&b).await.is_success() && gone(&b));
     assert!(elsewhere.is_dir() && !root_b.exists());
