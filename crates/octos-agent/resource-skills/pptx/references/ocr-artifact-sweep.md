@@ -38,11 +38,11 @@ A correct short label can still be wrong twice: `SSD`, `GPU` or a unit may remai
 
 Extract the raster from the final PPTX and identify its source by hash. A newer clean background elsewhere in the workspace does not prove the build used it. Check the generator's selected asset and any rollback/alias; bind background-only evidence to those exact embedded bytes. OCR is a locator, not a substitute for viewing the region.
 
-For editable labels, remove raster text through the authorized artwork-editing workflow while retaining one native label per intended object. Do not solve a doubled label by dropping editability, hiding it with a cover patch, or swapping to an unverified alternative background. Verify the underlying region is text-free, each native label occurs once at its intended node, and the corrected artwork preserves topology/borders/icons. Update full and blank derivatives together; invalidate prior visual evidence for any changed pixels. Retaining unavoidable raster text is a disclosed editability exception, not a clean text-free-artwork pass.
+Check the embedded background against the supplied file. Correct a wrong binding or duplicate native object, then confirm each intended native label appears once in the final render. If the bound background itself contains the same label, record its location and the editability conflict for the asset owner. Keep the supplied artwork intact.
 
 ## Repair and close
 
-Repair confirmed errors in the producer's own mapping/generator. Remove spurious native runs while retaining the intended icon and nearby labels. If the defect is actually rasterized, record that separately and use the established authorized artwork workflow. Do not hide the symptom with a cover patch or erase legitimate content with a blanket character filter.
+Repair confirmed errors in the producer's own mapping/generator. Remove spurious native runs while retaining the intended icon and nearby labels. If the defect is in the supplied background itself, verify the asset binding and report the location separately. Do not hide the symptom with a cover patch or erase legitimate content with a blanket character filter.
 
 Render a distinctly versioned candidate and inspect each changed region with its neighbors. Check that the icon is intact, the unwanted glyph is gone, required labels remain and no duplicate replacement was added. Reinspect every page affected by shared logic. Run the existing copy, layer, render-binding and compatibility checks within their documented scopes.
 

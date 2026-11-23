@@ -17,17 +17,12 @@ project or an explicitly selected different engine, retain that engine and colle
 equivalent evidence; this exception does not apply merely because new code is easier.
 
 The engine does not decide authoritative copy, text ownership, font hierarchy or
-placement. An OCR draft remains unreviewed. It does not remove raster text from
-artwork, infer correct diagram labels, certify actual glyph fit, or make artwork
-editable. Agent pixel inspection and the existing copy/visual criteria still apply.
+placement. An OCR draft needs review for diagram labels, glyph fit and editability.
+Agent pixel inspection and the existing copy/visual criteria still apply.
 
-This is the reconstruction stage, not a substitute for page design. If a new
-image-first deck has no background yet, create and inspect the full-page design
-and derive its blank artwork using [paired design](paired-workflow.md). A required
-background field means that input is needed; it does not mean the requested
-workflow cannot be used. Rasterizing an unaccepted layout merely preserves that
-layout. Ordinary editable text over artwork does not require replacing the
-illustrations with fully native vector objects.
+For reconstruction, bind each page's supplied background to `background` and
+the labeled reference to `design`. Use the reference to place native content
+over that background. See [design and background inputs](paired-workflow.md).
 
 ## Input data
 

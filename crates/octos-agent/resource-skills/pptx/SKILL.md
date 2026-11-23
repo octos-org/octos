@@ -1,6 +1,6 @@
 ---
 name: pptx
-description: "制作或修改可编辑 PPTX，尤其适用于沿用既有插画风格、生成全稿与无字底稿、叠加原生文字，以及评审演示文稿的视觉 UX。包含真实分辨率记录和美术验收；普通文案讨论不必启动生图或导出流程。"
+description: "制作或修改可编辑 PPTX，尤其适用于沿用既有插画风格、使用已有底图叠加原生文字，以及评审演示文稿的视觉 UX。包含真实分辨率记录和美术验收；普通文案讨论不必启动生图或导出流程。"
 ---
 
 # 可编辑 PPTX
@@ -23,19 +23,19 @@ Octos 制作 peer 同时按 [continuation evidence](references/continuation-evid
 
 ## 先确定设计路径
 
-- **从文稿新建或重做图文丰富的稿件**：先读 [视觉设计与验收](references/visual-review.md)，把论点转成整页的图形、关系与标签布局，再进入构建。用户指定 image-first／海报式全页生图时，按 [成对设计](references/paired-workflow.md) 生成完整有字设计、从同一设计派生无字底稿，再重建可编辑文字。生成几个局部插画再塞入固定栏位，不等于完成整页设计。
-- **已有被认可的设计图与无字底稿**：沿用其构图，进入下面的原生叠字流程；不用重复设计或生图。
-- **用户明确要求图形、表格也全部可编辑**：选择适合的原生图形／图表实现，同时遵守整页视觉要求。单说“可编辑 PPTX”不自动要求每个像素都矢量化，也不授权改变指定的生图路径；说明实际可编辑范围。
+- **从文稿新建或重做图文丰富的稿件**：先读 [视觉设计与验收](references/visual-review.md)，把论点转成整页的图形、关系与标签布局，再进入构建。采用 image-first 设计时，有字参考图决定版式，图片层使用上游交付的底图。缺少底图时登记缺失页并继续准备文案和处理已有素材的页面。若用户已授权制作美术素材，由任务指定的生图工具或服务生成并交付底图，按项目要求完成美术验收后再重建该页。按[底图与原生文字](references/paired-workflow.md)放置可编辑内容。生成几个局部插画再塞入固定栏位，不等于完成整页设计。
+- **从已有底图制作可编辑页**：将该页提供的底图原样嵌入 PPTX，并在独立图层放置原生文字和所需的可编辑图形。
+- **用户明确要求图形、表格也全部可编辑**：选择适合的原生图形／图表实现，同时遵守整页视觉要求。单说“可编辑 PPTX”不自动要求每个像素都矢量化，也保留用户指定的素材来源；说明实际可编辑范围。
 
-用户要求改变信息密度、图文关系或版式时，重新检查整页构图与生图提示词；保持旧版位、仅换插图或缩字，不能证明已满足这个修改。两栏本身不是错误，是否适用由本页论点与用户要求决定。
+用户要求改变信息密度、图文关系或版式时，重新检查整页构图、信息分组与已交付素材；保持旧版位、仅换插图或缩字，不能证明已满足这个修改。两栏本身不是错误，是否适用由本页论点与用户要求决定。
 
 ## 保持本任务选定的流程
 
 开始制作时，在项目已有的约定／制作记录中简短记下：内容来源与范围、选定路径、参考设计、可编辑范围、字体与分辨率要求。记录当前产物、尚未完成的步骤和真实阻塞；不另建一套调度或验收框架。开始、恢复任务或接到局部修改时核对这份记录。用户说“继续”、改字体或修一页时，原有范围与流程继续有效；用户明确改变要求时更新相关约定。
 
-对已选定的 image-first 路径，有字整页图是布局参考；从它去字后叠原生文字，才能同时保留设计与可编辑性。不能以“图片里的字不能编辑”为由改成只生成无字插画、固定栏位排版或只交整页图片。已有合适的有字设计可直接复用。只需复用仍然有效的步骤；只有实际输入缺失、工具失败或不支持的能力才构成阻塞，排版困难本身不授权更换流程。
+底图是可编辑制作的现有输入。从素材清单或页计划定位该页底图，制作和返修都复用同一文件。有字参考图用于核对文案、位置和方向；发现底图与参考不符时核对页号与素材绑定，记录确有的源素材差异。
 
-模型决定构图、提示词、标签位置和修复方式。实现可以调整，但须保持用户选定路径及其可核对的产物关系。分批完成时更新进度，继续处理已获授权的剩余工作；进度汇报不等于任务完成，不逐批重新请求“继续”的许可。
+模型根据任务决定构图、标签位置和修复方式。实现可以调整，但须保持用户选定路径及其可核对的产物关系。分批完成时更新进度，继续处理已获授权的剩余工作；进度汇报不等于任务完成，不逐批重新请求“继续”的许可。
 
 ## 常用制作路径
 
@@ -49,7 +49,7 @@ Octos 制作 peer 同时按 [continuation evidence](references/continuation-evid
 
 Maker 首次发布前只核对构建成功、文件存在与页数，不制作完整 review_pack、不填逐对象验收模板，也不等待“自己满意”。完整首轮视觉审查只由 Reviewer 执行；Maker 可直接查看必要的局部图来实施修复。首次可读的 `cycle` 就把返回值中的 `peer_review_handoff` 数据交给评审主会话；它不是工具名，不要搜索或调用同名工具，也不自动发送通知。Octos 制作 peer 用 `peer_publish` 发布中间成果，协调者用 `peer_gather` 读取并用 `peer_send_input` 派发评审，不能先自修几十轮。该字段绑定实际文件；评审与后续制作复用同一组缺陷 ID，参见 peer 退出规则。
 
-实际生成位图时使用当前环境可用的 imagegen 工具与其 skill；普通文字修改无需重新生图。需要所有箭头、图标或表格也可编辑时，选原生形状/图表/矢量方法，并明确交付范围，不能把位图底稿称为全矢量。
+生成新插画属于用户另行指定的美术任务。已有底图的可编辑制作和文字返修直接使用绑定的素材，不调用图像生成或编辑工具处理底图。用户要求箭头、图标或表格也可编辑时，按约定使用原生形状、图表或矢量对象，并说明实际可编辑范围。
 
 ## 按需要读取
 
@@ -66,7 +66,7 @@ Maker 首次发布前只核对构建成功、文件存在与页数，不制作�
 | 首次使用数据构建器、字体提案或自动修订 | [native builder](references/native-builder.md)、[fit and revise](references/fit-and-revise.md) |
 | 用户授权并行制作；自己是页面 worker | 主代理：[independent pages](references/independent-pages.md)；worker：[page worker](references/page-worker.md) |
 | 多页效率、重复修改、异步渲染 | [efficient production](references/efficient-production.md)、[checked jobs](references/checked-jobs.md) |
-| 生图、去字、成对素材和分辨率记录 | [paired workflow](references/paired-workflow.md)、[pipeline pitfalls](references/pipeline-pitfalls.md) |
+| 已有底图、参考图配准和分辨率记录 | [paired workflow](references/paired-workflow.md)、[pipeline pitfalls](references/pipeline-pitfalls.md) |
 | 参考风格与图解质量 | [visual review](references/visual-review.md) |
 | PPTX 打开失败或跨应用差异 | [PowerPoint compatibility](references/powerpoint-compatibility.md)、[PPTX-first audit](references/pptx-first-audit.md) |
 | 错字、漏标签、重复值、归属或布局错误 | [reconstruction repair](references/reconstruction-repair.md)、[text-region audit](references/text-region-audit.md)、[标签级图差与间距](references/label-comparison.md)、[text reinspection](references/text-layout-reinspection.md) |
@@ -77,6 +77,10 @@ Maker 首次发布前只核对构建成功、文件存在与页数，不制作�
 无需加载所有参考、为每个对象写长报告或重新编写测量框架。技能和脚本不得包含固定稿件的页码、文案、坐标或已知答案；页面数据可以包含当前任务实际确定的内容与坐标。
 
 ## 交付要求
+
+协调员在逐页要求中登记用户指定的字形、基线角度和对应原图区域。制作和复审都保留该区域的来源、裁切原点和比例，区分字形本身倾斜与整行旋转；原图中可见但无法辨读的细节单独记录。
+
+参考图重建中遇到重影、小字错位或倾斜标签越界时，制作员和独审员都用[同一区域的三图对照](references/label-comparison.md#compare-a-registered-region)定位问题。把原图、当前候选隐藏原生文字后的渲染、同一候选显示文字的渲染合成一张可读的局部图。独审员在能看到三个区域的回合记录观察，再核对修订后的整页。局部结论只覆盖实际看过的对象。
 
 使用新版 Rust 工具时，先用 `review_pack` 读整页关系，再按 `view_batches` 逐组读原图／底稿／实际 PPTX 的原像素局部图；不把整稿图片一次塞给模型，也不以 OCR 结论替代看图。同时检查工具返回的 `relation_signals`，对测得的倾角／偏移逐项说明缺陷、有意设计或未知；“有意设计”还须引用该信号 `intentional_options` 中的 `support_id`，无依据保留未知；不能用保留左起点解释原图居中关系丢失。用 `review_submit` 绑定验收记录，避免手抄哈希。按 [对象级视觉证据](references/object-visual-review.md) 为每个文字对象记录归属、越界、对齐、方向、字体五项简短观察。工具会把漏检对象、未知判断和过期版本留为未完成；同页发生修改后必须复核最终渲染。修前登记缺陷、预先冻结独立视觉验证路径和局部证据复用见 [review lifecycle](references/review-lifecycle.md)。判断由任务选定模型作出，不隐式改用其他视觉模型。
 
