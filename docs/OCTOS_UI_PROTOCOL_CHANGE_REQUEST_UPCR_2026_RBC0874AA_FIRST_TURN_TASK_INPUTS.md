@@ -14,11 +14,13 @@ optional `kind` (`text`, `data`, `image`), `required` (default true) and
 `sha256` pin. A fleet task in `goal_plan` takes the same list. Both go through
 one resolver (`octos_agent::task_inputs`).
 
-At staging the server checks the declaration against the peer's working
-directory and records it beside the brief, before `brief.md` makes the peer
-visible. A required input that is not there refuses the handoff, and nothing is
-staged. An input outside the working directory is left to the peer session's
-own read access, which only its first turn knows.
+At staging the server checks the declaration with the calling session's
+`SessionScope` when one is available and records it beside the brief, before
+`brief.md` makes the peer visible. A required input that is not there refuses
+the handoff, and nothing is staged. A hidden folder, denied path, or unavailable
+session scope is left to the peer session's own read access; the note says only
+that its first request resolves it, never whether the file exists, its size, or
+its digest.
 
 At the first `turn/start` of the peer's session — the conversation has no
 message yet — the server reads the declared files under that session's own read
@@ -44,9 +46,12 @@ them from the transcript as they were first read, and are not given them again.
 ### A message to an existing peer
 
 The `peer_send_input` tool takes the same optional `inputs` list: the files the
-task in its message needs. The server checks it against the peer's working
-directory before anything is recorded or queued; a required input that is not
-there refuses the send, with every input's state, and nothing is queued.
+task in its message needs. The server checks it with the live peer session's
+`SessionScope` when that runtime is available; otherwise it carries the
+declaration to the owning turn without learning whether the files exist, their
+type, size, or digest. A required input that is not there refuses the send, with
+every input's state, and nothing is queued. A sha256 mismatch reports only that
+it does not match, never any part of the file's actual digest.
 
 The declaration is queued and persisted with the message, as continuation
 metadata, and moves with it when a reopen re-homes the message to the peer's new

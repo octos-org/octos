@@ -306,6 +306,9 @@ async fn hand_off(
         fx.workspace.clone(),
         fx.master.clone(),
         "dev".to_owned(),
+        Some(Arc::new(
+            octos_core::SessionScope::solo(fx.workspace.clone(), Vec::new()).unwrap(),
+        )),
         Vec::new(),
         Arc::new(AtomicU32::new(0)),
         Arc::new(move |event| seen.lock().unwrap().push(event)),
@@ -652,7 +655,7 @@ async fn should_not_read_for_a_peer_what_its_own_session_may_not_read() {
     assert!(
         result
             .output
-            .contains("the peer's own read access decides at its first request"),
+            .contains("left for the peer's own file access"),
         "{}",
         result.output
     );
@@ -737,8 +740,18 @@ async fn send_input(
     let peers_root = fx.data_dir.join("peers");
     let origin = fx.master.to_string();
     let turn = TurnId::new();
+    let workspace = fx.workspace.clone();
+    let scope =
+        Arc::new(octos_core::SessionScope::solo(workspace, Vec::new()).expect("test scope"));
     let tool = octos_agent::PeerSendInputTool::new(Arc::new(move |request| {
-        deliver_peer_send_input("dev", &peers_root, &origin, &turn, request)
+        deliver_peer_send_input(
+            "dev",
+            &peers_root,
+            &origin,
+            &turn,
+            request,
+            Some(scope.clone()),
+        )
     }));
     tool.execute(&json!({ "slug": peer.slug, "message": message, "inputs": inputs }))
         .await

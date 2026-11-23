@@ -449,6 +449,24 @@ impl SessionRuntimeCache {
         .await
     }
 
+    /// Return a cached runtime without building one. A miss means the caller
+    /// must not infer filesystem facts; it can only defer checks to the turn
+    /// that owns the session.
+    pub fn peek(
+        &self,
+        profile: &Arc<ProfileRuntime>,
+        session_key: &SessionKey,
+    ) -> Option<Arc<SessionRuntime>> {
+        let key_root =
+            super::session::resolve_sessions_root_from_hint(profile, None, self.sessions_in_cwd);
+        let key = (profile.profile_id.clone(), session_key.clone(), key_root);
+        self.inner
+            .try_read()
+            .ok()?
+            .get(&key)
+            .map(|entry| entry.runtime.clone())
+    }
+
     /// Look up or build a session runtime using explicit effective
     /// permissions. Callers should invalidate a cached session before changing
     /// permission policy; cache hits intentionally keep the first bootstrapped

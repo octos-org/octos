@@ -47,11 +47,12 @@ pub(super) fn record_at_staging(
     cwd: &Path,
     fenced: bool,
     inputs: &[DeclaredInput],
+    session_scope: Option<&SessionScope>,
 ) -> Result<Option<InputReport>, RpcError> {
     if inputs.is_empty() {
         return Ok(None);
     }
-    let report = check_in_working_dir(cwd, fenced, inputs)
+    let report = check_in_working_dir(cwd, fenced, inputs, session_scope)
         .map_err(|why| RpcError::invalid_params(format!("peer not staged: {why}")))?;
     let body = serde_json::to_string(inputs)
         .map_err(|err| RpcError::internal_error(format!("failed to encode peer inputs: {err}")))?;
@@ -71,12 +72,13 @@ pub(super) fn record_at_staging(
 pub(crate) fn check_for_message(
     peer_dir: &Path,
     inputs: &[DeclaredInput],
+    session_scope: Option<&SessionScope>,
 ) -> Result<Option<String>, String> {
     if inputs.is_empty() {
         return Ok(None);
     }
     if let Some((cwd, fenced)) = working_dir(peer_dir) {
-        check_in_working_dir(&cwd, fenced, inputs)
+        check_in_working_dir(&cwd, fenced, inputs, session_scope)
             .map_err(|why| format!("input not sent: {why}"))?;
     }
     serde_json::to_string(inputs)
@@ -101,14 +103,12 @@ fn check_in_working_dir(
     cwd: &Path,
     fenced: bool,
     inputs: &[DeclaredInput],
+    session_scope: Option<&SessionScope>,
 ) -> Result<InputReport, String> {
-    let report = check_declared_inputs(
-        inputs,
-        InputAuthority::Filesystem {
-            base_dir: cwd,
-            scope: FilesystemScope::Workspace,
-        },
-    );
+    let Some(scope) = session_scope else {
+        return Ok(deferred_report(inputs));
+    };
+    let report = check_declared_inputs(inputs, InputAuthority::Session(scope));
     if report
         .undelivered_required()
         .any(|record| !left_to_the_peers_reach(&record.outcome))
@@ -126,6 +126,26 @@ fn check_in_working_dir(
         ));
     }
     Ok(report)
+}
+
+/// No live session scope is available, so the declaration is carried to the
+/// peer's first request without learning anything about the files here.
+fn deferred_report(inputs: &[DeclaredInput]) -> InputReport {
+    InputReport {
+        inputs: inputs
+            .iter()
+            .map(|input| octos_core::task_inputs::InputRecord {
+                path: input.path.clone(),
+                required: input.required,
+                outcome: InputOutcome::Omitted {
+                    reason: OmitReason::Denied,
+                    detail: "not checked here; the peer's first request resolves it with its own file access".to_owned(),
+                },
+            })
+            .collect(),
+        budget_tokens: 0,
+        used_tokens: 0,
+    }
 }
 
 fn left_to_the_peers_reach(outcome: &InputOutcome) -> bool {
@@ -158,8 +178,8 @@ pub(super) fn staging_note(report: &InputReport) -> String {
             )),
             outcome @ InputOutcome::Omitted { detail, .. } if left_to_the_peers_reach(outcome) => {
                 out.push_str(&format!(
-                    "- `{}`: outside the peer's working directory ({required}); the peer's own \
-                     read access decides at its first request: {detail}",
+                    "- `{}`: left for the peer's own file access ({required}); its first request \
+                     resolves it: {detail}",
                     record.path
                 ))
             }
@@ -380,6 +400,7 @@ pub(crate) fn delivery_records(peers_root: &Path, slug: &str) -> Vec<(bool, Inpu
 mod tests {
     use super::*;
     use octos_core::task_inputs::InputKind;
+    use sha2::{Digest, Sha256};
 
     fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -388,6 +409,10 @@ mod tests {
         std::fs::create_dir_all(&peer_dir).unwrap();
         std::fs::create_dir_all(cwd.join("src")).unwrap();
         (tmp, peer_dir, cwd)
+    }
+
+    fn solo_scope(cwd: &Path) -> SessionScope {
+        SessionScope::solo(cwd.to_path_buf(), Vec::new()).unwrap()
     }
 
     #[test]
@@ -403,7 +428,8 @@ mod tests {
             },
         ];
 
-        let report = record_at_staging(&peer_dir, &cwd, false, &inputs)
+        let scope = solo_scope(&cwd);
+        let report = record_at_staging(&peer_dir, &cwd, false, &inputs, Some(&scope))
             .unwrap()
             .unwrap();
 
@@ -423,11 +449,13 @@ mod tests {
     fn should_tell_a_fenced_peers_master_why_an_uncommitted_input_is_not_there() {
         let (_tmp, peer_dir, cwd) = dirs();
 
+        let scope = solo_scope(&cwd);
         let err = record_at_staging(
             &peer_dir,
             &cwd,
             true,
             &[DeclaredInput::required("renders/page-03.png")],
+            Some(&scope),
         )
         .unwrap_err();
 
@@ -443,6 +471,65 @@ mod tests {
             err.message
         );
         assert!(declared(&peer_dir).unwrap().is_empty(), "nothing recorded");
+    }
+
+    #[test]
+    fn should_hide_staging_input_facts_from_a_denied_chat_path() {
+        let (_tmp, peer_dir, cwd) = dirs();
+        let hidden = cwd.join("chats/chat-1");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("notes.md"), "hidden chat secret").unwrap();
+        let scope = SessionScope::solo(cwd.clone(), Vec::new())
+            .unwrap()
+            .with_hidden_folders(vec![cwd.join("chats")])
+            .unwrap();
+        let input = DeclaredInput {
+            sha256: Some("0".repeat(64)),
+            ..DeclaredInput::required("chats/chat-1/notes.md")
+        };
+
+        let report = record_at_staging(&peer_dir, &cwd, false, &[input], Some(&scope))
+            .unwrap()
+            .unwrap();
+        let note = staging_note(&report);
+
+        assert!(
+            note.contains("left for the peer's own file access"),
+            "{note}"
+        );
+        assert!(!note.contains("bytes"), "{note}");
+        assert!(!note.contains("sha256"), "{note}");
+        assert!(
+            !note.contains(&format!("{:x}", Sha256::digest(b"hidden chat secret"))),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn should_hide_send_input_facts_from_a_denied_chat_path() {
+        let (_tmp, peer_dir, cwd) = dirs();
+        std::fs::write(peer_dir.join("workspace-root"), cwd.display().to_string()).unwrap();
+        let hidden = cwd.join("chats/chat-1");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("notes.md"), "hidden chat secret").unwrap();
+        let scope = SessionScope::solo(cwd.clone(), Vec::new())
+            .unwrap()
+            .with_hidden_folders(vec![cwd.join("chats")])
+            .unwrap();
+        let input = DeclaredInput {
+            sha256: Some("0".repeat(64)),
+            ..DeclaredInput::required("chats/chat-1/notes.md")
+        };
+
+        let encoded = check_for_message(&peer_dir, &[input], Some(&scope))
+            .unwrap()
+            .unwrap();
+
+        assert!(!encoded.contains("hidden chat secret"), "{encoded}");
+        assert!(
+            !encoded.contains(&format!("{:x}", Sha256::digest(b"hidden chat secret"))),
+            "{encoded}"
+        );
     }
 
     #[test]
