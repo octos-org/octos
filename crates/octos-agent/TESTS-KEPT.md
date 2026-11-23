@@ -195,3 +195,11 @@
 | tests/spawn_only_interrupt_cancellation.rs::supervisor_cancel_aborts_running_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/spawn_only_interrupt_cancellation.rs::cancel_runs_terminal_teardown_for_routed_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/validator_runner.rs::windows_command_validator_fails_closed_when_appcontainer_helper_vanished | 4 | Windows AppContainer helper 缺失时 fail-closed，marker 证明不 raw host spawn |
+
+## Agent progress and media boundaries
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| Empty streaming chunks do not count as model progress. `src/agent/activity.rs` | `should_ignore_empty_chunks_for_stream_activity` |
+| Durable evidence distinguishes terminal handoff, stalled work and a genuine resumed repair. `src/agent/iteration_evidence_tests.rs` | `verified_blocker_ends_the_attempt_with_undelivered_outputs`<br>`a_blocked_attempt_cannot_replace_the_final_pass_or_omit_a_required_check`<br>`unchanged_completion_claims_reach_a_durable_handoff_without_counting_polls`<br>`durable_handoff_still_allows_deliberately_resumed_repair_tools`<br>`large_dependency_inventories_are_checked_on_restart_without_satisfying_delivery_paths` |
+| Timeout and budget exits retain real progress and distinguish empty heartbeats from tool output. `src/agent/loop_runner_tests.rs` | `should_preserve_failed_progress_when_conversation_activity_times_out`<br>`should_not_classify_model_text_as_a_runtime_timeout`<br>`should_keep_artifacts_usage_and_tool_rows_when_idle_budget_stops`<br>`should_record_only_nonempty_tool_bytes_as_stream_activity`<br>`should_timeout_empty_stream_heartbeats_without_losing_a_real_stall_guard`<br>`should_keep_a_slow_stream_of_real_tool_arguments_alive` |

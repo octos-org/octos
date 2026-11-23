@@ -141,3 +141,9 @@ Concrete `EmbedQueueFull` shedding/backfill tests live in `octos-embed-llama` an
 |---|---:|---|
 | `registry::orcarouter::tests::should_apply_gpt5_hints_to_a_prefixed_orcarouter_model_on_the_wire` | 3 | A provider-prefixed id (`openai/gpt-5`) keeps its full form on the wire while hints derive from the upstream name: `max_completion_tokens` (never `max_tokens`), no `temperature`, and the configured `reasoning_effort` is preserved. |
 | `registry::orcarouter::tests::should_let_explicit_hint_overrides_win_over_detected_gpt5_defaults` | 3 | An explicit `model_hints` override beats the detected GPT-5 defaults on the same prefixed id: plain `max_tokens`, forwarded `temperature`, and no `reasoning_effort` field. |
+
+## Agent progress and media boundaries
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| User input and a completed assistant turn close the previous tool-image batch. `src/tool_media.rs` | `current_batch_only_does_not_resend_images_after_a_user_resume`<br>`completed_assistant_closes_current_batch_but_system_note_does_not` |
