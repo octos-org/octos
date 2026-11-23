@@ -6,6 +6,10 @@
 //! Serial CI step (the broad integration step skips it):
 //! `cargo test -p octos-cli --features api --test serve_host_managed -- --test-threads=1`
 //!
+//! It also holds the one fleet test that needs the real binary (macOS only):
+//! a worktree task survives a SIGKILL of the server and is recovered by the
+//! next one.
+//!
 //! Unix-only (descriptor passing and process control), like `serve_sigterm`.
 
 #[cfg(unix)]
@@ -658,5 +662,419 @@ mod serve_host_managed {
                 && host.iter().any(|t| t == "edit_file"),
             "host turn must keep the core read/write surface: {host:?}"
         );
+    }
+
+    // ── A fleet task that survives a SIGKILL of the server ─────────────────
+    //
+    // macOS only: the worker runs under the real `sandbox-exec` backend, which
+    // every macOS host has; on Linux the fleet worker pool needs bwrap, which a
+    // CI host may not offer.
+
+    /// What the scripted fleet model has seen, and what it does next.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    #[derive(Default)]
+    struct FleetScript {
+        /// The keeper's next moves, each sent as one `run_tool` call. With none
+        /// left the keeper just answers "ok".
+        keeper_moves: std::collections::VecDeque<serde_json::Value>,
+        keeper_calls: usize,
+        worker_calls: usize,
+        /// A worker call is being held open: the patch is on disk.
+        worker_held: bool,
+        /// Set once the server has been killed. From then on a worker call is
+        /// answered at once — and counted, because there must be none.
+        restarted: bool,
+        worker_calls_after_restart: usize,
+        keeper_calls_after_restart: usize,
+        /// One line per request, for a failure message.
+        log: Vec<String>,
+    }
+
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    enum Reply {
+        Text,
+        Tool(&'static str, serde_json::Value),
+        Hold,
+    }
+
+    /// A scripted OpenAI-compatible model that tells the goal keeper (its
+    /// request offers `run_tool`) from a fleet worker (its request offers
+    /// `escalate`). The keeper plays [`FleetScript::keeper_moves`]. The worker
+    /// writes the fix through `write_file` on its first call; its next call is
+    /// never answered — the model call that is outstanding when the server dies.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    fn fleet_model() -> (u16, std::sync::Arc<Mutex<FleetScript>>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = std::sync::Arc::new(Mutex::new(FleetScript::default()));
+        let shared = script.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let script = shared.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut length = 0usize;
+                    let mut first = String::new();
+                    if reader.read_line(&mut first).is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    let _ = reader.read_exact(&mut body);
+                    if first.starts_with("GET") {
+                        let data =
+                            r#"{"object":"list","data":[{"id":"mock-model","object":"model"}]}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{data}",
+                            data.len()
+                        );
+                        return;
+                    }
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let offers = |name: &str| {
+                        request["tools"].as_array().is_some_and(|tools| {
+                            tools.iter().any(|tool| tool["function"]["name"] == name)
+                        })
+                    };
+                    let reply = {
+                        let mut script = script.lock().unwrap();
+                        let reply = if offers("run_tool") {
+                            script.keeper_calls += 1;
+                            if script.restarted {
+                                script.keeper_calls_after_restart += 1;
+                            }
+                            match script.keeper_moves.pop_front() {
+                                Some(invocation) => Reply::Tool("run_tool", invocation),
+                                None => Reply::Text,
+                            }
+                        } else if offers("escalate") {
+                            script.worker_calls += 1;
+                            if script.restarted {
+                                script.worker_calls_after_restart += 1;
+                                Reply::Text
+                            } else if script.worker_calls == 1 {
+                                Reply::Tool(
+                                    "write_file",
+                                    serde_json::json!({"path": "value.txt", "content": "fixed\n"}),
+                                )
+                            } else {
+                                script.worker_held = true;
+                                Reply::Hold
+                            }
+                        } else {
+                            Reply::Text
+                        };
+                        let role = if offers("run_tool") {
+                            "keeper"
+                        } else if offers("escalate") {
+                            "worker"
+                        } else {
+                            "other"
+                        };
+                        let does = match &reply {
+                            Reply::Text => "says ok".to_owned(),
+                            Reply::Tool(name, arguments) => format!("calls {name} {arguments}"),
+                            Reply::Hold => "is never answered".to_owned(),
+                        };
+                        let last = request["messages"]
+                            .as_array()
+                            .and_then(|messages| messages.last())
+                            .map(|message| message["content"].to_string())
+                            .unwrap_or_default();
+                        let last: String = last.chars().take(300).collect();
+                        script.log.push(format!("{role} {does}  <- {last}"));
+                        reply
+                    };
+                    let call_id = format!("call_{}", uuid::Uuid::now_v7().simple());
+                    let (delta, message, finish) = match &reply {
+                        Reply::Hold => {
+                            std::thread::sleep(Duration::from_secs(900));
+                            return;
+                        }
+                        Reply::Text => (
+                            serde_json::json!({"role": "assistant", "content": "ok"}),
+                            serde_json::json!({"role": "assistant", "content": "ok"}),
+                            "stop",
+                        ),
+                        Reply::Tool(name, arguments) => {
+                            let function = serde_json::json!({
+                                "name": name,
+                                "arguments": arguments.to_string(),
+                            });
+                            (
+                                serde_json::json!({"role": "assistant", "tool_calls": [
+                                    {"index": 0, "id": call_id, "type": "function", "function": function}
+                                ]}),
+                                serde_json::json!({"role": "assistant", "content": null, "tool_calls": [
+                                    {"id": call_id, "type": "function", "function": function}
+                                ]}),
+                                "tool_calls",
+                            )
+                        }
+                    };
+                    let usage = serde_json::json!({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2});
+                    if request["stream"] == true {
+                        let chunk = serde_json::json!({
+                            "id": "c1", "object": "chat.completion.chunk", "model": "mock-model",
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                        });
+                        let done = serde_json::json!({
+                            "id": "c1", "object": "chat.completion.chunk", "model": "mock-model",
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                            "usage": usage,
+                        });
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n"
+                        );
+                    } else {
+                        let data = serde_json::json!({
+                            "id": "c1", "object": "chat.completion", "model": "mock-model",
+                            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                            "usage": usage,
+                        })
+                        .to_string();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{data}",
+                            data.len()
+                        );
+                    }
+                });
+            }
+        });
+        (port, script)
+    }
+
+    /// Wait until `done`, or fail with `what` and whatever `evidence` shows.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    fn wait_until(
+        what: &str,
+        limit: Duration,
+        evidence: &dyn Fn() -> String,
+        mut done: impl FnMut() -> bool,
+    ) {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}\n{}",
+                evidence()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Connect as the host with the features a coding client declares, and
+    /// open `session` on the repository at `cwd`.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    async fn open_coding_session(port: u16, session: &str, cwd: &std::path::Path) -> Socket {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://127.0.0.1:{port}/api/ui-protocol/ws")
+            .into_client_request()
+            .unwrap();
+        let headers = request.headers_mut();
+        headers.insert("authorization", format!("Bearer {HOST}").parse().unwrap());
+        headers.insert(
+            "x-octos-ui-features",
+            "session.workspace_cwd.v1,coding.autonomy.v1,coding.goal_runtime.v1"
+                .parse()
+                .unwrap(),
+        );
+        let mut socket = tokio_tungstenite::connect_async(request).await.unwrap().0;
+        let opened = rpc(
+            &mut socket,
+            "open",
+            "session/open",
+            serde_json::json!({"session_id": session, "profile_id": "_main", "cwd": cwd}),
+        )
+        .await;
+        assert!(opened.get("error").is_none(), "{opened}");
+        socket
+    }
+
+    /// Read whatever the server sends until the connection ends, so the
+    /// connection stays alive while the server works.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    async fn keep_reading(mut socket: Socket) {
+        use futures::StreamExt;
+        while let Some(Ok(_)) = socket.next().await {}
+    }
+
+    /// The real server, a real repository, a real sandbox — and a real kill.
+    /// The keeper plans one task that names a failing test and dispatches it;
+    /// the worker writes the fix; the server is killed with SIGKILL while the
+    /// worker's next model call is outstanding. A new server on the same data
+    /// directory, with nobody connected to it, reconciles, wakes the keeper,
+    /// and the keeper dispatches again: the fix the dead server's worker left
+    /// is committed, verified and delivered without the worker's model being
+    /// called once.
+    #[cfg(all(feature = "api", target_os = "macos"))]
+    #[test]
+    fn serve_host_managed_recovers_a_fleet_task_after_the_server_is_sigkilled() {
+        let _serial = serial_guard();
+        // Under the build directory, not the system temp directory: the
+        // sandbox's default read allow-list covers the latter, and the point is
+        // a repository the worker can reach only through its grant — like one
+        // under a user's home directory.
+        let base =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sandbox-tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(std::fs::canonicalize(base).unwrap()).unwrap();
+        let (repo, data) = (root.path().join("repo"), root.path().join("data"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "fleet@test"]);
+        git(&["config", "user.name", "fleet-test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("value.txt"), "broken\n").unwrap();
+        std::fs::write(repo.join("check.sh"), "grep -q fixed value.txt\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base with a failing test"]);
+        let fleet_branch = || {
+            git(&[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/fleet/",
+            ])
+        };
+
+        let (model_port, script) = fleet_model();
+        let dispatch = serde_json::json!({"name": "goal_dispatch", "arguments": {}});
+        script.lock().unwrap().keeper_moves = [
+            serde_json::json!({"name": "goal_plan", "arguments": {"tasks": [{
+                "task_id": "t1",
+                "title": "Make check.sh pass",
+                "detail": "Edit value.txt so that `sh check.sh` exits 0.",
+                "acceptance": ["sh check.sh"],
+                "failing_test": "sh check.sh",
+                "grant": {"fs": "host", "network": {"mode": "full"}},
+            }]}}),
+            dispatch.clone(),
+        ]
+        .into();
+        write_mock_profile(&data, model_port);
+        let serve = |log: &str| {
+            let mut server = command(&data, &["--port", "0"]);
+            server.stderr(std::fs::File::create(root.path().join(log)).unwrap());
+            let mut server = server.spawn().unwrap();
+            send_tokens(&mut server);
+            let (port, lines) = announced_port(&mut server);
+            (server, port, lines)
+        };
+        // What a failure message shows: every model request, and the end of
+        // what the server printed and logged.
+        let evidence = |stderr: &str| {
+            let printed = std::fs::read_to_string(root.path().join(stderr)).unwrap_or_default();
+            let logged = super::serve_process::read_dir_logs_concat(&data.join("logs"));
+            let newest = |text: &str| text.lines().rev().take(40).collect::<Vec<_>>().join("\n");
+            format!(
+                "model requests:\n{}\nserver stderr (newest first):\n{}\nserver log (newest first):\n{}",
+                script.lock().unwrap().log.join("\n"),
+                newest(&printed),
+                newest(&logged),
+            )
+        };
+
+        // Boot 1: set the goal; the keeper plans and dispatches; the worker
+        // writes the fix and its next model call is never answered.
+        let (mut server, port, _lines) = serve("server-1.log");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let session = "_main:api:web#recovery";
+        let socket = runtime.block_on(async {
+            let mut socket = open_coding_session(port, session, &repo).await;
+            let goal = rpc(
+                &mut socket,
+                "goal",
+                "session/goal/set",
+                serde_json::json!({"session_id": session, "profile_id": "_main", "objective": "Make `sh check.sh` pass."}),
+            )
+            .await;
+            assert!(goal.get("error").is_none(), "{goal}");
+            socket
+        });
+        let reader = runtime.spawn(keep_reading(socket));
+        wait_until(
+            "the worker's patch on disk with its next model call outstanding",
+            Duration::from_secs(120),
+            &|| evidence("server-1.log"),
+            || script.lock().unwrap().worker_held,
+        );
+        let branch = fleet_branch();
+        assert_eq!(
+            git(&["show", &format!("{branch}:value.txt")]),
+            "broken",
+            "the fix is on disk only: nothing committed it"
+        );
+
+        server.kill().unwrap(); // SIGKILL
+        server.wait().unwrap();
+        reader.abort();
+
+        // Boot 2: the same data directory, and nobody connects. The keeper's
+        // one move is to dispatch again; the worker's model must not be called.
+        {
+            let mut script = script.lock().unwrap();
+            script.restarted = true;
+            script.keeper_moves = [dispatch].into();
+        }
+        let (mut server, _port, _lines) = serve("server-2.log");
+        wait_until(
+            "the recovered fix on the task branch",
+            Duration::from_secs(120),
+            &|| evidence("server-2.log"),
+            || git(&["show", &format!("{branch}:value.txt")]) == "fixed",
+        );
+        {
+            let script = script.lock().unwrap();
+            assert_eq!(
+                script.worker_calls_after_restart,
+                0,
+                "the recovered work was verified, not redone:\n{}",
+                script.log.join("\n")
+            );
+            assert!(script.keeper_calls_after_restart >= 1);
+        }
+        assert_eq!(
+            git(&["rev-list", "--count", &format!("HEAD..{branch}")]),
+            "1",
+            "the fix was committed once"
+        );
+        drop(server.stdin.take());
+        if exits_within(&mut server, Duration::from_secs(30)).is_none() {
+            let _ = server.kill();
+        }
     }
 }

@@ -463,6 +463,7 @@ Creation admission also retains these persistence regressions (T-0323):
 | 4 | `goal_tool::tests::should_leave_task_ordinary_when_no_failing_test_is_named` | A plan that omits `failing_test`, or sends it as `null`, still plans an ordinary task instead of being refused. |
 | 5 | `goal_tool::tests::should_reject_plan_when_failing_test_is_not_a_command_string` | An empty or non-string `failing_test` refuses the plan and names the task, rather than planning an ordinary task that skips the failing-base check. |
 | 5 | `goal_tool::tests::should_describe_failing_test_in_the_plan_tool_schema` | The plan tool tells the keeper model which grant a failing test needs; without it such tasks are planned and then refused at dispatch. |
+| 1 | `tests/serve_host_managed.rs::serve_host_managed::serve_host_managed_recovers_a_fleet_task_after_the_server_is_sigkilled` | A real server killed with SIGKILL in the middle of a fleet task is followed by one that, with nobody connected, commits, verifies and delivers what the dead worker left without calling the worker's model (macOS, real sandbox). |
 
 ## Agent/peer profile-scoped delivery (#2081, UPCR-2026-R8C3A1D2E)
 
