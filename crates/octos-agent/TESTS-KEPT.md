@@ -195,3 +195,12 @@
 | tests/spawn_only_interrupt_cancellation.rs::supervisor_cancel_aborts_running_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/spawn_only_interrupt_cancellation.rs::cancel_runs_terminal_teardown_for_routed_spawn_only_task | 4 | detached future 真 drop 与 router.mark_terminal 真实取消收尾 |
 | tests/validator_runner.rs::windows_command_validator_fails_closed_when_appcontainer_helper_vanished | 4 | Windows AppContainer helper 缺失时 fail-closed，marker 证明不 raw host spawn |
+
+## Receipt-driven peer dispatch
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| Registered plugin results retain their handoff and admission checks. `src/plugins/tool_tests.rs` | `structured_plugin_result_is_delivered_only_in_the_bound_context` |
+| A result published between gather and wait remains visible. `src/tools/peer_gather.rs` | `result_published_between_gather_and_wait_is_delivered_immediately` |
+| Publication uses the assigned bounded handoff. `src/tools/peer_publish.rs` | `peer_publish_handoff_is_explicit_bounded_and_has_no_recipient_argument` |
+| Peer addressing remains unambiguous across name and slug. `src/tools/peer_send_input.rs` | `peer_name_and_slug_reach_the_same_target_and_conflicting_keys_are_rejected` |

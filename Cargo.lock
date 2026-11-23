@@ -3107,9 +3107,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -6269,6 +6271,8 @@ dependencies = [
  "octos-store",
  "octos-swarm",
  "octos-workflows",
+ "octoscript-capabilities",
+ "octoscript-workflow",
  "open",
  "percent-encoding",
  "qrcode",
@@ -6704,6 +6708,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octoscript-capabilities"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "blake3",
+ "getrandom 0.3.4",
+ "makepad-script",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "octoscript-core"
 version = "0.1.0"
 source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
@@ -6714,11 +6733,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "octoscript-protocol"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "blake3",
+ "constant_time_eq 0.4.2",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
+name = "octoscript-schema"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "octoscript-storage"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "serde",
+ "serde_json",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "octoscript-ui-l0"
 version = "0.1.0"
 source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
 dependencies = [
  "blake3",
+ "serde_json",
+]
+
+[[package]]
+name = "octoscript-workflow"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript.git?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "blake3",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-schema",
+ "octoscript-storage",
+ "serde",
  "serde_json",
 ]
 

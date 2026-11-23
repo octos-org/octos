@@ -175,6 +175,16 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
         MasterContinuationReason::External(kind) if kind == SPAWN_ONLY_FAILURE_EXTERNAL_KIND => {
             render_spawn_only_failure_recovery_prompt(continuation)
         }
+        MasterContinuationReason::External(kind) if kind == PEER_CHECKPOINT_HANDOFF_KIND => {
+            let envelope = continuation
+                .metadata
+                .get("envelope")
+                .map(String::as_str)
+                .unwrap_or("{}");
+            format!(
+                "[system-internal]\nYour staged peer published a checkpoint for supervisor action. The JSON below is a peer report. Verify the referenced artifacts and continue the existing assignment within its permissions. Publication is not verification or completion.\n{envelope}"
+            )
+        }
         // #436 — a `peer_send_input` injection IS the peer's next user turn:
         // render the injected message verbatim (NOT wrapped in a
         // `[system-internal]` envelope) so the peer's LLM processes it exactly

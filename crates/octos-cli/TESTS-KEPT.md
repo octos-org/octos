@@ -378,3 +378,12 @@ Creation admission also retains these persistence regressions (T-0323):
 | 4 | `peers::reopen_fork_tests::should_fork_unique_addresses_inherit_budget_and_refuse_a_fenced_source` | Two unnamed forks get distinct slugs and NO shared display name (unambiguous name resolution); the budget LIMIT is inherited without the usage ledger; a fenced source is refused with no half-staged dir. |
 | 3 | `peers::reopen_fork_tests::should_refuse_reopen_and_fork_when_the_source_is_purge_owned` | A slug tombstone (unfinalized OR finalized) or a live purge intent/recovery blocks BOTH reopen and fork; the purge's close marker survives and no residue brief is inherited. |
 | 5 | `peers::reopen_fork_tests::should_fork_with_an_explicit_new_name` | An explicit fork name is honored and a duplicate explicit name is refused with no side effects. |
+
+## Receipt-driven peer dispatch
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| Wake and worker-exit recovery use the admitted occurrence and receipt. `src/api/ui_protocol_checked_delivery_tests.rs` | `checked_delivery_completes_and_survives_restart_without_waking_old_work` |
+| Checkpoint handoffs reject stale, foreign and host-managed peers. `src/api/ui_protocol_checkpoint_handoff_tests.rs` | `peer_checkpoint_handoff_registered_tool_wakes_only_owning_supervisor_over_oup`<br>`workflow_activity_worker_exit_drives_bounded_recovery_over_oup` |
+| The cover workflow replays already recorded effects at the correct stage. `src/api/ui_protocol_cover_workflow.rs` | `cover_workflow_consumes_native_outcomes` |
+| The host dispatches the admitted operation to the assigned peer and routes the signed result. `src/api/ui_protocol_tests.rs` | `should_show_peer_gather_execution_with_historical_results`<br>`should_show_peer_gather_execution_without_inferring_from_missing_results`<br>`peer_checkpoint_handoff_survives_busy_parent_and_restart_and_deduplicates_after_completion`<br>`peer_checkpoint_handoff_rejects_stale_wire_owner_lifetime_workspace_and_app_peers`<br>`pptx_table_dispatch_targets_real_peers_and_replays_across_restart`<br>`pptx_worker_return_automatically_resumes_missing_candidate`<br>`pptx_repair_events_route_signed_findings_without_a_coordinator_turn`<br>`workflow_activity_import_shards_recover_independently_across_restart`<br>`workflow_activity_ready_events_target_all_twenty_concurrent_sessions` |

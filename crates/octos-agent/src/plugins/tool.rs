@@ -76,11 +76,16 @@ impl SynthesisConfig {
     }
 }
 
+type PluginResultHandler =
+    dyn Fn(&str, &serde_json::Value, &mut serde_json::Value) -> bool + Send + Sync;
+
 /// A tool backed by a plugin executable.
 ///
 /// Protocol: write JSON args to stdin, read JSON result from stdout.
 /// Expected output: `{ "output": "...", "success": true/false }`
+#[derive(Clone)]
 pub struct PluginTool {
+    result_handler: Option<Arc<PluginResultHandler>>,
     plugin_name: String,
     tool_def: PluginToolDef,
     executable: PathBuf,
@@ -152,6 +157,7 @@ impl PluginTool {
 
     pub fn new(plugin_name: String, tool_def: PluginToolDef, executable: PathBuf) -> Self {
         Self {
+            result_handler: None,
             plugin_name,
             tool_def,
             executable,
@@ -387,22 +393,10 @@ impl PluginTool {
     /// Used to give each user session its own workspace for plugin output.
     pub fn clone_with_work_dir(&self, work_dir: PathBuf) -> Self {
         Self {
-            plugin_name: self.plugin_name.clone(),
-            tool_def: self.tool_def.clone(),
-            executable: self.executable.clone(),
-            blocked_env: self.blocked_env.clone(),
-            extra_env: self.extra_env.clone(),
-            vertex_token_source: self.vertex_token_source.clone(),
-            vertex_project_id: self.vertex_project_id.clone(),
             work_dir: Some(work_dir),
-            timeout: self.timeout,
-            synthesis_config: self.synthesis_config.clone(),
-            verified_exe_sha256: self.verified_exe_sha256.clone(),
-            manifest_sha256: self.manifest_sha256.clone(),
-            manifest_path: self.manifest_path.clone(),
-            require_signed: self.require_signed,
-            approval_policy: self.approval_policy,
-            auto_approve_high_risk: self.auto_approve_high_risk,
+            // A workspace rebind starts without another session's delivery capability.
+            result_handler: None,
+            ..self.clone()
         }
     }
 
@@ -418,22 +412,24 @@ impl PluginTool {
         auto_approve_high_risk: bool,
     ) -> Self {
         Self {
-            plugin_name: self.plugin_name.clone(),
-            tool_def: self.tool_def.clone(),
-            executable: self.executable.clone(),
-            blocked_env: self.blocked_env.clone(),
-            extra_env: self.extra_env.clone(),
-            vertex_token_source: self.vertex_token_source.clone(),
-            vertex_project_id: self.vertex_project_id.clone(),
-            work_dir: self.work_dir.clone(),
-            timeout: self.timeout,
-            synthesis_config: self.synthesis_config.clone(),
-            verified_exe_sha256: self.verified_exe_sha256.clone(),
-            manifest_sha256: self.manifest_sha256.clone(),
-            manifest_path: self.manifest_path.clone(),
-            require_signed: self.require_signed,
             approval_policy,
             auto_approve_high_risk,
+            ..self.clone()
+        }
+    }
+
+    /// Attach a turn-local handler for a structured result from this concrete plugin.
+    /// The identity argument comes from the executing agent's tool context.
+    pub fn with_result_handler(
+        &self,
+        handler: impl Fn(&str, &serde_json::Value, &mut serde_json::Value) -> bool
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            result_handler: Some(Arc::new(handler)),
+            ..self.clone()
         }
     }
 
@@ -3130,7 +3126,7 @@ impl Tool for PluginTool {
         );
 
         // Try to parse structured output
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
             let mut output = parsed
                 .get("output")
                 .and_then(|v| v.as_str())
@@ -3140,6 +3136,15 @@ impl Tool for PluginTool {
                 .get("success")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(exit_status.success());
+            if let (Some(handler), Some(owner), Some(result)) = (
+                self.result_handler.as_ref(),
+                ctx.as_ref().and_then(|c| c.continuation_owner.as_deref()),
+                parsed.get_mut("result"),
+            ) {
+                if handler(owner, &effective_args, result) {
+                    output = result.to_string();
+                }
+            }
             let structured_metadata = parsed.get("structured_metadata").cloned();
             // Plugins can return visual evidence directly, just like read_file.
             // Paths are untrusted plugin output: authorize against the active

@@ -75,6 +75,7 @@ pub(crate) struct InProcessAgentOrchestrator {
 /// The shared innards of [`InProcessAgentOrchestrator`] (see its `Clone` note).
 #[derive(Debug, Default)]
 struct OrchestratorShared {
+    ready: std::sync::OnceLock<tokio::sync::broadcast::Sender<(SessionKey, String)>>,
     state: StdMutex<AutonomyRuntimeState>,
     /// #1666 residue — per-project (cwd) scope for the goal/autonomy store,
     /// mirroring the ledger's `scopes` map (`ui_protocol_ledger.rs`).
@@ -1371,11 +1372,16 @@ impl InProcessAgentOrchestrator {
         }
         let mut state = self.state();
         state.supervisor_store = Some(store);
-        state.workspace_message_occurrences.extend(
+        state.accepted_peer_occurrences.extend(
             supervisor_state
                 .continuations
                 .values()
-                .filter(|c| c.group_id == crate::peers::workspace_team::MESSAGE_KIND)
+                .filter(|c| {
+                    c.group_id == crate::peers::workspace_team::MESSAGE_KIND
+                        || c.group_id == PEER_CHECKPOINT_HANDOFF_KIND
+                        || c.group_id == PPTX_ASSIGNMENT_GROUP
+                        || c.metadata.contains_key("payload:workflow_activity_v1")
+                })
                 .map(|c| c.continuation_id.clone()),
         );
         restore_runtime_from_supervisor_state(&mut state, &supervisor_state, &workspace_compat);
@@ -2859,9 +2865,11 @@ impl InProcessAgentOrchestrator {
                 &session_id.to_string(),
                 profile_id,
                 |item| {
-                    !state
-                        .pending_unpersisted_scatters
-                        .contains_key(item.dedupe_key.as_str())
+                    (runtime_state.handles_workflow_activities
+                        || !item.metadata.contains_key(WORKFLOW_ACTIVITY_META))
+                        && !state
+                            .pending_unpersisted_scatters
+                            .contains_key(item.dedupe_key.as_str())
                 },
             );
             if drained.is_empty() {
@@ -2949,15 +2957,7 @@ impl InProcessAgentOrchestrator {
         kept
     }
 
-    pub(crate) fn due_loop_targets(
-        &self,
-        profile_filter: Option<&str>,
-        max_items: usize,
-    ) -> Vec<(SessionKey, String)> {
-        self.due_loop_targets_with_filter(profile_filter, max_items, None)
-    }
-
-    /// Like [`Self::due_loop_targets`] but only counts a target toward
+    /// Lists due targets and only counts a target toward
     /// `max_items` when `runnable(session, profile_id)` is true. The connection-independent
     /// global drain passes a "workspace is known in-memory" predicate so it can
     /// use a small `max_items` (bounded result + bounded allocation) yet never
@@ -4712,6 +4712,141 @@ impl InProcessAgentOrchestrator {
         }
     }
 
+    /// Used only for explicitly resuming a peer that returned an incomplete page.
+    pub(crate) fn pptx_assignment_completed(
+        &self,
+        target: &SessionKey,
+        occurrence: &str,
+    ) -> std::io::Result<bool> {
+        let store = self
+            .state()
+            .supervisor_store
+            .clone()
+            .ok_or_else(|| std::io::Error::other("peer supervisor store unavailable"))?;
+        let key = peer_send_input_dedupe_key(target, occurrence);
+        store.has_continuation(PPTX_ASSIGNMENT_GROUP, |r| {
+            r.continuation_id == key && r.status == ContinuationStatus::Completed
+        })
+    }
+
+    pub(crate) fn pptx_review_route_admitted(&self, grant: &str) -> std::io::Result<bool> {
+        let store = self
+            .state()
+            .supervisor_store
+            .clone()
+            .ok_or_else(|| std::io::Error::other("peer supervisor store unavailable"))?;
+        store.has_continuation(PPTX_ASSIGNMENT_GROUP, |r| {
+            [
+                "payload:pptx_review_route",
+                "payload:pptx_confirmation_route",
+            ]
+            .iter()
+            .any(|key| r.metadata.get(*key).and_then(serde_json::Value::as_str) == Some(grant))
+        })
+    }
+
+    pub(crate) fn subscribe_ready(&self) -> tokio::sync::broadcast::Receiver<(SessionKey, String)> {
+        self.shared
+            .ready
+            .get_or_init(|| tokio::sync::broadcast::channel(1024).0)
+            .subscribe()
+    }
+
+    fn signal_ready(&self, session: &SessionKey, profile: &str) {
+        if let Some(sender) = self.shared.ready.get() {
+            let _ = sender.send((session.clone(), profile.to_owned()));
+        }
+    }
+
+    /// A ready edge may arrive while this session is occupied. Re-arm it
+    /// after releasing the execution slot if another delivery is still queued.
+    pub(crate) fn signal_pending(&self, session: &SessionKey, profile: &str) {
+        if self
+            .state()
+            .continuations
+            .pending_items()
+            .any(|i| i.session_id.as_str() == session.0 && i.profile_id.as_str() == profile)
+        {
+            self.signal_ready(session, profile);
+        }
+    }
+
+    /// Native workflow adapters admit a scoped assignment once per stage and revision.
+    pub(crate) fn enqueue_peer_assignment(
+        &self,
+        group: &str,
+        target: &SessionKey,
+        profile: &str,
+        slug: &str,
+        occurrence: &str,
+        message: &str,
+        admission_metadata: impl IntoIterator<Item = (&'static str, String)>,
+        activity: Option<String>,
+        before_queue: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
+        let mut request = MasterContinuationRequest::new(
+            group,
+            target.to_string(),
+            profile.to_owned(),
+            MasterContinuationReason::External(PEER_SEND_INPUT_EXTERNAL_KIND.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata(PEER_SEND_INPUT_META_MESSAGE, message.to_owned())
+        .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
+        .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence.to_owned())
+        .with_dedupe_key(peer_send_input_dedupe_key(target, occurrence));
+        for (key, value) in admission_metadata {
+            request = request.with_metadata(key, value);
+        }
+        let request = match activity {
+            Some(value) => request.with_metadata(WORKFLOW_ACTIVITY_META, value),
+            None => request,
+        };
+        self.enqueue_peer_occurrence(request, true, before_queue)
+    }
+
+    /// A successor inherits the original target and group. Only the original
+    /// admission may mint application-specific authority.
+    pub(crate) fn peer_occurrence_recorded(&self, target: &SessionKey, occurrence: &str) -> bool {
+        self.state()
+            .accepted_peer_occurrences
+            .contains(&peer_send_input_dedupe_key(target, occurrence))
+    }
+
+    pub(crate) fn enqueue_activity_successor(
+        &self,
+        previous: &QueuedMasterContinuation,
+        occurrence: &str,
+        contract: String,
+        exit: Option<String>,
+        before_queue: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
+        let target = SessionKey(previous.session_id.as_str().to_owned());
+        let request = MasterContinuationRequest::new(
+            previous.group_id.as_str(),
+            target.to_string(),
+            previous.profile_id.as_str(),
+            previous.reason.clone(),
+            SystemTime::now(),
+        )
+        .with_metadata(
+            PEER_SEND_INPUT_META_MESSAGE,
+            previous.metadata[PEER_SEND_INPUT_META_MESSAGE].clone(),
+        )
+        .with_metadata(
+            PEER_SEND_INPUT_META_SLUG,
+            previous.metadata[PEER_SEND_INPUT_META_SLUG].clone(),
+        )
+        .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence.to_owned())
+        .with_metadata(WORKFLOW_ACTIVITY_META, contract)
+        .with_dedupe_key(peer_send_input_dedupe_key(&target, occurrence));
+        let request = match exit {
+            Some(value) => request.with_metadata(WORKFLOW_EXIT_META, value),
+            None => request,
+        };
+        self.enqueue_peer_occurrence(request, true, before_queue)
+    }
+
     /// Workspace peers use the same durable scheduler and turn admission as
     /// staged peers, with an attributed synthetic prompt rather than a forged
     /// human message. The caller has already checked profile/team membership.
@@ -4734,13 +4869,132 @@ impl InProcessAgentOrchestrator {
         .with_dedupe_key(format!(
             "external/{kind}/{profile_id}/{target_session}/{occurrence_id}"
         ));
+        self.enqueue_peer_occurrence(request, false, || Ok(()))
+    }
+
+    /// Publish the checkpoint before admitting the first wake. Retries of an
+    /// accepted revision leave the current blackboard and parent queue alone.
+    pub(crate) fn enqueue_peer_checkpoint_handoff(
+        &self,
+        target: &SessionKey,
+        profile: &str,
+        stage_id: uuid::Uuid,
+        handoff_id: &str,
+        envelope: String,
+        publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
+        let kind = PEER_CHECKPOINT_HANDOFF_KIND;
+        let request = MasterContinuationRequest::new(
+            kind,
+            target.to_string(),
+            profile.to_owned(),
+            MasterContinuationReason::External(kind.to_owned()),
+            SystemTime::now(),
+        )
+        .with_metadata("envelope", envelope)
+        .with_dedupe_key(format!("external/{kind}/{stage_id}/{handoff_id}"));
+        self.enqueue_peer_occurrence(request, true, publish)
+    }
+
+    /// A supervisor can reconcile a backlog within its current turn. Select by
+    /// immutable stage/revision keys, never by age or by the latest blackboard.
+    #[cfg(any(feature = "api", test))]
+    pub(crate) fn peer_checkpoint_inbox(
+        &self,
+        master: &SessionKey,
+        profile: &str,
+        workspace: &Path,
+        acknowledge: &[String],
+        after: Option<&str>,
+    ) -> Result<Value, String> {
+        if !crate::peers::peer_handoff_allowed_for_session(master)
+            || master.profile_id() != Some(profile)
+        {
+            return Err("Only the owning supervisor can acknowledge checkpoints".into());
+        }
+        let target = self.scoped_goal_key(master);
+        let mut state = self.state();
+        let mut listed = Vec::new();
+        let mut handled = Vec::new();
+        for item in state.continuations.pending_items() {
+            if item.session_id.as_str() != target.0
+                || item.profile_id.as_str() != profile
+                || !matches!(&item.reason, MasterContinuationReason::External(kind) if kind == PEER_CHECKPOINT_HANDOFF_KIND)
+            {
+                continue;
+            }
+            let Some(envelope) = item
+                .metadata
+                .get("envelope")
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            else {
+                continue;
+            };
+            let publication = &envelope["publication"];
+            if publication["master"].as_str() != Some(&master.0)
+                || publication["workspace"].as_str().map(Path::new) != Some(workspace)
+            {
+                continue;
+            }
+            let id = item.dedupe_key.as_str();
+            if acknowledge.iter().any(|receipt| receipt == id) {
+                handled.push(item.dedupe_key.clone());
+            } else {
+                listed.push((id.to_owned(), json!({"receipt":id, "peer":publication["slug"],
+                    "handoff_id":envelope["checkpoint"]["handoff_id"], "message":envelope["checkpoint"]["message"]})));
+            }
+        }
+        if !handled.is_empty() {
+            let now = now_ms_u64();
+            let entries: Vec<_> = handled
+                .iter()
+                .map(|id| CoalescedTombstoneEntry {
+                    group_id: PEER_CHECKPOINT_HANDOFF_KIND.to_owned(),
+                    continuation_id: id.as_str().to_owned(),
+                    completed_at_ms: now,
+                    result: "acknowledged_by_owning_supervisor".to_owned(),
+                    attempt: 0,
+                })
+                .collect();
+            let store = state
+                .supervisor_store
+                .as_ref()
+                .ok_or("Checkpoint store unavailable")?;
+            store
+                .record_continuations_coalesced(&entries)
+                .map_err(|e| e.to_string())?;
+            for id in &handled {
+                cancel_pending_continuation(&mut state, id);
+            }
+        }
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        let pending = listed.len();
+        let mut remaining = listed
+            .into_iter()
+            .filter(|(id, _)| after.is_none_or(|cursor| id.as_str() > cursor));
+        let page: Vec<_> = remaining.by_ref().take(4).map(|(_, row)| row).collect();
+        let next_after = remaining
+            .next()
+            .and_then(|_| page.last())
+            .and_then(|row| row["receipt"].as_str());
+        Ok(
+            json!({"acknowledged":handled.len(),"pending":pending,"checkpoints":page,"next_after":next_after}),
+        )
+    }
+
+    fn enqueue_peer_occurrence(
+        &self,
+        request: MasterContinuationRequest,
+        requires_store: bool,
+        publish: impl FnOnce() -> std::io::Result<()>,
+    ) -> PeerSendInputEnqueueOutcome {
         let mut state = self.state();
         let occurrence_key = request.stable_dedupe_key().as_str().to_owned();
-        if state
-            .workspace_message_occurrences
-            .contains(&occurrence_key)
-        {
+        if state.accepted_peer_occurrences.contains(&occurrence_key) {
             return PeerSendInputEnqueueOutcome::Duplicate;
+        }
+        if (requires_store && state.supervisor_store.is_none()) || publish().is_err() {
+            return PeerSendInputEnqueueOutcome::PersistFailed;
         }
         match state.continuations.enqueue(request) {
             MasterContinuationEnqueueOutcome::Duplicate { .. } => {
@@ -4751,7 +5005,11 @@ impl InProcessAgentOrchestrator {
                     cancel_pending_continuation(&mut state, &continuation.dedupe_key);
                     PeerSendInputEnqueueOutcome::PersistFailed
                 } else {
-                    state.workspace_message_occurrences.insert(occurrence_key);
+                    state.accepted_peer_occurrences.insert(occurrence_key);
+                    self.signal_ready(
+                        &SessionKey(continuation.session_id.as_str().to_owned()),
+                        continuation.profile_id.as_str(),
+                    );
                     PeerSendInputEnqueueOutcome::Queued
                 }
             }
@@ -5128,12 +5386,32 @@ impl InProcessAgentOrchestrator {
         let new_session_str = new_session.to_string();
         let mut state = self.state();
         // Snapshot stranded items (immutable borrow) before mutating the queue.
+        // Receipt-bound jobs belong to the original stage and cannot become
+        // ordinary unguarded chat messages when a slug is reopened.
+        let retired: Vec<_> = state
+            .continuations
+            .pending_items()
+            .filter(|item| {
+                item.metadata.contains_key(WORKFLOW_ACTIVITY_META)
+                    && item.profile_id.as_str() == profile_id
+                    && item
+                        .metadata
+                        .get(PEER_SEND_INPUT_META_SLUG)
+                        .is_some_and(|s| s == slug)
+                    && item.session_id.as_str() != new_session_str
+            })
+            .map(|item| item.dedupe_key.clone())
+            .collect();
+        for key in retired {
+            retire_old_peer_injection(&mut state, &key, "workflow_activity_superseded");
+        }
         let stranded: Vec<(MasterContinuationDedupeKey, String, String)> = state
             .continuations
             .pending_items()
             .filter(|item| {
                 matches!(&item.reason, MasterContinuationReason::External(kind)
                     if kind == PEER_SEND_INPUT_EXTERNAL_KIND)
+                    && !item.metadata.contains_key(WORKFLOW_ACTIVITY_META)
                     && item.profile_id.as_str() == profile_id
                     && item
                         .metadata
@@ -11827,9 +12105,9 @@ struct AutonomyRuntimeState {
     /// revision and a post-restart re-persist always allocates strictly above
     /// the persisted history.
     continuation_revisions: HashMap<String, u64>,
-    // Accepted workspace message occurrences remain deduplicated after completion.
+    // Accepted peer message and checkpoint handoff occurrences remain deduplicated after completion.
     // Seeded from the same durable continuation records on restart.
-    workspace_message_occurrences: HashSet<String>,
+    accepted_peer_occurrences: HashSet<String>,
     /// Durable "already told the master" marks for scatter joins:
     /// the full join key (`scatter_join/{group}/{session}/{profile}/
     /// {cwd_hash}/{epoch}`) → "joined". Seeded from persisted
@@ -12021,7 +12299,7 @@ impl Default for AutonomyRuntimeState {
             scatter_join_state: HashMap::new(),
             delivered_child_marks: HashMap::new(),
             continuation_revisions: HashMap::new(),
-            workspace_message_occurrences: HashSet::new(),
+            accepted_peer_occurrences: HashSet::new(),
             delivered_scatter_marks: HashMap::new(),
             pending_unpersisted_scatters: std::collections::HashMap::new(),
             goals: HashMap::new(),
