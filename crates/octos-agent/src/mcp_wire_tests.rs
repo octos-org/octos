@@ -280,7 +280,12 @@ async fn should_send_mcp_screenshot_pixels_to_the_main_model() {
     .unwrap();
     assert_eq!(result.content, "done");
     let requests = http.received_requests().await.unwrap();
-    let next: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let follow_up = requests
+        .iter()
+        .filter(|r| !(r.method.as_str() == "GET" && r.url.path() == "/models"))
+        .nth(1)
+        .expect("chat request carrying the tool result");
+    let next: Value = serde_json::from_slice(&follow_up.body).unwrap();
     let messages = next["messages"].as_array().unwrap();
     assert!(
         messages.iter().any(|m| m["role"] == "tool"
