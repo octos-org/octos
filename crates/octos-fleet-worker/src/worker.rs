@@ -908,7 +908,8 @@ const WORKTREE_GIT_OP_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Build the sandboxed git-op command: wrap it in the worker's sandbox, put it in
 /// its own process group (so the timeout can group-kill a detached filter/hook
-/// child), and STRIP controller secrets from its environment.
+/// child), STRIP controller secrets from its environment, and keep git away
+/// from every configuration outside the repository.
 fn sandboxed_git_command(
     sandbox: &Arc<dyn Sandbox>,
     cwd: &Path,
@@ -926,6 +927,20 @@ fn sandboxed_git_command(
     // that dumps `env` during the populate/commit never sees controller secrets
     // (a Full-network worker would otherwise exfiltrate them).
     octos_agent::sanitize_default_subprocess_env(&mut command);
+    // Git reads no configuration from outside the repository — not the user's
+    // (`~/.gitconfig`), not the system's — exactly as the agent's own `git`
+    // commands do (the shell tool masks both). The repository's LOCAL config
+    // still applies, at the worker's contained grant. Two reasons: what a task
+    // produces must not depend on the personal settings of whoever runs the
+    // server; and under a restricted-read sandbox, where `~/.gitconfig` exists
+    // but may not be read, git would not start at all (it dies on a config
+    // file it is denied instead of skipping it).
+    command
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     command
 }
 
@@ -1272,6 +1287,18 @@ mod tests {
         // Sanity: the dump ran and produced SOME environment, so the negative
         // assertion above is not vacuously true because `env` failed to run.
         assert!(!text.is_empty(), "env dump produced no output");
+        // Git is kept away from the user's and the system's configuration:
+        // under a sandbox that denies reading `~/.gitconfig` it would not start.
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        for masked in [
+            format!("GIT_CONFIG_GLOBAL={null}"),
+            "GIT_CONFIG_NOSYSTEM=1".into(),
+        ] {
+            assert!(
+                text.lines().any(|line| line == masked),
+                "no {masked}:\n{text}"
+            );
+        }
     }
 
     #[test]

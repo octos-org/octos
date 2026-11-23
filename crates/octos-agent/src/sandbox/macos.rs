@@ -160,10 +160,10 @@ pub struct MacosSandbox {
     /// "<repo>/.git"))` ALONGSIDE the cwd grant — NOT a global `(allow
     /// file-write*)` (which would let a full-FS worker rewrite ANY host file,
     /// e.g. a LaunchAgent, ABOVE its grant) — so a Host-granted worktree worker's
-    /// `git commit` can reach `<repo>/.git` (outside its cwd). Viable ONLY under
-    /// an unrestricted-read profile (empty `read_allow_paths` → global
-    /// `(allow file-read*)`), since git must also READ `<repo>/.git`; the pool
-    /// gate (`supports_repo_git_write`) enforces that. Default `None` = today's
+    /// `git commit` can reach `<repo>/.git` (outside its cwd). Git must also
+    /// READ that directory, so under a restricted-read profile the same grant
+    /// emits `(allow file-read* (subpath "<repo>/.git"))` — the git dir only,
+    /// never the rest of the repository's checkout. Default `None` = today's
     /// cwd-only writable behaviour. The operator's explicit grant, NOT a fence.
     pub(crate) repo_git_write: Option<PathBuf>,
     /// Outer-loop #4 (docs/build-cache-pool.md §7.2) — the build-cache pool
@@ -273,12 +273,11 @@ impl Sandbox for MacosSandbox {
     }
 
     fn supports_repo_git_write(&self) -> bool {
-        // A `(subpath "<repo>/.git")` rule grants the `.git` WRITE, but
-        // `git commit` must also READ `<repo>/.git`. That read only holds under an
-        // UNRESTRICTED-read profile (empty `read_allow_paths` → global
-        // `(allow file-read*)`); a restricted-read profile would grant the write
-        // but deny the read, so the worktree flow must fall back to scratch.
-        self.read_allow_paths.is_empty()
+        // `git commit` must WRITE and READ `<repo>/.git`. The write is a
+        // `(subpath "<repo>/.git")` rule; the read holds under an
+        // unrestricted-read profile by itself, and under a restricted-read one
+        // because `wrap_command` emits the matching read rule with the grant.
+        true
     }
 
     fn runs_posix_sh(&self) -> bool {
@@ -376,6 +375,29 @@ impl Sandbox for MacosSandbox {
             String::new()
         };
 
+        // The repo `.git` common dir a worktree worker is granted, as SBPL sees
+        // it (canonical) — `None` when there is no such grant, or when it is
+        // not honoured: a #1976 write fence wins over it (reported where the
+        // fence is emitted), and a path with SBPL metacharacters is never
+        // injected (fail closed — the commit fails, caught by the worker's
+        // verification, rather than a rule being injected).
+        let granted_git_dir = match (&self.repo_git_write, &self.write_allow_globs) {
+            (Some(git_dir), None) => {
+                let real_git = std::fs::canonicalize(git_dir)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| git_dir.to_string_lossy().to_string());
+                if has_sbpl_metachars(&real_git) {
+                    tracing::error!(
+                        "repo_git_write path contains SBPL metacharacters, granting cwd-only write"
+                    );
+                    None
+                } else {
+                    Some(real_git)
+                }
+            }
+            _ => None,
+        };
+
         // Build file-read rules: global if no read_allow_paths, restricted otherwise
         let read_rules = if self.read_allow_paths.is_empty() && !self.strict_read_paths {
             "(allow file-read*)".to_string()
@@ -390,6 +412,12 @@ impl Sandbox for MacosSandbox {
             rules.push("(allow file-read-metadata)".to_string());
             // Always allow reading the workspace (use canonical path for SBPL)
             rules.push(format!("(allow file-read* (subpath \"{real_cwd}\"))"));
+            // A worktree worker's git reads the repository's `.git` common dir
+            // (objects, refs, its own worktree admin dir) as well as writing
+            // it. The git dir only: the checkout beside it stays unreadable.
+            if let Some(real_git) = &granted_git_dir {
+                rules.push(format!("(allow file-read* (subpath \"{real_git}\"))"));
+            }
             // Add configured read paths -- validate each for SBPL metacharacters
             // to prevent sandbox profile injection (same check as cwd above).
             for path in &self.read_allow_paths {
@@ -450,11 +478,11 @@ impl Sandbox for MacosSandbox {
         //   so `git commit` can reach objects/refs/worktree-admin OUTSIDE the cwd.
         //   This is TARGETED, NOT a global `(allow file-write*)` — a full-FS
         //   worker must not be able to rewrite arbitrary host files (e.g. plant a
-        //   LaunchAgent) ABOVE its grant. Only reached under unrestricted reads
-        //   (see `supports_repo_git_write`), which the pool gate enforces. The
-        //   `.git` path is validated for SBPL metacharacters; on failure it falls
-        //   back to cwd-only write (fail closed — the commit fails, caught by the
-        //   worker's branch-advance check, rather than injecting a rule).
+        //   LaunchAgent) ABOVE its grant. The matching READ of that directory is
+        //   emitted with the read rules above (`granted_git_dir`). The `.git`
+        //   path is validated for SBPL metacharacters; on failure it falls back
+        //   to cwd-only write (fail closed — the commit fails, caught by the
+        //   worker's verification, rather than injecting a rule).
         // - `workspace_write` (default): grant `file-write*` to the cwd subpath.
         // - neither (read-only profile): OMIT the grant so `(deny default)`
         //   denies the write. `/dev/null` stays writable regardless so shell
@@ -510,22 +538,13 @@ impl Sandbox for MacosSandbox {
                 );
             }
             rules
-        } else if let Some(git_dir) = &self.repo_git_write {
-            let real_git = std::fs::canonicalize(git_dir)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| git_dir.to_string_lossy().to_string());
-            if real_git
-                .bytes()
-                .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
-            {
-                tracing::error!(
-                    "repo_git_write path contains SBPL metacharacters, granting cwd-only write"
-                );
-                format!("{cwd_write_rule}{toolchain_write_rules}")
-            } else {
-                format!(
+        } else if self.repo_git_write.is_some() {
+            match &granted_git_dir {
+                Some(real_git) => format!(
                     "{cwd_write_rule}(allow file-write* (subpath \"{real_git}\"))\n{toolchain_write_rules}"
-                )
+                ),
+                // Not injectable (reported above): cwd-only write.
+                None => format!("{cwd_write_rule}{toolchain_write_rules}"),
             }
         } else if self.workspace_write {
             format!("{cwd_write_rule}{toolchain_write_rules}")

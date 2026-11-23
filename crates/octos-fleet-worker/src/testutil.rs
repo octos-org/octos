@@ -308,7 +308,7 @@ pub async fn launch(store: &FleetKernelStore, fleet_id: &str, task_id: &str) -> 
 /// under a no-op sandbox, so run_attempt tests thread THIS to exercise the agent
 /// path; a test that wants the fail-closed path passes a genuine [`NoSandbox`].
 /// It also reports `supports_repo_git_write() == true` so it doubles a full-FS
-/// backend (bwrap / full-read macOS) for the worktree-flow tests (codex fix #2b
+/// backend (bwrap / macOS) for the worktree-flow tests (codex fix #2b
 /// terminates a worktree attempt whose resolved sandbox can't grant full-FS
 /// write).
 pub struct MarkerSandbox;
@@ -331,7 +331,7 @@ impl Sandbox for MarkerSandbox {
 }
 
 /// A test double for a real isolating backend that does NOT support full-FS
-/// write (docker / restricted-read macOS): non-noop but
+/// write (docker): non-noop but
 /// `supports_repo_git_write() == false`. Used to prove codex fix #2b — a worktree
 /// attempt whose RESOLVED sandbox degraded to non-full-FS-write is terminated.
 pub struct RestrictedSandbox;

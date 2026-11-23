@@ -82,8 +82,8 @@ pub struct PoolConfig {
     /// `FsGrant::Host` worker — the third gate condition for the worktree flow
     /// (§5). Computed at serve boot from the base sandbox's
     /// `supports_repo_git_write()` AND `runs_posix_sh()` (#2707): `true` for
-    /// bwrap and unrestricted-read macOS, `false` for docker, restricted-read
-    /// macOS, Landlock, AppContainer, and no sandbox. When `false`, EVERY task
+    /// bwrap and macOS, `false` for docker, Landlock, AppContainer, and no
+    /// sandbox. When `false`, EVERY task
     /// takes the SCRATCH fallback even on a git controller root with a Host
     /// grant (running the worktree flow on a backend that can't grant `.git`
     /// read+write would lose the deliverable — the worker couldn't commit, then
