@@ -575,7 +575,8 @@ impl SessionRuntime {
         // or home that holds them.
         if chat_root.is_none() {
             super::chat_workspace::register_profile(&chat_records_dir);
-            sandbox.hidden_folders = Some(super::chat_workspace::reserved_folders());
+            sandbox.hidden_folders =
+                Some(super::chat_workspace::reserved_folders(&chat_records_dir));
         }
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
@@ -875,8 +876,9 @@ impl SessionRuntime {
                     // folders, even from a project or home that holds them.
                     Some(Arc::new(match &chat_root {
                         Some(root) => scope.with_pinned_workspace(root.clone()),
-                        None => scope
-                            .with_shared_hidden_folders(super::chat_workspace::reserved_folders()),
+                        None => scope.with_shared_hidden_folders(
+                            super::chat_workspace::reserved_folders(&chat_records_dir),
+                        ),
                     }))
                 }
                 Err(err) => {
@@ -975,7 +977,7 @@ impl SessionRuntime {
                 snapshot_cfg.keep_last,
             ) {
                 // Snapshots and restores never reach a chat folder either.
-                let reserved = super::chat_workspace::reserved_folders();
+                let reserved = super::chat_workspace::reserved_folders(&profile.data_dir);
                 let manager = manager.with_hidden_folders(reserved);
                 agent = agent.with_snapshot_manager(std::sync::Arc::new(manager));
             }

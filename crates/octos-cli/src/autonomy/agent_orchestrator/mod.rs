@@ -11534,8 +11534,9 @@ fn monitor_sandbox_config(record: &AutonomyMonitorRecord) -> octos_agent::Sandbo
     // A monitor runs for a session that is not a chat (a chat has no goal
     // tools), so like that session's shell it never sees any profile's chat
     // folders (UPCR-2026-R1EFC56A3).
+    let data_dir = PathBuf::from(record.data_dir.as_deref().unwrap_or_default());
     octos_agent::SandboxConfig {
-        hidden_folders: Some(crate::runtime::chat_workspace::reserved_folders()),
+        hidden_folders: Some(crate::runtime::chat_workspace::reserved_folders(&data_dir)),
         ..profile_monitor_sandbox_config(record)
     }
 }

@@ -181,7 +181,7 @@ pub(crate) fn configure_server_root(
     let root = canonical_dir(&data_dir.join(CHATS_DIR));
     validate_server_root(&root, profile_data_dirs, workspace_roots)?;
     private_dir(&root, true)?;
-    reserved_folders()
+    reserved_folders(data_dir)
         .add(root.clone())
         .map_err(std::io::Error::other)?;
     layout_write().server_root = Some(root.clone());
@@ -210,7 +210,7 @@ pub(crate) fn unregister_profile(data_dir: &Path) {
     layout.profile_server_roots.remove(&profile_dir);
     if layout.legacy_profiles.remove(&profile_dir).is_some() {
         drop(layout);
-        reserved_folders().remove(&chats_root(&profile_dir));
+        reserved_folders(&profile_dir).remove(&chats_root(&profile_dir));
     }
 }
 
@@ -528,12 +528,38 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     holds || server_holds || is_in_chat_folder(&data_dir, &path)
 }
 
-/// The chats folders of the profiles this process serves, shared by every
-/// scope and `send_file` of a session that is not a chat, so a profile that
-/// starts later still keeps its chats from sessions already running.
-pub(crate) fn reserved_folders() -> octos_core::HiddenFolders {
-    static RESERVED: std::sync::OnceLock<octos_core::HiddenFolders> = std::sync::OnceLock::new();
-    RESERVED.get_or_init(Default::default).clone()
+/// The chats folders of the profiles served alongside the one in
+/// `data_dir`, shared by every scope and `send_file` of a session that is not
+/// a chat, so a profile that starts later still keeps its chats from sessions
+/// already running. A server process keeps one list for all its profiles.
+pub(crate) fn reserved_folders(data_dir: &Path) -> octos_core::HiddenFolders {
+    type Lists = std::collections::HashMap<Option<PathBuf>, octos_core::HiddenFolders>;
+    static RESERVED: std::sync::OnceLock<std::sync::Mutex<Lists>> = std::sync::OnceLock::new();
+    let mut lists = RESERVED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    lists.entry(fixture_root(data_dir)).or_default().clone()
+}
+
+/// The temporary directory a test's server lives in, which the test deletes
+/// when it ends. A test binary runs many such servers side by side; each
+/// keeps its own reserved list, so no sandbox is ever asked to hide a folder
+/// another test has already deleted (it would refuse to run, by design).
+#[cfg(test)]
+fn fixture_root(data_dir: &Path) -> Option<PathBuf> {
+    static TEMP: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let temp = TEMP.get_or_init(|| canonical_dir(&std::env::temp_dir()));
+    let below = canonical_dir(data_dir)
+        .strip_prefix(temp)
+        .ok()?
+        .to_path_buf();
+    below.components().next().map(|first| temp.join(first))
+}
+
+#[cfg(not(test))]
+fn fixture_root(_data_dir: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// Reserve a profile's chats folder as the profile starts. A profile already
@@ -545,7 +571,7 @@ pub(crate) fn register_profile(data_dir: &Path) {
     let result = if layout_read().legacy_profiles.contains_key(&profile_dir) {
         reserve_profile(data_dir)
     } else if let Some(root) = server_root() {
-        reserved_folders()
+        reserved_folders(data_dir)
             .add(root.clone())
             .map_err(std::io::Error::other)
             .and_then(|()| private_dir(&root, true))
@@ -576,7 +602,7 @@ pub(crate) fn register_existing_profile(data_dir: &Path) -> std::io::Result<()> 
 /// before the profile's first chat.
 fn reserve_profile(data_dir: &Path) -> std::io::Result<()> {
     let root = chats_root(&canonical_dir(data_dir));
-    reserved_folders()
+    reserved_folders(data_dir)
         .add(root.clone())
         .map_err(std::io::Error::other)?;
     private_dir(&root, true)
@@ -589,7 +615,7 @@ fn reserve_profile(data_dir: &Path) -> std::io::Result<()> {
 #[cfg(feature = "api")]
 pub(crate) fn reserved_roots(data_dir: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for root in std::iter::once(chats_root(data_dir)).chain(reserved_folders().folders()) {
+    for root in std::iter::once(chats_root(data_dir)).chain(reserved_folders(data_dir).folders()) {
         roots.extend(std::fs::canonicalize(&root));
         roots.push(root);
     }
@@ -764,7 +790,7 @@ mod server_root_tests {
             .expect("configure server root");
         register_existing_profile(&profile).expect("legacy profile root");
         let legacy_root = canonical_dir(&chats_root(&profile));
-        let reserved = reserved_folders();
+        let reserved = reserved_folders(&profile);
         assert!(reserved.folders().contains(&legacy_root));
 
         std::fs::remove_dir_all(&profile).unwrap();
@@ -848,16 +874,9 @@ mod server_root_tests {
                 secret.display()
             )
         };
-        // Other tests may have dropped their TempDirs after registering
-        // fixture roots in this process-global list. Remove stale fixture
-        // entries here; the roots under test are created by production calls.
-        let reserved = reserved_folders();
-        for root in reserved.folders().into_iter().filter(|root| !root.exists()) {
-            reserved.remove(&root);
-        }
         let sandbox = octos_agent::create_sandbox(&octos_agent::SandboxConfig {
             mode,
-            hidden_folders: Some(reserved_folders()),
+            hidden_folders: Some(reserved_folders(&new_profile)),
             ..octos_agent::SandboxConfig::default()
         });
         if sandbox.refusal().is_some() {

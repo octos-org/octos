@@ -80,7 +80,12 @@ A connection that does not request it sees byte-identical replies.
   so a Profile registered while the server runs is already covered. Legacy
   profiles are reserved by the folder their data directory resolves to, however
   the profile's `data_dir` is spelled; a profile whose folder cannot be reserved
-  cannot create a chat:
+  cannot create a chat. The server keeps one reserved list for all its
+  profiles. (A unit-test binary runs many fixture servers side by side, each
+  in a temporary directory deleted when its test ends; there each such
+  directory keeps its own list, so no test's sandbox is asked to hide a folder
+  another test has deleted. The wire behaviour is unchanged.) The reserved
+  folders are kept from:
   - its file tools: its session scope hides those folders, so a path there,
     by name or through a symlink, is out of scope, and directory walks skip
     them. `diff_edit`, which resolves paths itself, refuses a path the scope

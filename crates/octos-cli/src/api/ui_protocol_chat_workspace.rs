@@ -100,7 +100,7 @@ fn turn_send_file_tool(
         Some(root) => tool = tool.with_base_dir_only(root),
         None => {
             chat_workspace::register_profile(chat_records_dir);
-            tool = tool.with_hidden_folders(chat_workspace::reserved_folders());
+            tool = tool.with_hidden_folders(chat_workspace::reserved_folders(chat_records_dir));
         }
     }
     for extra in extras {

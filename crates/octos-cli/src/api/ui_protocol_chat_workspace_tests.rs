@@ -363,8 +363,8 @@ async fn chat_tools_cannot_leave_the_chat_folder() {
     std::fs::write(top.join(".gitignore"), "!**/chats/\n!**/chats/**\n").unwrap();
     let draft = root_b.join("draft.txt");
     std::fs::write(&draft, "draft one").unwrap();
-    let hiding =
-        snapshot_manager(&profile, &top).with_hidden_folders(chat_workspace::reserved_folders());
+    let reserved = chat_workspace::reserved_folders(&profile.data_dir);
+    let hiding = snapshot_manager(&profile, &top).with_hidden_folders(reserved);
     let hidden = hiding.take_snapshot("hidden").unwrap();
     let old = snapshot_manager(&profile, &top)
         .take_snapshot("unhidden")
