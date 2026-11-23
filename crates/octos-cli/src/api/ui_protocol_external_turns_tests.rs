@@ -95,17 +95,20 @@ pub(crate) fn unique(name: &str) -> SessionKey {
 }
 
 impl Fixture {
-    /// Stops this server. A turn's background work can hold the runtime a
-    /// little past its ended record, and `episodes.redb` admits one opener.
+    /// Stops this server. A turn's background work can hold `episodes.redb`
+    /// a little past its ended record, and the store admits one opener: wait
+    /// until it opens again, failing on any other error.
     async fn stop(self) {
-        let runtime = ensure_session_profile_runtime(&self.state, Some(CHAT_PROFILE)).await;
-        let memory = Arc::downgrade(&runtime.unwrap().unwrap().memory);
+        let data_dir = self.profile.data_dir.clone();
         drop(self);
         for _ in 0..2000 {
-            if memory.strong_count() == 0 {
-                return;
+            match octos_memory::EpisodeStore::open(&data_dir).await {
+                Ok(_) => return,
+                Err(error) if octos_memory::is_episode_store_locked(&error) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => panic!("{error:?}"),
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the stopped server still holds episodes.redb");
     }
