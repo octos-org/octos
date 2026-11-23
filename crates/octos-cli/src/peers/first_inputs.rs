@@ -1,0 +1,370 @@
+//! A staged peer's declared task inputs ([`octos_core::task_inputs`]).
+//!
+//! `peer_handoff` may name the files its peer needs to begin. They are checked
+//! against the peer's working directory and recorded beside the brief at
+//! staging; the server then puts them into the first message of the peer's
+//! conversation, whichever client sends that first turn. The reading, the
+//! budget and the report are [`octos_agent::task_inputs`]'s — the resolver a
+//! fleet task's worker uses.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use octos_agent::policy::FilesystemScope;
+use octos_agent::task_inputs::{
+    InputAuthority, InputContext, check_declared_inputs, input_budget_tokens,
+    resolve_declared_inputs,
+};
+use octos_core::task_inputs::{
+    DeclaredInput, InputOutcome, InputReport, OmitReason, parse_declared_inputs,
+};
+use octos_core::ui_protocol::RpcError;
+use octos_core::{Message, SessionKey, SessionScope};
+use octos_llm::LlmProvider;
+use tracing::{info, warn};
+
+use super::peer_io;
+
+/// The declaration, as the handoff gave it. Written before `brief.md`.
+const DECLARED_LEAF: &str = "inputs.json";
+/// What the peer's first message carried of the declaration.
+const REPORT_LEAF: &str = "inputs-report.json";
+
+/// Check `inputs` against the peer's working directory and record them in
+/// `peer_dir`. Returns what the check found, or `None` when nothing is
+/// declared.
+///
+/// A required input that is not there to deliver refuses the staging: the
+/// handoff's caller can still fix the declaration, a started peer cannot. An
+/// input outside the working directory is left to the peer session's own
+/// reach, which only its first turn knows.
+pub(super) fn record_at_staging(
+    peer_dir: &Path,
+    cwd: &Path,
+    fenced: bool,
+    inputs: &[DeclaredInput],
+) -> Result<Option<InputReport>, RpcError> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let report = check_declared_inputs(
+        inputs,
+        InputAuthority::Filesystem {
+            base_dir: cwd,
+            scope: FilesystemScope::Workspace,
+        },
+    );
+    if report
+        .undelivered_required()
+        .any(|record| !left_to_the_peers_reach(&record.outcome))
+    {
+        let fence = if fenced {
+            " The peer runs in its own git worktree, which holds only committed files."
+        } else {
+            ""
+        };
+        return Err(RpcError::invalid_params(format!(
+            "peer not staged: a required input cannot be delivered from the peer's working \
+             directory ({}).{fence} Fix the declaration, or mark the input optional.\n{}",
+            cwd.display(),
+            staging_note(&report),
+        )));
+    }
+    let body = serde_json::to_string(inputs)
+        .map_err(|err| RpcError::internal_error(format!("failed to encode peer inputs: {err}")))?;
+    peer_io::write_peer_file_atomic(peer_dir, DECLARED_LEAF, &body)
+        .map_err(|err| RpcError::internal_error(format!("failed to record peer inputs: {err}")))?;
+    Ok(Some(report))
+}
+
+fn left_to_the_peers_reach(outcome: &InputOutcome) -> bool {
+    matches!(
+        outcome,
+        InputOutcome::Omitted {
+            reason: OmitReason::Denied,
+            ..
+        }
+    )
+}
+
+/// One line per declared input: what the staging check found.
+pub(super) fn staging_note(report: &InputReport) -> String {
+    let mut out = String::new();
+    for record in &report.inputs {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let required = if record.required {
+            "required"
+        } else {
+            "optional"
+        };
+        match &record.outcome {
+            InputOutcome::Delivered { form, bytes, .. } => out.push_str(&format!(
+                "- `{}`: ready ({}, {bytes} bytes)",
+                record.path,
+                form.as_str()
+            )),
+            outcome @ InputOutcome::Omitted { detail, .. } if left_to_the_peers_reach(outcome) => {
+                out.push_str(&format!(
+                    "- `{}`: outside the peer's working directory ({required}); the peer's own \
+                     read access decides at its first request: {detail}",
+                    record.path
+                ))
+            }
+            InputOutcome::Omitted { reason, detail } => out.push_str(&format!(
+                "- `{}`: NOT ready ({required}, {}): {detail}",
+                record.path,
+                reason.as_str()
+            )),
+        }
+    }
+    out
+}
+
+/// The inputs `peer_dir`'s peer was staged with, for a fork that starts from
+/// the same brief. A declaration that cannot be read is an error, never "none".
+pub(super) fn declared(peer_dir: &Path) -> Result<Vec<DeclaredInput>, String> {
+    match read_declared(peer_dir) {
+        Declared::None => Ok(Vec::new()),
+        Declared::Inputs(inputs) => Ok(inputs),
+        Declared::Unreadable(err) => Err(err),
+    }
+}
+
+enum Declared {
+    None,
+    Inputs(Vec<DeclaredInput>),
+    Unreadable(String),
+}
+
+fn read_declared(peer_dir: &Path) -> Declared {
+    let body = match peer_io::read_peer_control_file(
+        peer_dir,
+        DECLARED_LEAF,
+        peer_io::PEER_FILE_READ_CAP_LARGE,
+    ) {
+        Ok(None) => return Declared::None,
+        Ok(Some(body)) => body,
+        Err(err) => return Declared::Unreadable(err.to_string()),
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|err| err.to_string())
+        .and_then(|value| parse_declared_inputs(Some(&value)));
+    match parsed {
+        Ok(inputs) if inputs.is_empty() => Declared::None,
+        Ok(inputs) => Declared::Inputs(inputs),
+        Err(err) => Declared::Unreadable(err),
+    }
+}
+
+/// Whose reach decides what a peer may be given: its own session's, as its
+/// file tools have it.
+pub(crate) enum PeerReadAuthority {
+    Session(Arc<SessionScope>),
+    Filesystem {
+        base_dir: PathBuf,
+        scope: FilesystemScope,
+    },
+}
+
+/// Put the declared inputs of the peer behind `session` into `message`, the
+/// first message of its conversation.
+///
+/// A session that is not a staged peer's, or whose peer declared nothing,
+/// leaves `message` as it is. Otherwise `message` gains either the inputs
+/// (each whole, with a manifest of what was delivered and what was left out
+/// and why) or, when a required one could not be delivered, a notice saying
+/// that none were — a peer has no way to report back but to run. What was
+/// decided is recorded beside the peer's brief.
+pub(crate) async fn attach_to_first_message(
+    peers_root: &Path,
+    session: &SessionKey,
+    turn_id: &str,
+    authority: PeerReadAuthority,
+    llm: &Arc<dyn LlmProvider>,
+    message: &mut Message,
+) {
+    let Some(slug) = session
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+    else {
+        return;
+    };
+    let Some(peer_dir) = super::staged_peer_dir(peers_root, slug) else {
+        return;
+    };
+    let inputs = match read_declared(&peer_dir) {
+        Declared::None => return,
+        Declared::Inputs(inputs) => inputs,
+        Declared::Unreadable(error) => {
+            warn!(peer = slug, %error, "peer inputs declaration is unreadable; none delivered");
+            message.content.push_str(&undeclared_notice(&error));
+            return;
+        }
+    };
+
+    llm.ensure_ready().await;
+    let budget_tokens = input_budget_tokens(llm.context_window());
+    let accepts_images = llm.accepts_image_input();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let authority = match &authority {
+            PeerReadAuthority::Session(scope) => InputAuthority::Session(scope),
+            PeerReadAuthority::Filesystem { base_dir, scope } => InputAuthority::Filesystem {
+                base_dir,
+                scope: *scope,
+            },
+        };
+        resolve_declared_inputs(
+            &inputs,
+            &InputContext {
+                authority,
+                budget_tokens,
+                accepts_images,
+            },
+        )
+    })
+    .await;
+    let (delivered, report) = match resolved {
+        Ok(Ok(resolved)) => {
+            resolved.attach_to(message);
+            (true, resolved.report)
+        }
+        Ok(Err(err)) => {
+            message.content.push_str("\n\n");
+            message.content.push_str(&err.notice());
+            (false, err.report)
+        }
+        Err(error) => {
+            warn!(peer = slug, %error, "reading peer inputs failed; none delivered");
+            message
+                .content
+                .push_str(&undeclared_notice("they could not be read"));
+            return;
+        }
+    };
+    if delivered {
+        info!(
+            peer = slug,
+            turn = turn_id,
+            "peer first-turn inputs:\n{}",
+            report.summary()
+        );
+    } else {
+        warn!(
+            peer = slug,
+            turn = turn_id,
+            "peer first-turn inputs withheld, a required one is undeliverable:\n{}",
+            report.summary()
+        );
+    }
+    let record = serde_json::json!({
+        "turn_id": turn_id,
+        "delivered": delivered,
+        "report": report,
+    });
+    if let Err(error) = peer_io::write_peer_file_atomic(&peer_dir, REPORT_LEAF, &record.to_string())
+    {
+        warn!(peer = slug, %error, "failed to record the peer's input report");
+    }
+}
+
+fn undeclared_notice(why: &str) -> String {
+    format!(
+        "\n\n## Task inputs — NOT delivered\n\n\
+         This task declared input files, but the declaration could not be used ({why}), so \
+         none are in this message. Do not guess what they say: read the files the brief \
+         names yourself, and say in your result that the declared inputs were not delivered.\n"
+    )
+}
+
+/// What the first message of `slug`'s conversation carried of its declared
+/// inputs: `(delivered, report)`. `None` until that message was composed.
+#[cfg(test)]
+pub(crate) fn delivery_record(peers_root: &Path, slug: &str) -> Option<(bool, InputReport)> {
+    let dir = super::staged_peer_dir(peers_root, slug)?;
+    let body = peer_io::read_peer_file(&dir, REPORT_LEAF, peer_io::PEER_FILE_READ_CAP_LARGE)?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some((
+        value["delivered"].as_bool()?,
+        serde_json::from_value(value["report"].clone()).ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use octos_core::task_inputs::InputKind;
+
+    fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer_dir = tmp.path().join("peers/edison");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        (tmp, peer_dir, cwd)
+    }
+
+    #[test]
+    fn should_record_the_declaration_as_given_when_every_required_input_is_there() {
+        let (_tmp, peer_dir, cwd) = dirs();
+        std::fs::write(cwd.join("src/lib.rs"), "pub fn add() {}\n").unwrap();
+        let inputs = vec![
+            DeclaredInput::required("src/lib.rs"),
+            DeclaredInput {
+                kind: InputKind::Image,
+                sha256: Some("a".repeat(64)),
+                ..DeclaredInput::optional("renders/page-03.png")
+            },
+        ];
+
+        let report = record_at_staging(&peer_dir, &cwd, false, &inputs)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(declared(&peer_dir).unwrap(), inputs);
+        let note = staging_note(&report);
+        assert!(
+            note.contains("- `src/lib.rs`: ready (text, 16 bytes)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("- `renders/page-03.png`: NOT ready (optional, missing)"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn should_tell_a_fenced_peers_master_why_an_uncommitted_input_is_not_there() {
+        let (_tmp, peer_dir, cwd) = dirs();
+
+        let err = record_at_staging(
+            &peer_dir,
+            &cwd,
+            true,
+            &[DeclaredInput::required("renders/page-03.png")],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.message
+                .contains("`renders/page-03.png`: NOT ready (required, missing)"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("holds only committed files"),
+            "{}",
+            err.message
+        );
+        assert!(declared(&peer_dir).unwrap().is_empty(), "nothing recorded");
+    }
+
+    #[test]
+    fn should_report_a_corrupt_declaration_instead_of_reading_it_as_none() {
+        let (_tmp, peer_dir, _cwd) = dirs();
+        std::fs::write(peer_dir.join(DECLARED_LEAF), "[{\"path\": 3}]").unwrap();
+
+        assert!(declared(&peer_dir).is_err());
+    }
+}

@@ -81,6 +81,7 @@ pub fn task_spec_granted(
         deps: deps.iter().map(|s| s.to_string()).collect(),
         acceptance,
         grant,
+        inputs: Vec::new(),
     }
 }
 

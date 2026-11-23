@@ -38939,6 +38939,8 @@ async fn run_standalone_turn(
         // Prompt bounding remains ContextManager's projection responsibility.
         session.messages.clone()
     };
+    // The conversation has no message yet: this turn's is its first.
+    let opens_the_conversation = raw_history.is_empty();
     // Resolve a lazily-probed context window before threshold compaction.
     llm_provider.ensure_ready().await;
     let (
@@ -41364,6 +41366,36 @@ async fn run_standalone_turn(
             abort: heartbeat.abort_handle(),
         })
     });
+    // UPCR-2026-RBC0874AA — first-turn task inputs: a peer staged with declared
+    // inputs gets them in the first message of its conversation, read under
+    // this session's own reach and before that message is committed, so the
+    // first model request carries them and every later one replays them.
+    if opens_the_conversation && !skip_internal_user_persist {
+        let authority = match request_agent.session_scope() {
+            Some(scope) => crate::peers::first_inputs::PeerReadAuthority::Session(scope.clone()),
+            None => crate::peers::first_inputs::PeerReadAuthority::Filesystem {
+                base_dir: session_runtime.workspace_root.clone(),
+                scope: session_runtime.permissions.filesystem_scope,
+            },
+        };
+        let mut first = Message::user(std::mem::take(&mut prompt));
+        first.media = std::mem::take(&mut turn_media_paths);
+        let typed_len = first.content.len();
+        crate::peers::first_inputs::attach_to_first_message(
+            &session_runtime.profile.data_dir.join("peers"),
+            &session_id,
+            &turn_id.0.to_string(),
+            authority,
+            &request_agent.llm_provider(),
+            &mut first,
+        )
+        .await;
+        if let Some(persisted) = voice_user_content_for_persist.as_mut() {
+            persisted.push_str(&first.content[typed_len..]);
+        }
+        prompt = first.content;
+        turn_media_paths = first.media;
+    }
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
     // `session`/`turn` from this span (postfix `.instrument` keeps the block
@@ -48117,3 +48149,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]
 mod peer_host_tools_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_first_inputs_tests.rs"]
+mod first_inputs_tests;

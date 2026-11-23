@@ -49,6 +49,7 @@ use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
 pub(crate) mod app_binding;
+pub(crate) mod first_inputs;
 pub(crate) mod host_tools;
 pub(crate) mod purge;
 mod recovery;
@@ -2264,6 +2265,9 @@ pub(crate) struct StagedPeer {
     pub(crate) cwd: PathBuf,
     /// `peer/<slug>` when a worktree fence was created.
     pub(crate) worktree_branch: Option<String>,
+    /// What the staging check found of the declared first-turn inputs
+    /// ([`first_inputs`]); `None` when none were declared.
+    pub(crate) inputs: Option<octos_core::task_inputs::InputReport>,
 }
 
 /// A peer budget is independent of the master's goal budget. Usage is keyed
@@ -2379,6 +2383,42 @@ pub(crate) fn stage_peer_with_budget(
     // memory namespace), written BEFORE `brief.md` so the peer never becomes
     // visible unbound. `None` for every agent-staged peer.
     host_binding: Option<&app_binding::PeerHostBinding>,
+) -> Result<StagedPeer, RpcError> {
+    stage_peer_with_inputs(
+        peers_root,
+        workspace_root,
+        seed,
+        name,
+        originator,
+        brief,
+        worktree,
+        goal_id,
+        task_id,
+        token_budget,
+        host_binding,
+        &[],
+    )
+}
+
+/// [`stage_peer_with_budget`], for a peer whose handoff declares the files its
+/// first model request must bring ([`first_inputs`]). They are checked against
+/// the peer's working directory and recorded before `brief.md`, so a peer that
+/// becomes visible already carries them; a required one that is not there
+/// refuses the staging.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_peer_with_inputs(
+    peers_root: &Path,
+    workspace_root: &Path,
+    seed: &str,
+    name: Option<&str>,
+    originator: Option<&str>,
+    brief: &str,
+    worktree: bool,
+    goal_id: Option<&str>,
+    task_id: Option<&str>,
+    token_budget: Option<u64>,
+    host_binding: Option<&app_binding::PeerHostBinding>,
+    inputs: &[octos_core::task_inputs::DeclaredInput],
 ) -> Result<StagedPeer, RpcError> {
     if token_budget == Some(0) {
         return Err(RpcError::invalid_params(
@@ -2590,6 +2630,16 @@ pub(crate) fn stage_peer_with_budget(
         }
     }
 
+    // First-turn inputs: recorded BEFORE `brief.md` like the goal above, and
+    // before the build-cache slot so a refused declaration holds none.
+    let inputs_report = match first_inputs::record_at_staging(&peer_dir, &cwd, worktree, inputs) {
+        Ok(report) => report,
+        Err(err) => {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(err);
+        }
+    };
+
     // Outer-loop #4 (§4.1/§7.4): acquire the FIRST-turn build-cache slot and
     // record it BEFORE `brief.md` (the visibility gate) — the same ordering
     // discipline as `goal` above: a peer that becomes bootable must already
@@ -2668,6 +2718,7 @@ pub(crate) fn stage_peer_with_budget(
         slug,
         brief_path,
         cwd,
+        inputs: inputs_report,
     })
 }
 
@@ -3018,7 +3069,7 @@ pub(crate) fn build_peer_handoff_callback(
         };
         let (effective_worktree, fence_warning) =
             resolve_peer_worktree(request.worktree, &fence_reasons);
-        let staged = stage_peer_with_budget(
+        let staged = stage_peer_with_inputs(
             &peers_root,
             &workspace_root,
             &request.name,
@@ -3031,6 +3082,7 @@ pub(crate) fn build_peer_handoff_callback(
             request.task_id.as_deref(),
             request.token_budget,
             None,
+            &request.inputs,
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -3108,6 +3160,7 @@ pub(crate) fn build_peer_handoff_callback(
             worktree_branch: staged.worktree_branch,
             model_note,
             token_budget: request.token_budget,
+            inputs_note: staged.inputs.as_ref().map(first_inputs::staging_note),
         })
     })
 }
@@ -4474,7 +4527,11 @@ pub(crate) fn fork_staged_peer(
     // can never share one address (`resolve_peer_name_to_slug` falls back to
     // the unique slug).
     let named = new_name.map(str::trim).filter(|name| !name.is_empty());
-    let staged = stage_peer_with_budget(
+    // The fork starts over from the source's brief, so it starts with the
+    // inputs that brief was handed off with.
+    let inputs = first_inputs::declared(&source_dir)
+        .map_err(|err| format!("peer '{slug}' has an unreadable inputs declaration: {err}"))?;
+    let staged = stage_peer_with_inputs(
         peers_root,
         &workspace_root,
         &fork_name,
@@ -4486,6 +4543,7 @@ pub(crate) fn fork_staged_peer(
         None,
         token_budget,
         None,
+        &inputs,
     )
     .map_err(|err| format!("failed to stage the fork: {err:?}"))?;
     let new_slug = staged.slug;

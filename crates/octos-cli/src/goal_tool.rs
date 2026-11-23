@@ -127,6 +127,8 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
             })
             .unwrap_or_default();
         let grant = parse_grant(task.get("grant"), &task_id)?;
+        let inputs = octos_core::task_inputs::parse_declared_inputs(task.get("inputs"))
+            .map_err(|err| format!("task `{task_id}`: {err}"))?;
         out.push(TaskSpec {
             task_id,
             title,
@@ -134,6 +136,7 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
             deps,
             acceptance,
             grant,
+            inputs,
         });
     }
     Ok(out)
@@ -626,6 +629,7 @@ impl Tool for GoalPlanTool {
                                 "items": { "type": "string" },
                                 "description": "Shell commands (split argv, no shell) that must each exit 0 for the task to be accepted. Omit for a task with no mechanical check."
                             },
+                            "inputs": octos_core::task_inputs::declared_inputs_schema(),
                             "grant": {
                                 "type": "object",
                                 "description": "Optional operator capability grant for THIS task's worker. Omit for least privilege (today's closed worker: no network, base file tools, own scratch dir). Grant more only where needed.",
@@ -1946,6 +1950,71 @@ impl Tool for MonitorDeleteTool {
                 success: false,
                 ..Default::default()
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod declared_inputs_tests {
+    use super::*;
+    use octos_core::task_inputs::{DeclaredInput, InputKind};
+
+    fn plan(task: Value) -> Value {
+        json!({ "tasks": [task] })
+    }
+
+    #[test]
+    fn should_offer_task_inputs_to_the_planner_and_carry_them_onto_the_task() {
+        // The keeper is told what declaring an input does...
+        let schema = GoalPlanTool::new("p").input_schema();
+        let field = &schema["properties"]["tasks"]["items"]["properties"]["inputs"];
+        assert!(
+            field["description"]
+                .as_str()
+                .unwrap()
+                .contains("FIRST model request"),
+            "{field}"
+        );
+        // ...and what it declares reaches the task.
+        let tasks = parse_task_specs(&plan(json!({
+            "task_id": "fix",
+            "title": "Fix the failing test",
+            "inputs": [
+                "src/lib.rs",
+                { "path": "renders/page-03.png", "kind": "image", "required": false },
+            ],
+        })))
+        .unwrap();
+
+        assert_eq!(
+            tasks[0].inputs,
+            [
+                DeclaredInput::required("src/lib.rs"),
+                DeclaredInput {
+                    kind: InputKind::Image,
+                    ..DeclaredInput::optional("renders/page-03.png")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn should_reject_plan_when_a_tasks_inputs_are_malformed() {
+        for bad in [
+            json!("src/lib.rs"),
+            json!([{ "kind": "text" }]),
+            json!([{ "path": "a", "requird": false }]),
+        ] {
+            let err = parse_task_specs(&plan(json!({
+                "task_id": "fix",
+                "title": "Fix the failing test",
+                "inputs": bad,
+            })))
+            .unwrap_err();
+            assert!(
+                err.contains("`fix`") && err.contains("inputs"),
+                "got: {err}"
+            );
         }
     }
 }

@@ -102,6 +102,10 @@ impl LlmProvider for SwappableProvider {
         provider.ensure_ready().await;
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.inner.read().unwrap().accepts_image_input()
+    }
+
     fn model_id(&self) -> &str {
         // &'static str is Copy — reading it from the guard yields a value
         // that doesn't depend on the guard's lifetime.

@@ -235,9 +235,10 @@ pub async fn run_attempt(
         }
     }
 
-    // 2. Build the Task from the rendered brief + acceptance criteria. For a
-    //    worktree attempt, add the deliverable hint (belt-and-suspenders on the
-    //    auto-commit): the worker's deliverable is a COMMIT on its branch.
+    // 2. Render the brief the Task is built from (step 3a builds the Task,
+    //    once the agent whose model reads it exists). For a worktree attempt,
+    //    add the deliverable hint (belt-and-suspenders on the auto-commit):
+    //    the worker's deliverable is a COMMIT on its branch.
     let mut brief = render_brief(task_view);
     if worktree.is_some() {
         brief.push_str(
@@ -247,21 +248,6 @@ pub async fn run_attempt(
              an empty branch with no changes counts as NO deliverable.)\n",
         );
     }
-    let task = Task::new(
-        TaskKind::Custom {
-            name: "fleet_task".to_string(),
-            params: serde_json::json!({
-                "fleet_id": fleet_id,
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-            }),
-        },
-        TaskContext {
-            working_dir: working_dir.to_path_buf(),
-            working_memory: vec![Message::user(brief)],
-            ..Default::default()
-        },
-    );
 
     // The sandbox scope comes from THIS task's grant (projected fresh per
     // attempt), not a hardcode:
@@ -381,7 +367,39 @@ pub async fn run_attempt(
                 );
                 Computed::terminated(format!("invalid worker grant: {err}"))
             }
-            Ok(agent) => {
+            Ok(agent) => 'run: {
+                // 3a. The first message: the brief, and with it the inputs the
+                //     task declared, whole. They are read as this worker's own
+                //     `read_file` would read them, so a declaration never
+                //     reaches past the worker's grant. A required input that
+                //     cannot be delivered ends the attempt here, before any
+                //     model call, with the report of every input as its reason.
+                let first = match first_message(brief, task_view, working_dir, &agent).await {
+                    Ok(first) => first,
+                    Err(reason) => {
+                        tracing::warn!(
+                            %fleet_id, %task_id, %attempt_id, %reason,
+                            "fleet worker: declared task inputs not delivered; terminating the attempt",
+                        );
+                        break 'run Computed::terminated(reason);
+                    }
+                };
+                let task = Task::new(
+                    TaskKind::Custom {
+                        name: "fleet_task".to_string(),
+                        params: serde_json::json!({
+                            "fleet_id": fleet_id,
+                            "task_id": task_id,
+                            "attempt_id": attempt_id,
+                        }),
+                    },
+                    TaskContext {
+                        working_dir: working_dir.to_path_buf(),
+                        working_memory: vec![first],
+                        ..Default::default()
+                    },
+                );
+
                 // 4. Run under a HARD deadline — `run_task` is cancel-safe to
                 //    drop and has NO internal wall-clock cap, so the timeout
                 //    wrapper is mandatory. `run_task_with_tracker` folds each
@@ -644,6 +662,64 @@ pub(crate) fn tracked_tokens(tracker: &TokenTracker) -> u64 {
 /// cancel path) so BOTH settle honestly from reliable inputs.
 pub(crate) fn escalation_tokens_with_floor(tracked: u64, reserved: u64) -> u64 {
     if tracked > 0 { tracked } else { reserved }
+}
+
+/// The worker's first user message: `brief`, with the inputs the task declared
+/// attached ([`octos_agent::task_inputs`]). `Err` carries the reason a required
+/// input could not be delivered, followed by what became of every input.
+async fn first_message(
+    brief: String,
+    task_view: &TaskView,
+    working_dir: &Path,
+    agent: &octos_agent::Agent,
+) -> Result<Message, String> {
+    use octos_agent::task_inputs::{
+        InputAuthority, InputContext, input_budget_tokens, resolve_declared_inputs,
+    };
+
+    let mut message = Message::user(brief);
+    if task_view.inputs.is_empty() {
+        return Ok(message);
+    }
+    let llm = agent.llm_provider();
+    // The window is a sync accessor some providers learn asynchronously; the
+    // agent loop waits for it before its first window-dependent decision too.
+    llm.ensure_ready().await;
+    let budget_tokens = input_budget_tokens(llm.context_window());
+    let accepts_images = llm.accepts_image_input();
+    let inputs = task_view.inputs.clone();
+    let base_dir = working_dir.to_path_buf();
+    let scope = crate::closed_registry::filesystem_scope_of(&task_view.grant);
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_declared_inputs(
+            &inputs,
+            &InputContext {
+                authority: InputAuthority::Filesystem {
+                    base_dir: &base_dir,
+                    scope,
+                },
+                budget_tokens,
+                accepts_images,
+            },
+        )
+    })
+    .await
+    .map_err(|err| format!("task inputs could not be read: {err}"))?;
+    match resolved {
+        Ok(resolved) => {
+            tracing::info!(
+                delivered = resolved.report.delivered().count(),
+                omitted = resolved.report.omitted().count(),
+                used_tokens = resolved.report.used_tokens,
+                budget_tokens = resolved.report.budget_tokens,
+                "fleet worker: task inputs for the first request:\n{}",
+                resolved.report.summary(),
+            );
+            resolved.attach_to(&mut message);
+            Ok(message)
+        }
+        Err(err) => Err(format!("{err}\n{}", err.report.summary())),
+    }
 }
 
 /// Render the task brief the worker agent sees: title + detail + the

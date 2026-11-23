@@ -62,10 +62,19 @@ pub const ALLOWED: &[&str] = octos_fleet::BASE_TOOLS;
 fn perms_from_grant(grant: &WorkerGrant) -> EffectivePermissions {
     let mut perms =
         EffectivePermissions::workspace_write().with_approval_policy(ApprovalPolicy::Never);
-    if grant.fs.is_host() {
-        perms.filesystem_scope = FilesystemScope::Host;
-    }
+    perms.filesystem_scope = filesystem_scope_of(grant);
     perms
+}
+
+/// The reach `grant` gives the worker's file tools: its working directory, or
+/// the host. The one mapping, shared by the tools and by whatever reads on the
+/// worker's behalf (its declared task inputs), so the two cannot disagree.
+pub(crate) fn filesystem_scope_of(grant: &WorkerGrant) -> FilesystemScope {
+    if grant.fs.is_host() {
+        FilesystemScope::Host
+    } else {
+        FilesystemScope::Workspace
+    }
 }
 
 /// Build the replay-safe tool registry for a fleet task-worker rooted at `cwd`,

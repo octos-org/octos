@@ -367,6 +367,12 @@ impl LlmProvider for ProviderRouter {
             .unwrap_or(128_000)
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.active_provider()
+            .map(|p| p.accepts_image_input())
+            .unwrap_or(true)
+    }
+
     fn model_id(&self) -> &str {
         // Cannot return dynamic &str from RwLock; return static identifier.
         // Callers that need the actual model should use resolve() to get

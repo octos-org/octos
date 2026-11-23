@@ -46,6 +46,8 @@ mod pool;
 mod worker;
 
 #[cfg(test)]
+mod first_inputs_tests;
+#[cfg(test)]
 mod testutil;
 
 use std::path::{Path, PathBuf};

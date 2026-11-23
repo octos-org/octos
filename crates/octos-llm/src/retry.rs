@@ -445,6 +445,10 @@ impl LlmProvider for RetryProvider {
         self.inner.ensure_ready().await;
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.inner.accepts_image_input()
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }

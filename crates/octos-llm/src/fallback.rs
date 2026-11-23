@@ -251,6 +251,11 @@ impl LlmProvider for FallbackProvider {
         }
     }
 
+    fn accepts_image_input(&self) -> bool {
+        self.primary.accepts_image_input()
+            && self.fallbacks.iter().all(|fb| fb.accepts_image_input())
+    }
+
     fn model_id(&self) -> &str {
         self.primary.model_id()
     }

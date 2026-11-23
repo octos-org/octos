@@ -3329,12 +3329,12 @@ const MAX_MODEL_VIDEO_BYTES: u64 = 20 * 1024 * 1024;
 /// Formats every vision API takes inline. SVG and BMP are recognised by
 /// [`detect_image_format`] for the UI's sake but no provider renders them,
 /// and GIF is refused by Gemini, so it is metadata-only too.
-const VISION_FORMATS: &[&str] = &["png", "jpeg", "webp"];
+pub(crate) const VISION_FORMATS: &[&str] = &["png", "jpeg", "webp"];
 
 /// The smallest per-image ceiling among the providers (Anthropic's 5 MB);
 /// above it the request would be rejected, so the model gets a reason
 /// instead of a failed turn.
-const MAX_MODEL_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_MODEL_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// #1148 codex P2: bounded-read helper for `view_image` that refuses
 /// to follow symlinks. Reads only the first 512 bytes for magic-byte

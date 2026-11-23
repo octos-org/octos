@@ -28,7 +28,8 @@ An agent works with peers through five tools that cover the full lifecycle — *
 
 Promotes work out of the current conversation into a new sovereign peer.
 
-- **Arguments:** `name` and `brief` (required), `worktree` (optional), and `token_budget` (optional positive integer, only when the user requests a limit).
+- **Arguments:** `name` and `brief` (required), `worktree` (optional), `token_budget` (optional positive integer, only when the user requests a limit), and `inputs` (optional).
+- **Inputs:** `inputs` lists the files the peer needs to begin — paths as the peer would read them, or `{path, kind, required, sha256}`. They are checked at handoff (a required file that is not in the peer's working directory refuses the handoff) and placed in the peer's **first model request**: text and data whole, images as attachments, plus a manifest of what was delivered and what was left out and why. A file is delivered whole or not at all, and only if the peer's own session may read it. Keep naming the paths in the brief as well.
 - **Behavior:** stages the peer and returns immediately with a pointer to `peers/<slug>/result.md`. **Fire-and-forget** — you do *not* get the result back in this turn. Limited to **4 handoffs per turn**.
 
 ### `peer_send_input` — steer a running peer

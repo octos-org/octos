@@ -1221,6 +1221,10 @@ impl LlmProvider for OpenAIProvider {
         Ok(Box::pin(event_stream))
     }
 
+    fn accepts_image_input(&self) -> bool {
+        !self.hints.lacks_vision
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -1802,6 +1806,21 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_say_whether_the_model_takes_images_through_any_wrapper() {
+        let mut hints = ModelHints::detect("deepseek-v4-flash");
+        let sees = OpenAIProvider::new("k", "deepseek-v4-flash").with_hints(hints.clone());
+        assert!(sees.accepts_image_input());
+
+        hints.lacks_vision = true;
+        let blind: std::sync::Arc<dyn LlmProvider> =
+            std::sync::Arc::new(OpenAIProvider::new("k", "text-only").with_hints(hints));
+        assert!(!blind.accepts_image_input());
+        // Whoever asks holds a wrapper, and must get the model's answer.
+        let wrapped = crate::ContextWindowOverride::new(blind, 8_000);
+        assert!(!wrapped.accepts_image_input());
+    }
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
