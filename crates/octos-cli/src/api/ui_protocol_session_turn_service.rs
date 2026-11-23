@@ -160,6 +160,8 @@ pub(super) async fn run_admitted_turn(connection: Arc<dyn TurnConnection>, run: 
         false,
         None,
         run.turn_cancel,
+        // An interactive turn delivers no `peer_send_input` message.
+        None,
     )
     .await;
 }

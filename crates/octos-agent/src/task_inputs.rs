@@ -23,6 +23,12 @@
 //!   ([`octos_llm::vision::snapshot_image_bytes`]), so a retry, or a later
 //!   request that replays the message, sends the same pixels even if the file
 //!   has changed since.
+//! - **A delivered image stays delivered, or the report says otherwise.** A
+//!   provider that would send a request again without its images, because the
+//!   endpoint refused them, fails the request instead when one of them is a
+//!   required input, and records an optional one it drops
+//!   ([`octos_llm::vision::snapshot_input_image_bytes`]);
+//!   [`mark_dropped_images`] then corrects the report.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -222,6 +228,36 @@ pub fn check_declared_inputs(
     }
 }
 
+/// Correct `report` for the delivered images a request went out without: an
+/// endpoint refused image parts, and the provider sent the request again
+/// text-only. `media` is the delivered images' snapshots, in the order the
+/// report delivers them ([`ResolvedInputs::media`]). Returns the paths of the
+/// inputs it corrected; ask once the requests that carry them have been made.
+pub fn mark_dropped_images(report: &mut InputReport, media: &[String]) -> Vec<String> {
+    let delivered_images = report.inputs.iter_mut().filter(|record| {
+        matches!(
+            record.outcome,
+            InputOutcome::Delivered {
+                form: InputForm::Image,
+                ..
+            }
+        )
+    });
+    let mut dropped = Vec::new();
+    for (record, snapshot) in delivered_images.zip(media) {
+        if vision::take_input_image_dropped(snapshot) {
+            record.outcome = InputOutcome::Omitted {
+                reason: OmitReason::Unsupported,
+                detail: "the endpoint refused image input, and the request was sent again \
+                         without this image"
+                    .into(),
+            };
+            dropped.push(record.path.clone());
+        }
+    }
+    dropped
+}
+
 fn resolve(
     inputs: &[DeclaredInput],
     cx: &InputContext<'_>,
@@ -336,7 +372,7 @@ fn resolve(
         if !freeze_images {
             continue;
         }
-        match vision::snapshot_image_bytes(&candidate.bytes) {
+        match vision::snapshot_input_image_bytes(&candidate.bytes, slot.required) {
             Ok(snapshot) => {
                 media.push(snapshot.to_string_lossy().into_owned());
                 candidate.image_number = media.len();
@@ -488,11 +524,7 @@ fn read_candidate(
         if !expected.eq_ignore_ascii_case(&sha256) {
             return Err((
                 OmitReason::Changed,
-                format!(
-                    "declared with sha256 {}; the file now has {}",
-                    short_digest(expected),
-                    short_digest(&sha256)
-                ),
+                "the file does not match its declared sha256".to_owned(),
             ));
         }
     }
@@ -668,12 +700,18 @@ fn render(slots: &[Slot], report: &InputReport) -> String {
         let number = index + 1;
         match (&slot.state, &record.outcome) {
             (State::Candidate(candidate), InputOutcome::Delivered { bytes, sha256, .. }) => {
+                // An image's line uses the words a provider replaces when a
+                // request has to go out without the image.
                 let how = match candidate.form {
-                    InputForm::Image => format!("as attached image {}", candidate.image_number),
-                    form => format!("below as {}", form.as_str()),
+                    InputForm::Image => format!(
+                        "{} {}",
+                        vision::INPUT_IMAGE_DELIVERED,
+                        candidate.image_number
+                    ),
+                    form => format!("delivered below as {}", form.as_str()),
                 };
                 out.push_str(&format!(
-                    "{number}. `{}` — delivered {how} ({bytes} bytes, sha256 {})\n",
+                    "{number}. `{}` — {how} ({bytes} bytes, sha256 {})\n",
                     slot.path,
                     short_digest(sha256),
                 ));
@@ -853,6 +891,25 @@ mod tests {
             resolve_declared_inputs(&[DeclaredInput::required(secret.to_string_lossy())], &host)
                 .unwrap();
         assert!(resolved.text.contains("TOP-SECRET"));
+    }
+
+    #[test]
+    fn should_not_leak_the_actual_digest_when_a_pin_mismatches() {
+        let ws = Workspace::new();
+        ws.write("notes.md", "actual content\n");
+        let actual = sha256(b"actual content\n");
+        let input = DeclaredInput {
+            sha256: Some("0".repeat(64)),
+            ..DeclaredInput::required("notes.md")
+        };
+
+        let error = resolve_declared_inputs(&[input], &ws.cx()).unwrap_err();
+        let (reason, detail) = omitted(&error.report.inputs[0]);
+
+        assert_eq!(reason, OmitReason::Changed);
+        assert_eq!(detail, "the file does not match its declared sha256");
+        assert!(!detail.contains(&actual[..12]), "{detail}");
+        assert!(!detail.contains("000000000000"), "{detail}");
     }
 
     #[test]

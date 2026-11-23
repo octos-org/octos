@@ -16795,6 +16795,25 @@ struct RawPeerToolsRegisterParams {
     options: crate::peers::host_tools::ToolSetOptions,
 }
 
+/// The live scope of the peer session a `peer_send_input` declaration is for.
+/// A cache miss is not a filesystem answer: the sender-side check is deferred
+/// to the turn that owns the peer session.
+fn peer_send_input_scope(
+    state: &AppState,
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    peers_root: &Path,
+    identifier: &str,
+) -> Option<Arc<octos_core::SessionScope>> {
+    let slug = resolve_peer_name_to_slug(peers_root, identifier)?;
+    let target = peer_wire_registry().resolve(&peer_wire_key(&profile.profile_id, &slug))?;
+    state
+        .session_cache
+        .peek(profile, &target)?
+        .agent
+        .session_scope()
+        .cloned()
+}
+
 /// One `peer_send_input` call of the session `origin_session` (its turn
 /// `turn_id`) in profile `profile_id`: authorize it, then deliver the input.
 /// A host-owned app peer's input goes to its host connection as `peer/input`
@@ -16806,6 +16825,7 @@ fn deliver_peer_send_input(
     origin_session: &str,
     turn_id: &TurnId,
     req: octos_agent::PeerSendInputRequest,
+    input_scope: Option<std::sync::Arc<octos_core::SessionScope>>,
 ) -> Result<octos_agent::PeerSendInputDelivery, String> {
     // Resolve the identifier (peer NAME or slug) to the actual
     // slug BEFORE any auth / path / wire op — names are the
@@ -16830,6 +16850,37 @@ fn deliver_peer_send_input(
     if peer_is_closed(peers_root, &slug) {
         return Err(format!("peer '{slug}' is closed and cannot receive input"));
     }
+    // UPCR-2026-RBC0874AA — the files the message's task declares are checked
+    // against the peer's working directory before anything is recorded or
+    // queued: a required one that is not there refuses the send, with every
+    // input's state, while the sender can still fix the declaration. Only the
+    // serve continuation queue carries a declaration to the turn that runs
+    // the message; the other two routes say so instead of sending it bare.
+    let message_inputs = if req.inputs.is_empty() {
+        None
+    } else {
+        if crate::peers::app_binding::peer_is_host_owned(peers_root, &slug) {
+            return Err(format!(
+                "peer '{slug}' is run by its host app, which starts the peer's turns itself; \
+                 declared inputs cannot be delivered to it — name the files in the message"
+            ));
+        }
+        let key = peer_wire_key(profile_id, &slug);
+        if crate::session_actor::peer_inbox_registry()
+            .lock()
+            .unwrap()
+            .contains_key(&key)
+        {
+            return Err(format!(
+                "peer session '{slug}' is served by the gateway, which does not deliver \
+                 declared inputs — name the files in the message"
+            ));
+        }
+        let dir = staged_peer_dir(peers_root, &slug).ok_or_else(|| {
+            format!("peer '{slug}' no longer exists (its staged directory was removed)")
+        })?;
+        crate::peers::first_inputs::check_for_message(&dir, &req.inputs, input_scope.as_deref())?
+    };
     invalidate_peer_lifetime_for_input(peers_root, &slug)
         .map_err(|error| format!("cannot persist peer input lifetime: {error}"))?;
     // UPCR-2026-035: a host-owned app peer's input goes to its host
@@ -16922,6 +16973,7 @@ fn deliver_peer_send_input(
             &slug,
             &peer_send_input_occurrence_id(origin_session, turn_id, &req.occurrence_id),
             &req.message,
+            message_inputs,
         )
         .into_callback_result(&slug)
 }
@@ -18226,6 +18278,10 @@ fn write_peer_result_if_peer_session(
     let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
         return;
     };
+    // UPCR-2026-RBC0874AA — the turn's requests are made: if the endpoint
+    // refused image parts and they went out without an optional declared
+    // image, the report that called it delivered is corrected.
+    crate::peers::first_inputs::record_dropped_images(&peer_dir, &turn_id.0.to_string());
     if let Err(error) = charge_peer_token_budget(
         &runtime.data_dir.join("peers"),
         slug,
@@ -27590,6 +27646,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
                 None
             },
             turn_cancel_for_agent,
+            // The files a `peer_send_input` message's task declared.
+            continuation
+                .metadata
+                .get(crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_META_INPUTS)
+                .cloned(),
         )
         .await;
         // #436 P1 #2 — keep an undelivered peer injection durable; every other
@@ -38279,6 +38340,10 @@ async fn run_standalone_turn(
     // path (interrupt capture, connection close, revocation) fires the same
     // signal the tool workers watch.
     turn_cancel: tokio_util::sync::CancellationToken,
+    // UPCR-2026-RBC0874AA — the declaration queued with the `peer_send_input`
+    // message this turn delivers (`peers::first_inputs::check_for_message`).
+    // `None` for every other turn.
+    message_inputs: Option<String>,
 ) {
     let session_id = params.session_id.clone();
     let turn_id = params.turn_id.clone();
@@ -39939,6 +40004,7 @@ async fn run_standalone_turn(
                 session_runtime.workspace_root.clone(),
                 session_id.clone(),
                 session_runtime.profile.profile_id.clone(),
+                session_runtime.agent.session_scope().cloned(),
                 // #peer-model — the configured `sub_provider` lane keys a
                 // `peer_handoff` may name; validated in the callback.
                 session_runtime
@@ -40140,12 +40206,19 @@ async fn run_standalone_turn(
                             &req.message,
                         );
                     }
+                    let input_scope = peer_send_input_scope(
+                        &team_state,
+                        &team_runtime,
+                        &send_peers_root,
+                        &req.slug,
+                    );
                     deliver_peer_send_input(
                         &send_profile_id,
                         &send_peers_root,
                         &send_origin_session,
                         &send_turn_id,
                         req,
+                        input_scope,
                     )
                 });
             let answer = peer_send_input_answer_callback(
@@ -41403,11 +41476,13 @@ async fn run_standalone_turn(
             abort: heartbeat.abort_handle(),
         })
     });
-    // UPCR-2026-RBC0874AA — first-turn task inputs: a peer staged with declared
-    // inputs gets them in the first message of its conversation, read under
-    // this session's own reach and before that message is committed, so the
-    // first model request carries them and every later one replays them.
-    if opens_the_conversation && !skip_internal_user_persist {
+    // UPCR-2026-RBC0874AA — declared task inputs: a peer staged with inputs
+    // gets them in the first message of its conversation, and a
+    // `peer_send_input` message that declared inputs brings them with it.
+    // They are read under this session's own reach and before the message is
+    // committed, so the first model request of the task carries them and
+    // every later one replays them.
+    if !skip_internal_user_persist && (opens_the_conversation || message_inputs.is_some()) {
         let authority = match request_agent.session_scope() {
             Some(scope) => crate::peers::first_inputs::PeerReadAuthority::Session(scope.clone()),
             None => crate::peers::first_inputs::PeerReadAuthority::Filesystem {
@@ -41418,10 +41493,14 @@ async fn run_standalone_turn(
         let mut first = Message::user(std::mem::take(&mut prompt));
         first.media = std::mem::take(&mut turn_media_paths);
         let typed_len = first.content.len();
-        crate::peers::first_inputs::attach_to_first_message(
+        crate::peers::first_inputs::attach_to_message(
             &session_runtime.profile.data_dir.join("peers"),
             &session_id,
             &turn_id.0.to_string(),
+            crate::peers::first_inputs::Due {
+                staged: opens_the_conversation,
+                with_message: message_inputs,
+            },
             authority,
             &request_agent.llm_provider(),
             &mut first,

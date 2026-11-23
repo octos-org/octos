@@ -36,7 +36,8 @@ Promotes work out of the current conversation into a new sovereign peer.
 
 Injects a follow-up turn into an already-open peer.
 
-- **Arguments:** `slug` (required), `message` (required, ≤ 64 KB).
+- **Arguments:** `slug` (required), `message` (required, ≤ 64 KB), and `inputs` (optional).
+- **Inputs:** `inputs` lists the files the task in this message needs — the same declaration as `peer_handoff`'s, with paths as the peer would read them. They are checked against the peer's working directory when the message is sent (a required file that is not there refuses the send, and nothing is queued), travel with the queued message, and are placed in the **first model request of the turn that runs it**, read at that moment: a repair round gets the page as it is now, while the files an earlier message brought stay in the conversation as they were read then. Only the serve continuation queue carries them; a send to a host-owned app peer or a gateway-served peer that declares inputs is refused, not sent bare.
 - **Behavior:** the message is delivered as the peer's **next user turn**, rendered verbatim (as if an operator typed it) and persisted as a real user message. Only the peer's **originator** may send input (see [Rails](#rails-authorization--limits)). Repeated sends carry a unique occurrence id, so distinct messages never collapse but a genuine retry still de-dupes.
 
 ### `peer_gather` — collect results

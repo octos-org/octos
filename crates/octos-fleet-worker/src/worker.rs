@@ -384,6 +384,7 @@ pub async fn run_attempt(
                         break 'run Computed::terminated(reason);
                     }
                 };
+                let input_images = first.media.clone();
                 let task = Task::new(
                     TaskKind::Custom {
                         name: "fleet_task".to_string(),
@@ -411,6 +412,21 @@ pub async fn run_attempt(
                     tokio::time::timeout(deadline, agent.run_task_with_tracker(&task, &tracker))
                         .await;
                 let elapsed = start.elapsed();
+                // An endpoint that refuses image parts makes the provider send
+                // the request again without them (a required one fails the
+                // run instead): say when the model was not shown a declared
+                // image after all.
+                let unseen = input_images
+                    .iter()
+                    .filter(|path| octos_llm::vision::take_input_image_dropped(path))
+                    .count();
+                if unseen > 0 {
+                    tracing::warn!(
+                        %fleet_id, %task_id, %attempt_id, unseen,
+                        "fleet worker: the endpoint refused image input; the model was not \
+                         shown these optional declared images",
+                    );
+                }
 
                 // 4a. DETERMINISM (codex round-2): read the escalation slot
                 //     IMMEDIATELY after the turn, BEFORE `run_acceptance`. If the

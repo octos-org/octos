@@ -33,6 +33,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use eyre::Result;
 use futures::future::BoxFuture;
+use octos_core::task_inputs::DeclaredInput;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -57,6 +58,11 @@ pub struct PeerSendInputRequest {
     /// genuine retry of the SAME call (same id) still dedups — the invariant
     /// the scheduler requires of every `External` producer.
     pub occurrence_id: String,
+    /// Files the peer needs for THIS message's task (see
+    /// [`octos_core::task_inputs`]). The host checks them against the peer's
+    /// working directory and puts them into the first model request of the
+    /// turn the message starts. Empty when the call declares none.
+    pub inputs: Vec<DeclaredInput>,
 }
 
 /// Monotonic fallback for the occurrence id when no `tool_call_id` is present
@@ -127,6 +133,8 @@ impl PeerSendInputTool {
 struct Input {
     slug: String,
     message: String,
+    #[serde(default)]
+    inputs: Option<Value>,
 }
 
 #[async_trait]
@@ -175,7 +183,8 @@ impl Tool for PeerSendInputTool {
                     "minLength": 1,
                     "maxLength": PEER_SEND_INPUT_MAX_BYTES,
                     "description": "The message to inject as the peer's next turn. Include all needed context — the peer cannot see this conversation."
-                }
+                },
+                "inputs": octos_core::task_inputs::declared_inputs_schema()
             }
         })
     }
@@ -237,6 +246,17 @@ impl Tool for PeerSendInputTool {
             });
         }
 
+        let inputs = match octos_core::task_inputs::parse_declared_inputs(input.inputs.as_ref()) {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                return Ok(ToolResult {
+                    output: format!("invalid peer_send_input arguments: {err}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
         // #436 P1 (#4) — the occurrence id makes THIS tool call unique so two
         // distinct sends don't collapse. Prefer the LLM `tool_call_id` (stable
         // across a framework retry of the same call → a true retry dedups);
@@ -250,10 +270,17 @@ impl Tool for PeerSendInputTool {
             ctx.tool_id.clone()
         };
 
+        let with_inputs = match inputs.len() {
+            0 => String::new(),
+            declared => format!(
+                "; the {declared} declared input(s) go into that turn's first model request"
+            ),
+        };
         let request = PeerSendInputRequest {
             slug: slug.to_string(),
             message: message.to_string(),
             occurrence_id,
+            inputs,
         };
 
         let delivery = (self.send_input)(request.clone());
@@ -275,7 +302,7 @@ impl Tool for PeerSendInputTool {
             Ok(PeerSendInputDelivery::Queued) => Ok(ToolResult {
                 output: format!(
                     "message sent to peer {slug} — \
-                     the peer will process it as its next turn"
+                     the peer will process it as its next turn{with_inputs}"
                 ),
                 success: true,
                 ..Default::default()
@@ -296,5 +323,57 @@ impl Tool for PeerSendInputTool {
                 ..Default::default()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn should_hand_a_messages_declared_inputs_to_the_host_and_send_nothing_malformed() {
+        let seen: Arc<Mutex<Vec<PeerSendInputRequest>>> = Arc::default();
+        let sink = seen.clone();
+        let tool = PeerSendInputTool::new(Arc::new(move |request| {
+            sink.lock().unwrap().push(request);
+            Ok(PeerSendInputDelivery::Queued)
+        }));
+        assert!(
+            tool.input_schema()["properties"]["inputs"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("FIRST model request")
+        );
+
+        let sent = tool
+            .execute(&json!({
+                "slug": "Edison",
+                "message": "Fix the two defects in the review.",
+                "inputs": ["review/round-2.md", { "path": "renders/page-03.png", "required": false }],
+            }))
+            .await
+            .unwrap();
+        assert!(sent.success, "{}", sent.output);
+        assert!(sent.output.contains("the 2 declared input(s) go into"));
+        assert_eq!(
+            seen.lock().unwrap()[0].inputs,
+            [
+                DeclaredInput::required("review/round-2.md"),
+                DeclaredInput::optional("renders/page-03.png"),
+            ]
+        );
+
+        let refused = tool
+            .execute(&json!({
+                "slug": "Edison",
+                "message": "Fix the two defects in the review.",
+                "inputs": [{ "path": "review/round-2.md", "optional": true }],
+            }))
+            .await
+            .unwrap();
+        assert!(!refused.success);
+        assert!(refused.output.contains("inputs[0]"), "{}", refused.output);
+        assert_eq!(seen.lock().unwrap().len(), 1, "the host was asked to send");
     }
 }

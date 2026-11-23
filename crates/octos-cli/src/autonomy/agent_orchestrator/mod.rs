@@ -4672,6 +4672,12 @@ impl InProcessAgentOrchestrator {
     /// a real delivery status (#436 P1 #3): a durable-store write failure rolls
     /// the enqueue back and reports [`PeerSendInputEnqueueOutcome::PersistFailed`]
     /// so the tool surfaces an error rather than acking a false success.
+    ///
+    /// `inputs` is the declaration of the files the message's task needs, as
+    /// JSON (`octos_core::task_inputs`), or `None`. It is queued and persisted
+    /// with the message, so the turn that delivers the message — on this wire
+    /// or the one a reopen re-homes it to, before or after a restart — brings
+    /// them.
     pub(crate) fn enqueue_peer_send_input_continuation(
         &self,
         target_session: &SessionKey,
@@ -4679,8 +4685,9 @@ impl InProcessAgentOrchestrator {
         slug: &str,
         occurrence_id: &str,
         message: &str,
+        inputs: Option<String>,
     ) -> PeerSendInputEnqueueOutcome {
-        let request = MasterContinuationRequest::new(
+        let mut request = MasterContinuationRequest::new(
             PEER_SEND_INPUT_GROUP,
             target_session.to_string(),
             profile_id.to_owned(),
@@ -4691,6 +4698,9 @@ impl InProcessAgentOrchestrator {
         .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
         .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.to_owned())
         .with_dedupe_key(peer_send_input_dedupe_key(target_session, occurrence_id));
+        if let Some(inputs) = inputs {
+            request = request.with_metadata(PEER_SEND_INPUT_META_INPUTS, inputs);
+        }
         let mut state = self.state();
         match state.continuations.enqueue(request) {
             MasterContinuationEnqueueOutcome::Duplicate { .. } => {
@@ -5128,7 +5138,7 @@ impl InProcessAgentOrchestrator {
         let new_session_str = new_session.to_string();
         let mut state = self.state();
         // Snapshot stranded items (immutable borrow) before mutating the queue.
-        let stranded: Vec<(MasterContinuationDedupeKey, String, String)> = state
+        let stranded: Vec<(MasterContinuationDedupeKey, String, String, Option<String>)> = state
             .continuations
             .pending_items()
             .filter(|item| {
@@ -5153,11 +5163,12 @@ impl InProcessAgentOrchestrator {
                         .get(PEER_SEND_INPUT_META_MESSAGE)
                         .cloned()
                         .unwrap_or_default(),
+                    item.metadata.get(PEER_SEND_INPUT_META_INPUTS).cloned(),
                 )
             })
             .collect();
         let mut rehomed = 0;
-        for (old_key, occurrence_id, message) in stranded {
+        for (old_key, occurrence_id, message, inputs) in stranded {
             // #436 P1 #1 — CRASH-ORDER SAFETY. The re-home is three writes
             // (persist-new / tombstone-old-durable / cancel-old-in-mem) with no
             // transaction. Order them so no crash window can lose the injection:
@@ -5166,7 +5177,7 @@ impl InProcessAgentOrchestrator {
             // "neither" — and the redundant old is handled by the freshness gate
             // (+ dedup) on the next drain. `restore`'s completed-only skip means
             // the tombstone is what prevents a restart re-delivering the old.
-            let request = MasterContinuationRequest::new(
+            let mut request = MasterContinuationRequest::new(
                 PEER_SEND_INPUT_GROUP,
                 new_session_str.clone(),
                 profile_id.to_owned(),
@@ -5177,6 +5188,10 @@ impl InProcessAgentOrchestrator {
             .with_metadata(PEER_SEND_INPUT_META_SLUG, slug.to_owned())
             .with_metadata(PEER_SEND_INPUT_META_OCCURRENCE, occurrence_id.clone())
             .with_dedupe_key(peer_send_input_dedupe_key(new_session, &occurrence_id));
+            // The files the message's task declared move with the message.
+            if let Some(inputs) = inputs {
+                request = request.with_metadata(PEER_SEND_INPUT_META_INPUTS, inputs);
+            }
             let new_cont = match state.continuations.enqueue(request) {
                 MasterContinuationEnqueueOutcome::Queued(cont) => cont,
                 // Already re-homed (e.g. a prior retarget for the same reopen);

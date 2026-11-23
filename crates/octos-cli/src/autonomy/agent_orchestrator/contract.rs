@@ -163,6 +163,10 @@ pub(crate) const PEER_SEND_INPUT_META_SLUG: &str = "peer_send_input_slug";
 /// Metadata key carrying the unique occurrence id, so a re-home preserves the
 /// dedupe identity (a genuine retry still collapses after re-target).
 pub(crate) const PEER_SEND_INPUT_META_OCCURRENCE: &str = "peer_send_input_occurrence";
+/// Metadata key carrying the JSON declaration of the files this message's task
+/// needs (`octos_core::task_inputs`); absent when the call declared none. The
+/// peer turn that delivers the message puts them into its first model request.
+pub(crate) const PEER_SEND_INPUT_META_INPUTS: &str = "peer_send_input_inputs";
 /// Group id stamped onto peer_send_input continuations (queue triage filter).
 pub(crate) const PEER_SEND_INPUT_GROUP: &str = "peer-send-input";
 

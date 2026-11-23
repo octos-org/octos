@@ -1040,6 +1040,7 @@ fn send_input_request(message: &str, occurrence: &str) -> octos_agent::PeerSendI
         slug: "news".into(),
         message: message.into(),
         occurrence_id: occurrence.into(),
+        inputs: Vec::new(),
     }
 }
 
@@ -1358,6 +1359,7 @@ async fn peer_input_turn_id(e: &E2e, frames: &Frames, text: &str, occurrence: &s
         &e.system.0,
         &TurnId::new(),
         send_input_request(text, occurrence),
+        None,
     )
     .expect("delivered to the host");
     let input = wait_frame(frames, |f| {

@@ -960,6 +960,7 @@ impl LlmProvider for OpenAIProvider {
         if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let body = response.text().await.unwrap_or_default();
             let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let keeps_images = must_keep_its_images(messages, &self.hints, &body);
             let retry = if !fail_fast
                 && request_has_user_videos(messages, &self.hints)
                 && is_video_modality_error(&body)
@@ -972,6 +973,7 @@ impl LlmProvider for OpenAIProvider {
                 );
                 Some(self.build_request_stripping(messages, tools, config, false, true))
             } else if !fail_fast
+                && !keeps_images
                 && request_has_user_images(messages, &self.hints)
                 && is_image_modality_error(&body)
             {
@@ -980,6 +982,7 @@ impl LlmProvider for OpenAIProvider {
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only"
                 );
+                note_dropped_input_images(messages);
                 Some(self.build_request(messages, tools, config, true))
             } else {
                 None
@@ -990,7 +993,7 @@ impl LlmProvider for OpenAIProvider {
                     response = self.post_chat(&retry).await?;
                 }
                 None => {
-                    let body = crate::provider::truncate_error_body(&body);
+                    let body = unretried_body(keeps_images, &body);
                     return Err(crate::error::LlmError::from_status_with_label(
                         status,
                         &body,
@@ -1160,6 +1163,7 @@ impl LlmProvider for OpenAIProvider {
         if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let text = response.text().await.unwrap_or_default();
             let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let keeps_images = must_keep_its_images(messages, &self.hints, &text);
             let retry = if !fail_fast
                 && request_has_user_videos(messages, &self.hints)
                 && is_video_modality_error(&text)
@@ -1172,6 +1176,7 @@ impl LlmProvider for OpenAIProvider {
                 );
                 Some(self.build_request_stripping(messages, tools, config, false, true))
             } else if !fail_fast
+                && !keeps_images
                 && request_has_user_images(messages, &self.hints)
                 && is_image_modality_error(&text)
             {
@@ -1180,6 +1185,7 @@ impl LlmProvider for OpenAIProvider {
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only (stream)"
                 );
+                note_dropped_input_images(messages);
                 Some(self.build_request(messages, tools, config, true))
             } else {
                 None
@@ -1188,7 +1194,7 @@ impl LlmProvider for OpenAIProvider {
                 self.trace_prompt_cache_input(&retry, config);
                 response = self.post_chat_stream(&retry).await?;
             } else {
-                let body = crate::provider::truncate_error_body(&text);
+                let body = unretried_body(keeps_images, &text);
                 return Err(crate::error::LlmError::from_status_with_label(
                     400,
                     &body,
@@ -1385,6 +1391,50 @@ fn is_image_modality_error(body: &str) -> bool {
         || (b.contains("image_url") && b.contains("not support"))
 }
 
+/// Whether an endpoint's refusal of image parts leaves this request nothing
+/// to fall back to: it carries an image its task requires
+/// ([`vision::is_required_input_snapshot`]). Sent again text-only, the model would
+/// do the task without that image while the task's report calls it
+/// delivered, so the request fails with the refusal instead.
+fn must_keep_its_images(messages: &[Message], hints: &ModelHints, body: &str) -> bool {
+    !hints.lacks_vision
+        && is_image_modality_error(body)
+        && messages.iter().any(|message| {
+            message.role == MessageRole::User
+                && message
+                    .media
+                    .iter()
+                    .any(|path| vision::is_required_input_snapshot(path))
+        })
+}
+
+/// Record the declared input images this request is about to be sent again
+/// without, so the report that called them delivered can be corrected.
+fn note_dropped_input_images(messages: &[Message]) {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .flat_map(|message| &message.media)
+        .for_each(|path| vision::note_input_image_dropped(path));
+}
+
+/// What a refused request that is not sent again reports: the endpoint's own
+/// words, after the reason when it was the request's required image that kept
+/// it from being retried. The reason leads because error messages are cut
+/// short.
+fn unretried_body(keeps_images: bool, body: &str) -> String {
+    let body = crate::provider::truncate_error_body(body);
+    if keeps_images {
+        format!("{REQUIRED_IMAGE_REFUSED} Endpoint: {body}")
+    } else {
+        body
+    }
+}
+
+/// Leads the error of a request refused for an image its task requires.
+pub const REQUIRED_IMAGE_REFUSED: &str = "required image not delivered: the endpoint refuses \
+    image input, and the request was not sent again without it.";
+
 /// Whether the request carries at least one user-uploaded image we would have
 /// inlined (i.e. images are not already stripped by the configured
 /// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
@@ -1470,7 +1520,20 @@ fn build_openai_content(
             .iter()
             .filter(|p| !vision::is_image(p) && !vision::is_video(p))
             .collect();
-        let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p));
+        // A declared input image is not an upload the model can read back by
+        // name: the line of the message that calls it delivered says instead
+        // that this request is without it.
+        let uploaded = |p: &&String| vision::is_image(p) && !vision::is_input_snapshot(p);
+        let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| uploaded(&p));
+        let withheld_inputs = hints.lacks_vision
+            && msg.role == MessageRole::User
+            && msg.media.iter().any(|p| vision::is_input_snapshot(p));
+        let content = if withheld_inputs {
+            msg.content
+                .replace(vision::INPUT_IMAGE_DELIVERED, vision::INPUT_IMAGE_WITHHELD)
+        } else {
+            msg.content.clone()
+        };
         let stripped_videos = msg.role == MessageRole::User
             && (hints.lacks_vision || hints.lacks_video)
             && msg.media.iter().any(|p| vision::is_video(p));
@@ -1482,7 +1545,7 @@ fn build_openai_content(
                 parts.push(path.to_string());
             }
             if stripped_images {
-                for p in msg.media.iter().filter(|p| vision::is_image(p)) {
+                for p in msg.media.iter().filter(uploaded) {
                     let name = std::path::Path::new(p)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
@@ -1530,7 +1593,7 @@ fn build_openai_content(
             (a, b) => a.or(b),
         };
 
-        if msg.content.is_empty() && media_note.is_none() {
+        if content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
             // User messages must not be empty (many providers reject them).
             // Assistant messages: some providers (Kimi, DeepSeek) reject omitted content,
@@ -1543,9 +1606,9 @@ fn build_openai_content(
             };
         }
         let text = match media_note {
-            Some(note) if msg.content.is_empty() => note,
-            Some(note) => format!("{}\n{note}", msg.content),
-            None => msg.content.clone(),
+            Some(note) if content.is_empty() => note,
+            Some(note) => format!("{content}\n{note}"),
+            None => content,
         };
         return Some(OpenAIContent::Text(text));
     }
@@ -2142,6 +2205,61 @@ mod tests {
             "FailFast must skip text-only retry; got {} request(s)",
             reqs.len()
         );
+    }
+
+    #[tokio::test]
+    async fn should_fail_instead_of_resending_without_an_image_the_task_requires() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(IMAGE_MODALITY_400_BODY))
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("test-key", "gpt-4o").with_base_url(server.uri());
+        let frozen = |required| {
+            vision::snapshot_input_image_bytes(b"\x89PNG\r\n\x1a\n", required)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        };
+        let optional = frozen(false);
+        let chats = || async {
+            let requests = server.received_requests().await.unwrap();
+            let chat = |request: &&wiremock::Request| request.url.path() == "/chat/completions";
+            requests.iter().filter(chat).count()
+        };
+
+        // A required input image, with an optional one beside it.
+        let mut messages = [msg_with_user_image()];
+        messages[0].media = vec![optional.clone(), frozen(true)];
+        let config = ChatConfig::default();
+        let refused = provider.chat(&messages, &[], &config).await.unwrap_err();
+        assert!(
+            refused.to_string().contains(REQUIRED_IMAGE_REFUSED),
+            "{refused}"
+        );
+        let refused = provider.chat_stream(&messages, &[], &config).await;
+        assert!(
+            refused.is_err_and(|error| error.to_string().contains(REQUIRED_IMAGE_REFUSED)),
+            "a stream is refused the same way"
+        );
+        assert_eq!(
+            chats().await,
+            2,
+            "one request per call: neither went again without the required image"
+        );
+        assert!(!vision::take_input_image_dropped(&optional));
+
+        // Only the optional one: the request goes again without it, and that
+        // is recorded for its task's report, once.
+        messages[0].media = vec![optional.clone()];
+        let _ = provider.chat(&messages, &[], &config).await;
+        assert_eq!(chats().await, 4);
+        assert!(vision::take_input_image_dropped(&optional));
+        assert!(!vision::take_input_image_dropped(&optional));
     }
 
     #[test]

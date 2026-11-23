@@ -203,6 +203,7 @@
 | `task_inputs::tests::should_deliver_text_data_and_an_image_whole_when_they_fit` | 5 | Text, data and an image are each delivered whole, with a digest and a manifest line; the image as frozen media. |
 | `task_inputs::tests::should_deny_a_path_the_worker_may_not_read` | 3 | A path outside the worker's filesystem authority is left out as denied and never read. |
 | `task_inputs::tests::should_hold_a_session_worker_to_its_session_scope` | 3 | A session worker's inputs are held to that session's scope, as its file tools are. |
+| `task_inputs::tests::should_not_leak_the_actual_digest_when_a_pin_mismatches` | 3 | A sha256 mismatch reports only the mismatch, never the file's actual digest prefix. |
 | `task_inputs::tests::should_leave_out_whole_optional_inputs_when_the_budget_runs_out` | 5 | Over budget, an optional input is left out whole with the reason; nothing is cut to fit. |
 | `task_inputs::tests::should_say_an_image_is_unsupported_when_the_model_takes_no_images` | 5 | An image for a model that takes none is reported unsupported, not attached. |
 | `task_inputs::tests::should_deliver_a_file_once_when_it_is_declared_twice` | 4 | A file declared twice is delivered once; the repeat is reported as a duplicate. |
@@ -213,3 +214,4 @@
 | `task_inputs::tests::should_report_an_image_no_model_request_can_carry_instead_of_attaching_it` | 5 | An image over the request limit, or in a format models cannot view, is reported unsupported and never called delivered. |
 | `tools::peer_handoff::tests::should_hand_declared_inputs_to_the_host_when_the_handoff_names_them` | 2 | `peer_handoff` offers `inputs` in its schema and passes the parsed declaration to the host. |
 | `tools::peer_handoff::tests::should_stage_nothing_when_the_declared_inputs_are_malformed` | 5 | A malformed declaration fails the handoff before the host stages anything. |
+| `tools::peer_send_input::tests::should_hand_a_messages_declared_inputs_to_the_host_and_send_nothing_malformed` | 2 | `peer_send_input` passes a message's declared inputs to the host and says in its result that they go with the message; a malformed declaration sends nothing. |
