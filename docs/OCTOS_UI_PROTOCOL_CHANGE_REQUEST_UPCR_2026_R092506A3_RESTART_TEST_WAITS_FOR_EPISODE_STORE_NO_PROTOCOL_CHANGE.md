@@ -1,7 +1,7 @@
 # UPCR-2026-R092506A3 — Restart test waits for the episode store lock (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3341
 
 ## Decision record
 
