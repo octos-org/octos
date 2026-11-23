@@ -172,7 +172,9 @@ fn from_spec(ctx: &Context, spec: &Spec) -> Result<Presentation> {
                     let image = crate::review::load_image(ctx, &ctx.verify(&layer.image)?)?;
                     reference_image = Some((&layer.image, image));
                 }
-                let (_, image) = reference_image.as_ref().context("missing bound artwork image")?;
+                let (_, image) = reference_image
+                    .as_ref()
+                    .context("missing bound artwork image")?;
                 crop.extract(image)?
             } else {
                 ctx.read(ctx.verify(&layer.image)?)?
@@ -236,15 +238,20 @@ pub fn blank(doc: &Presentation) -> Presentation {
 }
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
-    let (mut spec, mut sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    let (mut spec, mut sources) =
+        crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
     ensure!(
         r["publish_candidate"] != true || (r["action"] == "cycle" && spec.pages.len() == 1),
         "publish_candidate requires a one-page cycle"
     );
     let freeze_inputs = r["freeze_inputs"] == true
-        || (spec.pages.len() == 1 && crate::page_assignments::should_snapshot_build(
-            ctx, &spec.pages[0].id, &spec_path, r["publish_candidate"] == true,
-        )?);
+        || (spec.pages.len() == 1
+            && crate::page_assignments::should_snapshot_build(
+                ctx,
+                &spec.pages[0].id,
+                &spec_path,
+                r["publish_candidate"] == true,
+            )?);
     if r["publish_candidate"] == true || freeze_inputs {
         crate::page_canvas::check(ctx, spec.canvas.physical_emu())?;
     }
@@ -263,7 +270,7 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
         }
         sources = crate::page_snapshot::freeze(ctx, &spec)?;
     }
-    let ocr_placement=crate::ocr_placement::apply(ctx,&mut spec)?;
+    let ocr_placement = crate::ocr_placement::apply(ctx, &mut spec)?;
     let doc = from_spec(ctx, &spec)?;
     let full = out.join("editable.pptx");
     let full_bytes = file::save_bytes(&doc, "pptx")?;
@@ -328,7 +335,10 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     } else {
         Value::Null
     };
-    let mut handoff = if r["action"] == "cycle" && missing.is_empty() && publication["ready_for_independent_review"] != false {
+    let mut handoff = if r["action"] == "cycle"
+        && missing.is_empty()
+        && publication["ready_for_independent_review"] != false
+    {
         json!({"kind":"review_data_not_a_tool","cycle":ctx.binding(&receipt)?,"editable":result["editable"],
             "renders":result["renders"]["editable"]["pages"],"ready_for_independent_review":true,
             "quality_approved":false,"notification_sent":false,
@@ -503,8 +513,12 @@ pub fn commands(r: &Value) -> Result<Value> {
             .iter()
             .filter(|c| c.id.contains(filter))
             .map(|c| json!({"command":c.id,"description":c.params}))
-            .chain(crate::repair_commands::COMMANDS.iter().filter(|(id,_)|id.contains(filter))
-                .map(|(id,description)|json!({"command":id,"description":description})))
+            .chain(
+                crate::repair_commands::COMMANDS
+                    .iter()
+                    .filter(|(id, _)| id.contains(filter))
+                    .map(|(id, description)| json!({"command":id,"description":description}))
+            )
             .collect::<Vec<_>>()
     ))
 }
@@ -597,7 +611,10 @@ pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
             if guarded_text_edits {
                 validate_guarded_text_edit(name, &params)?;
             }
-            let value = if crate::repair_commands::COMMANDS.iter().any(|(id,_)| *id == name) {
+            let value = if crate::repair_commands::COMMANDS
+                .iter()
+                .any(|(id, _)| *id == name)
+            {
                 crate::repair_commands::apply(ctx, &mut s, name, &params)?
             } else {
                 s.execute(name, &params)?
