@@ -1,5 +1,6 @@
 //! OpenRouter provider implementation (OpenAI-compatible API).
 
+use crate::discovery::{DiscoveryProtocol, ModelOutputDiscovery, OutputProbe};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -20,6 +21,7 @@ use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StopReason, Token
 
 /// OpenRouter provider (routes to many LLM providers).
 pub struct OpenRouterProvider {
+    output_probe: OutputProbe,
     client: Client,
     /// Separate client for streaming requests, built without a total request
     /// timeout so a healthy long generation is never cut off mid-stream. See
@@ -34,6 +36,7 @@ impl OpenRouterProvider {
     /// Create a new OpenRouter provider.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
+            output_probe: Default::default(),
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
@@ -56,6 +59,7 @@ impl OpenRouterProvider {
 
     /// Set a custom base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.output_probe = Default::default();
         self.base_url = base_url.into();
         self
     }
@@ -154,6 +158,17 @@ impl OpenRouterProvider {
     }
 }
 
+impl ModelOutputDiscovery for OpenRouterProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)> {
+        Some((
+            &self.output_probe,
+            DiscoveryProtocol::OpenAICompatible,
+            &self.base_url,
+            self.api_key.expose_secret(),
+        ))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for OpenRouterProvider {
     async fn chat(
@@ -162,6 +177,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        let config = &self.output_config(config, messages, tools).await;
         let scope_root = config.media_scope_root.as_deref();
         let api_messages: Vec<ApiMessage> = messages
             .iter()
@@ -189,7 +205,7 @@ impl LlmProvider for OpenRouterProvider {
         let request = ApiRequest {
             model: &self.model,
             messages: api_messages,
-            max_tokens: config.max_tokens,
+            max_tokens: self.request_output_tokens(config, messages, tools),
             temperature: config.temperature,
             tool_choice: config.tool_choice.openai_chat_wire(api_tools.is_some()),
             tools: api_tools,
@@ -246,6 +262,7 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        let config = &self.output_config(config, messages, tools).await;
         let scope_root = config.media_scope_root.as_deref();
         let api_messages: Vec<ApiMessage> = messages
             .iter()
@@ -273,7 +290,7 @@ impl LlmProvider for OpenRouterProvider {
         let request = ApiRequest {
             model: &self.model,
             messages: api_messages,
-            max_tokens: config.max_tokens,
+            max_tokens: self.request_output_tokens(config, messages, tools),
             temperature: config.temperature,
             tool_choice: config.tool_choice.openai_chat_wire(api_tools.is_some()),
             tools: api_tools,

@@ -1642,7 +1642,11 @@ impl AdaptiveRouter {
                         if v > 0 {
                             v
                         } else {
-                            crate::context::max_output_tokens(s.provider.model_id()) as u64
+                            crate::context::native_output_limits(
+                                s.provider.provider_name(),
+                                s.provider.model_id(),
+                            )
+                            .map_or(0, |(_, output)| u64::from(output))
                         }
                     },
                 }

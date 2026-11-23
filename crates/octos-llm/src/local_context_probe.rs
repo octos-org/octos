@@ -193,6 +193,37 @@ pub struct LocalContextProbe {
 }
 
 impl LocalContextProbe {
+    async fn chat_config<'a>(
+        &self,
+        config: &'a ChatConfig,
+        messages: &[Message],
+        tools: &[ToolSpec],
+    ) -> std::borrow::Cow<'a, ChatConfig> {
+        use std::borrow::Cow;
+        self.probe_if_unresolved().await;
+        if self.window.get().copied().flatten().is_none()
+            && self.provisional.load(Ordering::SeqCst) == 0
+        {
+            return Cow::Borrowed(config);
+        }
+        // A loaded local model can have a shorter window than its published
+        // model card. Preserve an unresolved output limit for model discovery.
+        let Some(limit) = self.inner.request_output_tokens(config, messages, tools) else {
+            return Cow::Borrowed(config);
+        };
+        let available = crate::context::fit_output(
+            limit,
+            self.context_window(),
+            self.inner.estimate_request_tokens(messages, tools),
+        );
+        if available == limit {
+            return Cow::Borrowed(config);
+        }
+        let mut resolved = config.clone();
+        resolved.max_tokens = Some(available);
+        Cow::Owned(resolved)
+    }
+
     /// Wrap `inner` and start probing in the background if a runtime is
     /// available (gateway construction runs inside one; the fallback is the
     /// request path). `api_key` is the key the wrapped provider itself
@@ -667,8 +698,8 @@ impl LlmProvider for LocalContextProbe {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        self.probe_if_unresolved().await;
-        self.inner.chat(messages, tools, config).await
+        let config = self.chat_config(config, messages, tools).await;
+        self.inner.chat(messages, tools, &config).await
     }
 
     async fn chat_stream(
@@ -677,8 +708,8 @@ impl LlmProvider for LocalContextProbe {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        self.probe_if_unresolved().await;
-        self.inner.chat_stream(messages, tools, config).await
+        let config = self.chat_config(config, messages, tools).await;
+        self.inner.chat_stream(messages, tools, &config).await
     }
 
     async fn ensure_ready(&self) {

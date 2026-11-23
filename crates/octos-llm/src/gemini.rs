@@ -1,5 +1,6 @@
 //! Google Gemini provider implementation.
 
+use crate::discovery::{DiscoveryProtocol, ModelOutputDiscovery, OutputProbe};
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -78,6 +79,7 @@ enum GeminiAuth {
 
 /// Google Gemini provider.
 pub struct GeminiProvider {
+    output_probe: OutputProbe,
     client: Client,
     /// Separate client for streaming requests, built without a total request
     /// timeout so a healthy long generation is never cut off mid-stream. See
@@ -92,6 +94,7 @@ impl GeminiProvider {
     /// Create a new Gemini provider authenticating with an AI Studio API key.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
+            output_probe: Default::default(),
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
@@ -113,6 +116,7 @@ impl GeminiProvider {
         token: Arc<dyn TokenSource>,
     ) -> Self {
         Self {
+            output_probe: Default::default(),
             client: crate::provider::build_http_client(
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
@@ -170,6 +174,7 @@ impl GeminiProvider {
 
     /// Set a custom base URL (AI Studio mode only; ignored for Vertex).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.output_probe = Default::default();
         self.base_url = base_url.into();
         self
     }
@@ -249,6 +254,7 @@ impl GeminiProvider {
             tools: build_gemini_tools(tools),
             generation_config: Some(build_gemini_generation_config(
                 config,
+                self.request_output_tokens(config, messages, tools),
                 &format!("{}/{}", self.provider_name(), self.model),
             )?),
             // Explicit cached-content handles require create/refresh/delete
@@ -317,6 +323,20 @@ impl GeminiProvider {
     }
 }
 
+impl ModelOutputDiscovery for GeminiProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)> {
+        let GeminiAuth::ApiKey(key) = &self.auth else {
+            return None;
+        };
+        Some((
+            &self.output_probe,
+            DiscoveryProtocol::GeminiList,
+            &self.base_url,
+            key.expose_secret(),
+        ))
+    }
+}
+
 #[async_trait]
 impl LlmProvider for GeminiProvider {
     async fn chat(
@@ -325,6 +345,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
+        let config = &self.output_config(config, messages, tools).await;
         let request = self.build_request(messages, tools, config)?;
         self.trace_prompt_cache_input(&request, config);
 
@@ -377,6 +398,7 @@ impl LlmProvider for GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
+        let config = &self.output_config(config, messages, tools).await;
         let request = self.build_request(messages, tools, config)?;
         self.trace_prompt_cache_input(&request, config);
 
@@ -546,6 +568,7 @@ struct GeminiInlineData {
 /// Build the Gemini generation config from ChatConfig.
 fn build_gemini_generation_config(
     config: &ChatConfig,
+    max_output_tokens: Option<u32>,
     provider_label: &str,
 ) -> Result<GeminiGenerationConfig> {
     use crate::config::{ReasoningEffort, ResponseFormat};
@@ -586,7 +609,7 @@ fn build_gemini_generation_config(
     };
 
     Ok(GeminiGenerationConfig {
-        max_output_tokens: config.max_tokens,
+        max_output_tokens,
         temperature: config.temperature,
         thinking_config,
         response_mime_type,
@@ -1506,7 +1529,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = build_gemini_generation_config(&config, "gemini/test")
+        let error = build_gemini_generation_config(&config, None, "gemini/test")
             .expect_err("empty array items must fail before the provider request");
         let llm_error = error
             .downcast_ref::<crate::error::LlmError>()

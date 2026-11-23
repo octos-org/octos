@@ -264,6 +264,113 @@ pub fn models_url(root: &str, protocol: DiscoveryProtocol) -> String {
     }
 }
 
+/// Per-serving-endpoint cache for models that have no exact catalog entry.
+#[derive(Default)]
+pub(crate) struct OutputProbe(tokio::sync::OnceCell<Option<(u32, u32)>>);
+
+pub(crate) trait ModelOutputDiscovery: crate::LlmProvider {
+    fn output_endpoint(&self) -> Option<(&OutputProbe, DiscoveryProtocol, &str, &str)>;
+
+    async fn output_config<'a>(
+        &self,
+        config: &'a crate::ChatConfig,
+        messages: &[octos_core::Message],
+        tools: &[crate::ToolSpec],
+    ) -> std::borrow::Cow<'a, crate::ChatConfig> {
+        use std::borrow::Cow;
+        if config.max_tokens.is_some()
+            || crate::context::native_output_limits(self.provider_name(), self.model_id()).is_some()
+        {
+            return Cow::Borrowed(config);
+        }
+        let Some((cache, protocol, root, key)) = self.output_endpoint() else {
+            return Cow::Borrowed(config);
+        };
+        let limits = cache
+            .0
+            .get_or_try_init(|| probe_output_limits(root, key, protocol, self.model_id()))
+            .await;
+        if let Ok(Some((window, output))) = limits {
+            let mut resolved = config.clone();
+            resolved.max_tokens = Some(crate::context::fit_output(
+                *output,
+                *window,
+                self.estimate_request_tokens(messages, tools),
+            ));
+            Cow::Owned(resolved)
+        } else {
+            Cow::Borrowed(config)
+        }
+    }
+}
+
+async fn probe_output_limits(
+    root: &str,
+    key: &str,
+    protocol: DiscoveryProtocol,
+    model: &str,
+) -> eyre::Result<Option<(u32, u32)>> {
+    use std::sync::LazyLock;
+    // Metadata may carry a vendor-specific API-key header. Keep it on this origin.
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("discovery HTTP client")
+    });
+    let mut url = reqwest::Url::parse(&models_url(root, protocol))?;
+    if protocol != DiscoveryProtocol::OpenAICompatible {
+        url.path_segments_mut()
+            .map_err(|_| eyre::eyre!("invalid model endpoint"))?
+            .push(model);
+    }
+    let mut request = CLIENT.get(url);
+    if !key.is_empty() {
+        request = match protocol {
+            DiscoveryProtocol::OpenAICompatible => request.bearer_auth(key),
+            DiscoveryProtocol::AnthropicMessages => request
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01"),
+            DiscoveryProtocol::GeminiList => request.header("x-goog-api-key", key),
+        };
+    }
+    let response = request.send().await?;
+    if matches!(response.status().as_u16(), 404 | 405 | 501) {
+        return Ok(None);
+    }
+    let body: serde_json::Value = response.error_for_status()?.json().await?;
+    let row = if protocol == DiscoveryProtocol::OpenAICompatible {
+        let Some(row) = body["data"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(model)))
+        else {
+            return Ok(None);
+        };
+        row
+    } else {
+        &body
+    };
+    let number = |v: &serde_json::Value| {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let output = [
+        "/max_output_tokens",
+        "/max_tokens",
+        "/max_completion_tokens",
+        "/top_provider/max_completion_tokens",
+        "/outputTokenLimit",
+    ]
+    .into_iter()
+    .find_map(|field| row.pointer(field).and_then(number));
+    let window = number(&row["context_window"])
+        .or_else(|| number(&row["context_length"]))
+        .unwrap_or(0);
+    Ok(output.map(|n| (window, n)))
+}
+
 /// Run one discovery attempt against the resolved route.
 ///
 /// `api_key` may be empty for keyless families — the auth header is then
