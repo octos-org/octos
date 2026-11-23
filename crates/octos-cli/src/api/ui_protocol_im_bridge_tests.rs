@@ -465,40 +465,49 @@ async fn a_stop_decision_lasts_while_its_stop_can_be_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let fx = serve(dir.path(), scripted()).await;
     let (first, second) = (fx.chat(&unique("im")).await, fx.chat(&unique("im-2")).await);
-    // Two bridges on one profile: mine, and another chat of mine on a bridge
-    // with a short time to live.
+    // Another chat of mine.
     const MINE: i64 = 4343;
-    let short = Duration::from_millis(500);
     let bridge = |chat, target, ttl| {
         let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
         let channel = Arc::new(FakeChannel::default());
         let bindings = vec![binding(chat, ME, target)];
-        ServeImBridge::new(turns, channel, vec![ME], bindings, ttl).unwrap()
+        ServeImBridge::new(turns, channel, vec![ME], bindings, ttl)
     };
-    let (long, short) = (bridge(ME, &first, TTL), bridge(MINE, &second, short));
+    assert!(bridge(ME, &first, MAX_TTL + Duration::from_secs(1)).is_err());
+    // On one profile: a bridge that accepts a message for a day, and one
+    // that accepts it for half a second.
+    let day = bridge(ME, &first, MAX_TTL).unwrap();
+    let short = bridge(MINE, &second, Duration::from_millis(500)).unwrap();
     let stop = |chat, id, sent_at| ImMessage {
         chat,
         sent_at: Some(sent_at),
         ..message(id, "/stop")
     };
-    // A platform clock 5 s ahead of this host's.
-    let ahead = Utc::now() + Duration::from_secs(5);
     let now = Utc::now();
+    // Sent almost a day ago: accepted for 700 ms more.
+    let nearly_a_day_ago = now - MAX_TTL + Duration::from_millis(700);
+    // A platform clock 5 s ahead of this host's.
+    let ahead = now + Duration::from_secs(5);
     for (bridge, message) in [
-        (&long, stop(ME, 1, now)),
-        (&short, stop(MINE, 1, ahead)),
-        (&short, stop(MINE, 2, now)),
+        (&short, stop(MINE, 1, now)),
+        (&day, stop(ME, 1, nearly_a_day_ago)),
+        (&short, stop(MINE, 2, ahead)),
     ] {
         assert!(matches!(bridge.handle(message).await, Handled::Answered));
     }
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    // The short bridge's next /stop forgets only the decision whose /stop
-    // can no longer be accepted (its /stop 2).
+    // The short bridge's next /stop forgets only the decision that no bridge
+    // can accept any more.
     let next = short.handle(stop(MINE, 3, ahead)).await;
     assert!(matches!(next, Handled::Answered));
-    for (bridge, message) in [(&long, stop(ME, 1, now)), (&short, stop(MINE, 1, ahead))] {
-        assert!(matches!(bridge.handle(message).await, Handled::Repeated));
-    }
     let decisions = std::fs::read_dir(fx.profile.data_dir().join(STOPS_DIR));
     assert_eq!(decisions.unwrap().count(), 3);
+    let stale = day.handle(stop(ME, 1, nearly_a_day_ago)).await;
+    assert!(matches!(stale, Handled::Refused(Refusal::Stale)));
+    // Past its own time to live, and past it twice over: reopened with a
+    // longer time to live, the short bridge's /stops are still decided.
+    let reopened = bridge(MINE, &second, TTL).unwrap();
+    for message in [stop(MINE, 1, now), stop(MINE, 2, ahead)] {
+        assert!(matches!(reopened.handle(message).await, Handled::Repeated));
+    }
 }

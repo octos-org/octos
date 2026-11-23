@@ -41,6 +41,12 @@ const SHARED_SENDERS: [i64; 3] = [777_000, 1_087_968_824, 136_817_688];
 /// while a delivery of the `/stop` could still be run.
 const STOPS_DIR: &str = "im_bridge_stops";
 
+/// The longest time to live a bridge may have: Telegram keeps an update the
+/// bot has not confirmed for 24 hours. A `/stop` decision is kept this long
+/// after its platform time, so no bridge on the profile, whatever its time
+/// to live, now or after a restart, accepts a `/stop` whose decision is gone.
+pub(crate) const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// A bot account on an IM platform: the channel a chat is on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ImChannelId {
@@ -172,6 +178,9 @@ impl ServeImBridge {
     ) -> Result<Arc<Self>, String> {
         if allowed.is_empty() {
             return Err("no allowed senders; list who may use the bridge".into());
+        }
+        if ttl > MAX_TTL {
+            return Err("the time to live is over 24 hours".into());
         }
         let mut chats = HashSet::new();
         let mut sessions = HashSet::new();
@@ -317,8 +326,9 @@ impl ServeImBridge {
             .map(|(turn_id, _)| turn_id);
         let decisions = binding.target.profile().data_dir().join(STOPS_DIR);
         let decision = decisions.join(turn_id_for(binding, message_id).0.to_string());
-        // The last moment this bridge accepts the /stop (see `handle`).
-        let deadline = chrono::TimeDelta::from_std(self.ttl)
+        // After this no bridge accepts the /stop (see `handle`), whatever
+        // its time to live: none may have more than `MAX_TTL`.
+        let deadline = chrono::TimeDelta::from_std(MAX_TTL)
             .ok()
             .and_then(|ttl| sent_at.checked_add_signed(ttl))
             .unwrap_or(DateTime::<Utc>::MAX_UTC);
@@ -481,9 +491,8 @@ fn record_stop(
 
 /// Forget the decisions whose `/stop` can no longer be accepted: a delivery
 /// of it now is refused as stale before it reaches them. Each decision keeps
-/// its own deadline, from its platform time and the time to live of the
-/// bridge that made it, so the clocks and bridges of other decisions in the
-/// profile do not matter.
+/// its own deadline, its platform time plus `MAX_TTL`, so neither the time to
+/// live of the bridge reading them nor its clock matters.
 fn forget_expired_stops(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
