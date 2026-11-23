@@ -395,7 +395,7 @@ mod tests {
             (json!([42]), "inputs[0]"),
             (json!(["ok", "  "]), "inputs[1]"),
             (json!([{ "kind": "text" }]), "inputs[0]"),
-            (json!([{ "path": "a", "requird": false }]), "inputs[0]"),
+            (json!([{ "path": "a", "optional": true }]), "inputs[0]"),
             (json!([{ "path": "a", "kind": "video" }]), "inputs[0]"),
             (json!([{ "path": "a", "sha256": "ABC" }]), "sha256"),
             (too_many, "at most"),

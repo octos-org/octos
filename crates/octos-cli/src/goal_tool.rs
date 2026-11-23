@@ -2003,7 +2003,7 @@ mod declared_inputs_tests {
         for bad in [
             json!("src/lib.rs"),
             json!([{ "kind": "text" }]),
-            json!([{ "path": "a", "requird": false }]),
+            json!([{ "path": "a", "optional": true }]),
         ] {
             let err = parse_task_specs(&plan(json!({
                 "task_id": "fix",

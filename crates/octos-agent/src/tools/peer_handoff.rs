@@ -392,7 +392,7 @@ mod tests {
             .execute(&json!({
                 "name": "Edison",
                 "brief": "Do the thing.",
-                "inputs": [{ "path": "a.txt", "requird": false }],
+                "inputs": [{ "path": "a.txt", "optional": true }],
             }))
             .await
             .unwrap();
