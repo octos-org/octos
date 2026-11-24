@@ -1676,13 +1676,13 @@ fn effective_session_permission_state(
     // UPCR-2026-R1EFC56A3: a chat is read-only with no network unless it was
     // explicitly set otherwise, and its record survives a restart.
     if is_chat_session(state, session_id) {
-        return StoredSessionPermissionProfile {
+        return Ok(StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::ReadOnly,
                 network: octos_core::ui_protocol::PermissionNetworkPolicy::Deny,
             },
             approval_policy: None,
-        };
+        });
     }
     // The dangerous default is granted ONLY where an EXPLICIT Full Access
     // selection would also be allowed (codex P1/P2 on #1639): Local
@@ -23261,7 +23261,7 @@ async fn handle_session_open_with_mode(
         }
     };
 
-    let outcome = match service
+    let mut outcome = match service
         .open(
             ws,
             approvals,
