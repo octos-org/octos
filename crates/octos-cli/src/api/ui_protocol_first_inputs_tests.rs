@@ -310,7 +310,6 @@ async fn hand_off(
             octos_core::SessionScope::solo(fx.workspace.clone(), Vec::new()).unwrap(),
         )),
         Vec::new(),
-        Arc::new(AtomicU32::new(0)),
         Arc::new(move |event| seen.lock().unwrap().push(event)),
     );
     let mut args = json!({ "name": name, "brief": BRIEF, "worktree": false });

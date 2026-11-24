@@ -9,9 +9,9 @@
 //! The tool is deliberately NOT registered anywhere by default — construction
 //! requires the staging callback, which only the serve/WS turn path can
 //! provide (gateway/chat/ACP have no client that can open sessions). The
-//! serve wiring also owns the governance rails: depth-1 (peer sessions never
-//! see the tool) and the per-turn handoff cap live at the wiring site, not
-//! here.
+//! serve wiring also owns the governance rail: depth-1 (peer sessions never
+//! see the tool) lives at the wiring site, not here. Nothing counts or caps
+//! the handoffs of a turn.
 
 use std::sync::Arc;
 
@@ -170,8 +170,8 @@ impl Tool for PeerHandoffTool {
     }
 
     fn concurrency_class(&self) -> super::ConcurrencyClass {
-        // Stateful: reserves peer dirs, may create git worktrees, and burns
-        // the per-turn handoff budget — keep calls serialized.
+        // Stateful: reserves peer dirs and may create git worktrees — keep
+        // calls serialized.
         super::ConcurrencyClass::Exclusive
     }
 

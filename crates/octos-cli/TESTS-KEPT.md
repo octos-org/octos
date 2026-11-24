@@ -425,3 +425,9 @@ Creation admission also retains these persistence regressions (T-0323):
 |---|---|---|
 | 3 | `api::static_files::tests::should_inject_the_deprecation_banner_into_the_app_index_only` | The /app index document carries the deprecation banner exactly once (before </body>) and names octoscode-web; content-hashed asset bytes pass through untouched. |
 | 3 | `api::static_files::tests::should_serve_a_body_less_index_unmodified` | An index without a closing </body> is served unmodified rather than mangled by the injection. |
+
+## Peer handoffs of one turn (UPCR-2026-R9EE04597)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 5 | `peers::handoff_tests::should_stage_every_peer_a_turn_hands_off_however_many` | One turn that hands off six peers through the tool the serve path wires gets all six staged, each with its `peer/staged` event; a fifth handoff used to be refused. |
