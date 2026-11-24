@@ -219,7 +219,8 @@ pub fn blank(doc: &Presentation) -> Presentation {
 }
 pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     let spec_path = ctx.path(string(r, "spec")?)?;
-    let (spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    let (mut spec, sources) = crate::spec::load_with_sources(ctx, &spec_path, r["page"].as_str())?;
+    let ocr_placement = crate::ocr_placement::apply(ctx, &mut spec)?;
     let out = ctx.path(string(r, "output")?)?;
     ensure!(!out.exists(), "use a fresh attempt directory");
     std::fs::create_dir_all(&out)?;
@@ -241,6 +242,13 @@ pub fn build(ctx: &Context, r: &Value) -> Result<Value> {
     );
     let mut result = json!({"schema_version":1,"engine_revision":crate::ENGINE_REV,"runtime":"rust","spec":ctx.binding(resolved)?,"editable":ctx.binding(&full)?,"blank":ctx.binding(&blank)?,"pages":spec.pages.iter().map(|p|&p.id).collect::<Vec<_>>(),"quality_approved":false});
     result["sources"] = json!(sources);
+    let lines = crate::source_lines::inventory(ctx, &spec)?;
+    if !lines.is_empty() {
+        result["source_lines"] = json!(lines);
+    }
+    if !ocr_placement.is_empty() {
+        result["ocr_placement"] = json!(ocr_placement);
+    }
     if r["action"] == "cycle" {
         let width = width(r)?;
         result["renders"] = json!({"editable":render_to(ctx,&full_doc,&full,&out.join("rendered"),width)?,"blank":render_to(ctx,&blank_doc,&blank,&out.join("blank-rendered"),width)?});

@@ -93,6 +93,40 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
     if plan["mode"] != "independent_visual" || !review["attestation"].is_object() {
         return Ok(false);
     }
+    let Some(reviewer) = attested_reviewer(ctx, review, cycle)? else {
+        return Ok(false);
+    };
+    Ok(["reviewer_agent", "arbiter_agent"].iter().any(|k| {
+        plan[k]
+            .as_str()
+            .is_some_and(|r| same_identity(r, &reviewer))
+    }) && !policy["owner_agent"]
+        .as_str()
+        .is_some_and(|o| same_identity(o, &reviewer)))
+}
+
+/// A strict job may use a distinct runtime peer without a preassigned visual arbiter.
+/// Named independent-visual routes remain restricted to their designated reviewer.
+pub(crate) fn independent_line_reviewer(
+    ctx: &Context,
+    policy: &Value,
+    review: &Value,
+    cycle: &Value,
+    authorized: bool,
+) -> Result<bool> {
+    if authorized || load_plan(ctx)?["mode"] != "strict" {
+        return Ok(authorized);
+    }
+    let reviewer = attested_reviewer(ctx, review, cycle)?;
+    Ok(reviewer
+        .zip(policy["owner_agent"].as_str())
+        .is_some_and(|(peer, owner)| !same_identity(&peer, owner)))
+}
+
+fn attested_reviewer(ctx: &Context, review: &Value, cycle: &Value) -> Result<Option<String>> {
+    if !review["attestation"].is_object() {
+        return Ok(None);
+    }
     let receipt = ctx.json(ctx.verify(&review["attestation"])?)?;
     let mut body = review.clone();
     body.as_object_mut()
@@ -104,13 +138,7 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
             && receipt["review_sha256"] == crate::fs::digest(&serde_json::to_vec(&body)?),
         "review attestation is stale or belongs to different evidence"
     );
-    let reviewer = string(&receipt, "reviewer")?;
-    Ok(["reviewer_agent", "arbiter_agent"]
-        .iter()
-        .any(|k| plan[k].as_str().is_some_and(|r| same_identity(r, reviewer)))
-        && !policy["owner_agent"]
-            .as_str()
-            .is_some_and(|o| same_identity(o, reviewer)))
+    Ok(Some(string(&receipt, "reviewer")?.to_owned()))
 }
 
 pub fn arbiter_authorized(
