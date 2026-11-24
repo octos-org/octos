@@ -19,9 +19,10 @@
 //! platform message id, so a redelivery, before or after a restart, names
 //! the turn that already ran and runs nothing.
 //!
-//! Nothing in `octos serve` starts a bridge yet: configuration (T-0654) and
-//! a real channel do. The tests drive it with a fake channel. Attachments,
-//! IM approvals and an outbox that redelivers results are later work.
+//! `octos serve` makes a bridge for each `serve.im` bot (T-0654), fed by
+//! the bot's Telegram transport (T-0663). The tests here drive it with a
+//! fake channel. Attachments, IM approvals and an outbox that redelivers
+//! results are later work.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashSet;

@@ -10,28 +10,37 @@
 //! allow-all, no partial start. The config is read once, so a binding
 //! removed from it, a revocation included, is gone from the next start on.
 //!
-//! The Telegram transport that feeds a bridge is the next cut. Until then a
-//! bridge made here receives nothing, and serve only keeps its bot from
-//! every gateway.
+//! Each bridge then gets its bot's Telegram transport (T-0663), which
+//! polls the bot until serve stops.
 
 use std::collections::HashSet;
+
+use octos_bus::telegram_api::{self, TelegramBotApi};
 
 use crate::bot_owner::{self, BotOwner, HANDOFF};
 use crate::config::{ServeImChannel, ServeImPlatform};
 
 use super::external_turns::{BoundChat, BoundProfile, ExternalTurns};
 use super::im_bridge::{ImBinding, ImChannel, ImChannelId, ServeImBridge};
+use super::im_telegram::{TelegramBot, poll};
 use super::*;
 
 /// What `serve.im` made, kept while serve runs.
 pub(crate) struct ServeIm {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) bridges: Vec<Arc<ServeImBridge>>,
+    pollers: Vec<tokio::task::JoinHandle<()>>,
     _owners: Vec<BotOwner>,
 }
 
+impl Drop for ServeIm {
+    /// No bot is polled once its lock may go.
+    fn drop(&mut self) {
+        self.pollers.iter().for_each(|poller| poller.abort());
+    }
+}
+
 /// `serve.im` for this serve: tokens from its environment, locks in this
-/// user's directory, and no transport connected yet.
+/// user's directory, and Telegram's own Bot API.
 pub(crate) async fn start_serve_im(
     state: &Arc<AppState>,
     entries: &[ServeImChannel],
@@ -40,36 +49,58 @@ pub(crate) async fn start_serve_im(
     let dir = bot_owner::default_dir()
         .ok_or_else(|| eyre::eyre!("serve.im: no home directory to keep bot locks in"))?;
     let holder = format!("octos serve, data dir {}", data_dir.display());
-    let im = assemble(
-        state,
-        entries,
-        |name| std::env::var(name).ok(),
-        &dir,
-        &holder,
-        |id| Arc::new(Unconnected(id)),
-    )
-    .await
-    .map_err(|why| eyre::eyre!(why))?;
-    warn!(
+    let env = |name: &str| std::env::var(name).ok();
+    let im = start(state, entries, env, &dir, &holder, telegram_api::API)
+        .await
+        .map_err(|why| eyre::eyre!(why))?;
+    info!(
         bots = im.bridges.len(),
-        "serve.im: bots taken and bindings checked; this build receives none of their messages yet"
+        "serve.im: polling Telegram for the bound chats"
     );
     Ok(im)
 }
 
+/// [`assemble`], then poll each bot through the Bot API server at `api`.
+pub(crate) async fn start(
+    state: &Arc<AppState>,
+    entries: &[ServeImChannel],
+    env: impl Fn(&str) -> Option<String>,
+    owners_dir: &Path,
+    holder: &str,
+    api: &str,
+) -> Result<ServeIm, String> {
+    let bots = StdMutex::new(Vec::new());
+    let channel = |id, token: &str| {
+        let bot = Arc::new(TelegramBot::new(id, TelegramBotApi::new(api, token)));
+        bots.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(bot.clone());
+        bot as Arc<dyn ImChannel>
+    };
+    let mut im = assemble(state, entries, env, owners_dir, holder, channel).await?;
+    let bots = bots.into_inner().unwrap_or_else(|p| p.into_inner());
+    let polled = im.bridges.iter().cloned().zip(bots);
+    im.pollers = polled
+        .map(|(bridge, bot)| tokio::spawn(poll(bridge, bot)))
+        .collect();
+    Ok(im)
+}
+
 /// Make `entries`' bridges: each bot's token read through `env`, its lock
-/// taken in `owners_dir` for `holder`, its replies sent through `channel`.
+/// taken in `owners_dir` for `holder`, its replies sent through the
+/// `channel` made from its id and token.
 pub(crate) async fn assemble(
     state: &Arc<AppState>,
     entries: &[ServeImChannel],
     env: impl Fn(&str) -> Option<String>,
     owners_dir: &Path,
     holder: &str,
-    channel: impl Fn(ImChannelId) -> Arc<dyn ImChannel>,
+    channel: impl Fn(ImChannelId, &str) -> Arc<dyn ImChannel>,
 ) -> Result<ServeIm, String> {
     let ledger = event_ledger(state).await;
     let mut im = ServeIm {
         bridges: Vec::new(),
+        pollers: Vec::new(),
         _owners: Vec::new(),
     };
     let mut bots = HashSet::new();
@@ -92,10 +123,11 @@ pub(crate) async fn assemble(
         }
         let owner = BotOwner::claim(owners_dir, platform, bot, holder, HANDOFF).map_err(refuse)?;
         im._owners.push(owner);
-        let channel = channel(ImChannelId {
+        let id = ImChannelId {
             platform: platform.into(),
             bot,
-        });
+        };
+        let channel = channel(id, &token);
         let mut bindings = Vec::new();
         for binding in &entry.bindings {
             let target = match BoundProfile::verify(state, &binding.profile).await {
@@ -117,19 +149,6 @@ pub(crate) async fn assemble(
         im.bridges.push(bridge);
     }
     Ok(im)
-}
-
-/// A bot with no transport: nothing reaches its bridge, and nothing goes out.
-struct Unconnected(ImChannelId);
-
-#[async_trait::async_trait]
-impl ImChannel for Unconnected {
-    fn id(&self) -> ImChannelId {
-        self.0.clone()
-    }
-    async fn send(&self, _chat: i64, _text: &str, _reply_to: Option<i64>) -> eyre::Result<()> {
-        eyre::bail!("no transport is connected for this bot")
-    }
 }
 
 #[cfg(test)]

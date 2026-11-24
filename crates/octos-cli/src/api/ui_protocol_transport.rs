@@ -12,6 +12,8 @@ mod external_turns;
 mod im_bridge;
 #[path = "ui_protocol_im_config.rs"]
 mod im_config;
+#[path = "ui_protocol_im_telegram.rs"]
+mod im_telegram;
 #[path = "ui_protocol_memory_entries.rs"]
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]

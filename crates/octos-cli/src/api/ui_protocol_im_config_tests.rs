@@ -44,7 +44,7 @@ async fn assemble_on(
     holder: &str,
     channel: &Arc<FakeChannel>,
 ) -> Result<ServeIm, String> {
-    assemble(state, entries, env, owners, holder, |_| channel.clone()).await
+    assemble(state, entries, env, owners, holder, |_, _| channel.clone()).await
 }
 
 /// Changes the first binding's `field` to `value`.
