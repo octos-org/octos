@@ -38,11 +38,12 @@ pub use env_hygiene::{
 pub use error::{Error, ErrorKind, Result};
 pub use gateway::{InboundMessage, METADATA_SENDER_USER_ID, MessageOrigin, OutboundMessage};
 pub use git_worktree::{
-    PreparedWorktree, branch_commit_and_tree, clean_checkout_path, clear_worktree_admin_entry,
-    commit_has_regular_file, deliverable_commit_command, git_ref_exists, is_git_repo,
-    is_work_checkout, new_work_checkout, prepare_detached_worktree, prepare_fleet_worktree,
-    probe_git_repo, recovery_snapshot_command, remove_checkout_keep_branch, reuse_fleet_worktree,
-    sweep_task_checkouts, worktree_populate_command,
+    PreparedWorktree, RecordedCheckout, branch_commit_and_tree, clean_checkout_command,
+    clean_checkout_path, clear_worktree_admin_entry, commit_has_regular_file,
+    deliverable_commit_command, git_ref_exists, inspect_recorded_checkout, is_git_repo,
+    is_work_checkout, new_work_checkout, prepare_clean_checkout_dir, prepare_fleet_worktree,
+    probe_git_repo, recovery_snapshot_command, remove_checkout_keep_branch, sweep_task_checkouts,
+    worktree_populate_command,
 };
 pub use message::AgentMessage;
 pub use resume::{ReplacementStateRef, SanitizeError, SanitizeOutcome, SessionSanitizeReport};

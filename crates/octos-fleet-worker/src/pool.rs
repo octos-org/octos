@@ -367,10 +367,11 @@ impl FleetWorkerPool {
                 // and finished populating a directory, that directory may hold
                 // work the dead attempt never committed. It is handed to the
                 // worker as the place to recover FROM — the worker commits what
-                // it holds and retires it. Anything else (no binding, another
-                // generation, a directory the worker never populated, a path
-                // that is not one of this task's work checkouts) has nothing to
-                // recover.
+                // it holds and retires it. If git can no longer commit from it,
+                // the dispatch is refused and the directory is left as it is.
+                // Anything else (no binding, another generation, a directory
+                // the worker never populated, a path that is not one of this
+                // task's work checkouts) has nothing to recover.
                 let recorded = child
                     .as_ref()
                     .and_then(|c| c.worktree.as_ref())
@@ -387,11 +388,24 @@ impl FleetWorkerPool {
                 let work_root = self.cfg.workspace_root.clone();
                 let task_stem = stem.clone();
                 let (prepared, recover_from) = tokio::task::spawn_blocking(move || {
-                    // Still this task's registered worktree on its branch?
+                    // Can what the recorded directory holds still be committed?
+                    // This is decided before anything of the task is removed.
                     let recover_from = match recorded {
                         Some(dead) => {
-                            octos_core::reuse_fleet_worktree(&root, &work_root, &branch, &dead)?
-                                .map(|_| dead)
+                            match octos_core::inspect_recorded_checkout(&root, &work_root, &dead)? {
+                                octos_core::RecordedCheckout::Recoverable => Some(dead),
+                                octos_core::RecordedCheckout::Gone => None,
+                                octos_core::RecordedCheckout::Unrecoverable(why) => {
+                                    return Err(eyre!(
+                                        "the directory recorded as holding this task's work, {}, \
+                                         cannot be recovered from: {why}. Nothing was removed. \
+                                         Save what you need from it, move or delete it, and \
+                                         dispatch the task again: it then continues from what is \
+                                         committed on branch {branch}",
+                                        dead.display()
+                                    ));
+                                }
+                            }
                         }
                         None => None,
                     };

@@ -14,8 +14,13 @@
 //! to fix: the attempt is refused and no model is called.
 //!
 //! **Work survives the host.** A later attempt of the same generation is
-//! handed the dead attempt's directory, and whatever it holds is committed as a
-//! snapshot; it is never reset. With an admitted failing test the recovered
+//! handed the dead attempt's directory, and whatever it holds is committed to
+//! the task branch as a snapshot; it is never reset. That holds wherever the
+//! dead attempt left its `HEAD` — detached, or on a branch of its own — because
+//! the snapshot is made from the directory's content, not from `HEAD`. A
+//! recorded directory git can no longer commit from (its `.git` file is gone,
+//! say) is not recovered and not removed either: the task is not dispatched
+//! until somebody has looked at it. With an admitted failing test the recovered
 //! commit is VERIFIED FIRST: if the acceptance commands already pass on it, the
 //! task completes with zero model calls. Otherwise — the commit does not pass,
 //! or the task admitted no test and so has nothing that says the work is
@@ -26,20 +31,28 @@
 //! works in a directory of its own. The lease fences a dead attempt's store
 //! writes, not its files: a build or a script it started may still be running
 //! and writing. So the successor never works in the dead attempt's directory.
-//! It commits what that directory holds, retires it (the directory is removed
-//! and unregistered, so git no longer works there), and continues in a new
-//! directory populated from the branch — a path the old process was never
-//! given, outside what its sandbox lets it write.
+//! It commits what that directory holds and continues in a new directory
+//! populated from the branch — a path the old process was never given, outside
+//! what its sandbox lets it write. Once the new directory is recorded as the
+//! one holding the work, the old one is retired: removed and unregistered, so
+//! git no longer works there. In that order the record never names a directory
+//! that has been removed.
 //!
 //! **A verdict is about a commit, and nothing else.** No check ever runs in the
 //! attempt's own checkout. The tree under test is always a committed tree whose
-//! id is read host-side, and its commands run in a throwaway, detached checkout
-//! of exactly that commit ([`octos_core::prepare_detached_worktree`]) that is
-//! created for the run and removed after it. So a file git ignores — a build
-//! cache, a marker an earlier run left — cannot make a commit pass that would
-//! fail where it is delivered, and a test that rewrites files rewrites the
-//! throwaway copy, never the work. A `FileExists` criterion is answered from
-//! the commit too.
+//! id is read host-side, and its commands run in a throwaway checkout of
+//! exactly that commit that is created for the run and removed after it. So a
+//! file git ignores — a build cache, a marker an earlier run left — cannot make
+//! a commit pass that would fail where it is delivered, and a test that
+//! rewrites files rewrites the throwaway copy, never the work. A `FileExists`
+//! criterion is answered from the commit too.
+//!
+//! That checkout is a repository of its own
+//! ([`octos_core::clean_checkout_command`]): it borrows the task repository's
+//! objects and reads none of its configuration, attribute files or hooks —
+//! all of which a worker can write. A filter planted there to rewrite a file
+//! as it is checked out therefore changes nothing: the files tested are the
+//! commit's own.
 //!
 //! **Every command leaves a receipt bound to that commit.** The intent to run
 //! is recorded before the command starts, and its exit status and output digest
@@ -62,8 +75,21 @@
 //!   no longer points at the commit the receipt names.
 //! - **A clean checkout has no build cache.** Every verification builds from
 //!   nothing, which is slow for a compiled project.
+//! - **A clean checkout has none of the repository's local setup.** A file the
+//!   repository stores through a locally configured filter (Git LFS) is checked
+//!   out as the commit holds it — the pointer — and none of the repository's
+//!   branches can be named there. The OBJECTS are still shared: a process that
+//!   rewrites the object store itself is not stopped.
 //! - **Only the acceptance commands are journaled.** The agent's own tool calls
 //!   inside a turn are not recorded one operation at a time.
+//! - **A recorded result is not questioned.** A test that passes once on the
+//!   base by accident refuses the task for that generation of the plan
+//!   ("no failing test to fix"), and one that fails once on a commit by
+//!   accident is reused as that commit's rejection. A flaky test is not
+//!   detected.
+//! - **The directory of a task that ended without being accepted stays on
+//!   disk** until the task is dispatched again, which may never happen.
+//!   Nothing else removes it.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -110,6 +136,9 @@ pub(crate) enum KillPoint {
     AcceptanceCommandExited,
     /// The attempt's verdict is computed; the completion is not committed yet.
     BeforeCompletion,
+    /// Recovered work is committed and this attempt's directory is recorded as
+    /// holding it; the interrupted attempt's directory is not retired yet.
+    BeforeRetiringDead,
 }
 
 /// Stop here forever if a test armed `point` for `store`. Compiles to nothing
@@ -325,11 +354,12 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
             return Ok(refused);
         }
 
-        if let Some(dead) = self.worktree.recover_from.as_deref() {
-            // The interrupted attempt's directory. Commit what it holds, then
-            // leave it: this attempt never works where that attempt's processes
-            // may still be writing.
-            if let Some(reason) = self.take_over(dead, &base, remaining(started)).await {
+        let dead = self.worktree.recover_from.as_deref();
+        if let Some(dead) = dead {
+            // The interrupted attempt's directory. Commit what it holds; this
+            // attempt never works where that attempt's processes may still be
+            // writing.
+            if let Some(reason) = self.snapshot_dead(dead, &base, remaining(started)).await {
                 return Ok(Admission::terminated(reason));
             }
         }
@@ -357,6 +387,12 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
             Ok(CompleteOutcome::Completed) => {}
             Ok(CompleteOutcome::Superseded) => return Err(Stop(AttemptOutcome::Superseded)),
             Err(err) => return Err(self.record_error("mark_worktree_populated", &err)),
+        }
+        if let Some(dead) = dead {
+            // The record names this attempt's directory now, so the dead one
+            // is no longer where the work is: it can go.
+            kill_point(self.store, KillPoint::BeforeRetiringDead).await;
+            self.retire(dead).await;
         }
 
         let (commit, tree) = match self.head().await {
@@ -433,18 +469,15 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
         }
     }
 
-    /// Take over the work in `dead`, an interrupted attempt's directory: commit
-    /// whatever it holds to the task branch, then retire the directory.
-    /// `Some(reason)` when the work could not be secured — the attempt then
-    /// terminates and `dead` is left exactly as it was.
+    /// Secure the work in `dead`, an interrupted attempt's directory: commit
+    /// whatever it holds to the task branch. `Some(reason)` when that could
+    /// not be done — the attempt then terminates and `dead` is left exactly as
+    /// it was.
     ///
     /// The commit is strict (a snapshot that did not commit leaves the work
-    /// only in `dead`, and nothing may be removed). Retiring removes the
-    /// directory and its worktree registration: a process the dead attempt left
-    /// running loses its directory, and a `git` command it runs there no longer
-    /// finds a repository. From here on that process and this attempt share no
-    /// working directory.
-    async fn take_over(
+    /// only in `dead`), and it does not depend on where `dead`'s `HEAD` points:
+    /// see [`octos_core::deliverable_commit_command`].
+    async fn snapshot_dead(
         &self,
         dead: &Path,
         base: &WorktreeBinding,
@@ -457,16 +490,30 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
                 base.checkout
             ));
         }
+        let failed =
+            |reason: String| Some(format!("could not snapshot the recovered work: {reason}"));
         let sandbox = match self.sandbox_for(dead) {
             Ok(sandbox) => sandbox,
-            Err(reason) => return Some(format!("could not snapshot the recovered work: {reason}")),
+            Err(reason) => return failed(reason),
         };
         let message = format!("fleet {} recovered work", self.task_id);
-        let command = octos_core::recovery_snapshot_command(&message);
-        if let Err(err) = run_sandboxed_git(&sandbox, dead, &command, budget, true).await {
-            return Some(format!("could not snapshot the recovered work: {err}"));
+        let command = match octos_core::recovery_snapshot_command(&self.worktree.branch, &message) {
+            Ok(command) => command,
+            Err(err) => return failed(format!("{err:#}")),
+        };
+        match run_sandboxed_git(&sandbox, dead, &command, budget, true).await {
+            Ok(()) => None,
+            Err(err) => failed(err),
         }
+    }
 
+    /// Retire `dead`, an interrupted attempt's directory whose work is
+    /// committed and which the record no longer names: remove it and its
+    /// worktree registration. A process the dead attempt left running loses
+    /// its directory, and a `git` command it runs there no longer finds a
+    /// repository. From here on that process and this attempt share no working
+    /// directory.
+    async fn retire(&self, dead: &Path) {
         let repo_root = self.worktree.repo_root.clone();
         let work_root = self.worktree.work_root.clone();
         let retired = dead.to_path_buf();
@@ -489,7 +536,6 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
             dead = %dead.display(), checkout = %self.checkout.display(),
             "fleet worker: took over the interrupted attempt's work; continuing in a new directory",
         );
-        None
     }
 
     /// A sandbox confined to `dir`, made by the same factory from the same
@@ -609,7 +655,15 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
         mut budget: Duration,
     ) -> Result<(AcceptanceVerdict, Option<String>), Stop> {
         let message = format!("fleet {} deliverable", self.task_id);
-        let snapshot = octos_core::recovery_snapshot_command(&message);
+        let snapshot = match octos_core::recovery_snapshot_command(&self.worktree.branch, &message)
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return Ok(terminated(format!(
+                    "could not commit the worktree for verification: {err:#}"
+                )));
+            }
+        };
         let mut verified: Option<(String, Vec<EvidenceRef>)> = None;
 
         for run in 0..=MAX_VERIFICATION_RUNS {
@@ -883,13 +937,17 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
     }
 
     /// Create a clean checkout of exactly `commit`, next to the attempt's own
-    /// checkout, and populate it inside a sandbox confined to it.
+    /// checkout, and fill it inside a sandbox confined to it.
     ///
     /// The directory is new for every call (`<task>.verify-<attempt>-<n>`), so
     /// nothing an earlier run wrote can be in it, and a process that outlived
-    /// an earlier attempt does not know its name. The sandbox is made by the
-    /// same factory, from the same grant, as the attempt's own; one that does
-    /// not isolate, or cannot run the worktree flow, is refused.
+    /// an earlier attempt does not know its name. It is filled as a repository
+    /// of its own that borrows the task repository's objects and reads none of
+    /// its configuration ([`octos_core::clean_checkout_command`]), so its files
+    /// are the commit's own whatever a worker wrote into the shared `.git`. The
+    /// sandbox is made by the same factory, from the same grant, as the
+    /// attempt's own; one that does not isolate, or cannot run the worktree
+    /// flow, is refused.
     async fn open_clean(
         &self,
         commit: &str,
@@ -899,14 +957,15 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
         let label = format!("{}-{number}", octos_core::safe_filename(self.attempt_id));
         let dir = octos_core::clean_checkout_path(&self.worktree.stem, &label)
             .map_err(|err| format!("{err:#}"))?;
+        let fill = octos_core::clean_checkout_command(&self.worktree.git_dir, commit)
+            .map_err(|err| format!("{err:#}"))?;
 
         let started = Instant::now();
         let prepared = {
-            let repo_root = self.worktree.repo_root.clone();
             let work_root = self.worktree.work_root.clone();
-            let (dir, commit) = (dir.clone(), commit.to_string());
+            let dir = dir.clone();
             tokio::task::spawn_blocking(move || {
-                octos_core::prepare_detached_worktree(&repo_root, &work_root, &dir, &commit)
+                octos_core::prepare_clean_checkout_dir(&work_root, &dir)
             })
             .await
         };
@@ -925,11 +984,11 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
             }
         };
         let started = Instant::now();
-        let failed = populate_worktree(&sandbox, &dir, *budget).await;
+        let filled = run_sandboxed_git(&sandbox, &dir, &fill, *budget, true).await;
         *budget = budget.saturating_sub(started.elapsed());
-        if let Some(reason) = failed {
+        if let Err(reason) = filled {
             self.remove_clean(dir).await;
-            return Err(reason);
+            return Err(format!("clean checkout failed: {reason}"));
         }
         Ok(CleanCheckout { dir, sandbox })
     }
@@ -939,8 +998,8 @@ impl<C: Fn() -> u64> WorktreeRun<'_, C> {
         self.remove_clean(clean.dir).await;
     }
 
-    /// Remove a clean checkout directory and its registration. Best-effort: one
-    /// that is left behind is removed when the task is next dispatched.
+    /// Remove a clean checkout directory. Best-effort: one that is left behind
+    /// is removed when the task is next dispatched.
     async fn remove_clean(&self, dir: PathBuf) {
         let repo_root = self.worktree.repo_root.clone();
         let work_root = self.worktree.work_root.clone();

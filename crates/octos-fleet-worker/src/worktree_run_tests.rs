@@ -211,18 +211,7 @@ impl Fixture {
 
     /// Run `git <args>` in the controller repository; trimmed stdout.
     fn git(&self, args: &[&str]) -> String {
-        let out = StdCommand::new("git")
-            .arg("-C")
-            .arg(self.repo.path())
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        git_in(self.repo.path(), args)
     }
 
     /// `<work>/<fleet>/<task>`: the name every directory of the task starts with.
@@ -339,6 +328,22 @@ impl Fixture {
             .filter(|r| r.phase == phase)
             .collect()
     }
+}
+
+/// Run `git <args>` in `dir`; trimmed stdout.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = StdCommand::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 async fn reached(point: oneshot::Receiver<()>, what: &str) {
@@ -919,6 +924,155 @@ async fn should_keep_recovered_checkout_when_relaunch_is_rejected() {
         1,
         "and the empty checkout it had created for itself is rolled back",
     );
+}
+
+/// Boot 1 writes the fix and dies with it uncommitted, after `left` was run in
+/// its checkout — what the dead attempt did to its own `HEAD` — and an
+/// untracked file was added. Boot 2 must deliver all of it without a model.
+async fn recovers_work_left_off_the_task_branch(left: &[&str]) {
+    let Some(fx) = Fixture::new("broken\n").await else {
+        return;
+    };
+    let (model, patch_written) = PatchProvider::then_never_answers("value.txt", "fixed\n");
+    let boot1 = fx.boot(Arc::new(model), EPOCH).await;
+    fx.start(&boot1).await;
+    reached(patch_written, "the patch on disk").await;
+    let dead_checkout = fx.bound_checkout().await;
+    git_in(&dead_checkout, left);
+    std::fs::write(dead_checkout.join("notes.txt"), "untracked\n").unwrap();
+
+    fx.reconcile(EPOCH + 1).await;
+    let (model, calls) = uncalled_model();
+    let boot2 = fx.boot(model, EPOCH + 1).await;
+    let (_, outcome) = fx.run(&boot2).await;
+
+    receipt_ops(&outcome);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no model call");
+    assert_eq!(fx.git(&["show", &format!("{BRANCH}:value.txt")]), "fixed");
+    assert_eq!(
+        fx.git(&["show", &format!("{BRANCH}:notes.txt")]),
+        "untracked",
+        "the untracked file was recovered too",
+    );
+    assert!(
+        !dead_checkout.exists(),
+        "retired once its work was committed"
+    );
+}
+
+#[tokio::test]
+async fn should_recover_work_when_the_dead_attempt_left_its_head_detached() {
+    recovers_work_left_off_the_task_branch(&["checkout", "-q", "--detach"]).await;
+}
+
+#[tokio::test]
+async fn should_recover_work_when_the_dead_attempt_left_its_head_on_another_branch() {
+    recovers_work_left_off_the_task_branch(&["checkout", "-q", "-b", "elsewhere"]).await;
+}
+
+#[tokio::test]
+async fn should_refuse_dispatch_and_keep_the_directory_when_its_work_cannot_be_committed() {
+    // The dead attempt's directory lost its `.git` file, so git cannot commit
+    // from it — and it holds the only copy of the patch. It must not be swept
+    // away as a leftover: the dispatch is refused until somebody has dealt
+    // with it.
+    let Some(fx) = Fixture::new("broken\n").await else {
+        return;
+    };
+    let (model, patch_written) = PatchProvider::then_never_answers("value.txt", "fixed\n");
+    let boot1 = fx.boot(Arc::new(model), EPOCH).await;
+    fx.start(&boot1).await;
+    reached(patch_written, "the patch on disk").await;
+    let dead_checkout = fx.bound_checkout().await;
+    std::fs::remove_file(dead_checkout.join(".git")).unwrap();
+
+    fx.reconcile(EPOCH + 1).await;
+    let (model, calls) = uncalled_model();
+    let boot2 = fx.boot(model, EPOCH + 1).await;
+    let refused = boot2
+        .dispatch(FLEET, TASK)
+        .await
+        .expect_err("the dispatch is refused");
+
+    let refused = format!("{refused:#}");
+    assert!(
+        refused.contains(&dead_checkout.display().to_string()),
+        "the refusal names the directory: {refused}",
+    );
+    assert_eq!(
+        std::fs::read_to_string(dead_checkout.join("value.txt")).unwrap(),
+        "fixed\n",
+        "the work is still where it was",
+    );
+    assert_eq!(
+        fx.task_dirs(""),
+        vec![
+            dead_checkout
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        ],
+        "nothing of the task was removed, and nothing was created",
+    );
+    assert_eq!(fx.child().await.status, ChildStatus::Ready);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no attempt ran");
+
+    // Once it has been moved away, the task runs again from the branch.
+    std::fs::rename(&dead_checkout, fx.work.path().join("saved")).unwrap();
+    let model = Arc::new(PatchProvider::new("value.txt", "fixed\n"));
+    let boot3 = fx.boot(model, EPOCH + 1).await;
+    let (_, outcome) = fx.run(&boot3).await;
+    receipt_ops(&outcome);
+}
+
+#[tokio::test]
+async fn should_deliver_recovered_work_when_host_dies_before_the_dead_directory_is_retired() {
+    // Boot 2 commits what boot 1 left, records its own directory as the one
+    // holding the work — and dies before it retires boot 1's directory. Boot 3
+    // finds two directories: the recorded one is recovered from, the other is
+    // a leftover. The work is delivered once, with no model call.
+    let Some(fx) = Fixture::new("broken\n").await else {
+        return;
+    };
+    let (model, patch_written) = PatchProvider::then_never_answers("value.txt", "fixed\n");
+    let boot1 = fx.boot(Arc::new(model), EPOCH).await;
+    fx.start(&boot1).await;
+    reached(patch_written, "the patch on disk").await;
+    let first = fx.bound_checkout().await;
+
+    fx.reconcile(EPOCH + 1).await;
+    let recorded = kill_points::arm(&fx.store, KillPoint::BeforeRetiringDead);
+    let (model, _) = uncalled_model();
+    let boot2 = fx.boot(model, EPOCH + 1).await;
+    fx.start(&boot2).await;
+    reached(
+        recorded,
+        "the new directory recorded, the old one not retired",
+    )
+    .await;
+    let second = fx.bound_checkout().await;
+    assert_ne!(second, first, "the record names boot 2's directory");
+    assert!(first.exists(), "boot 1's directory has not been retired");
+
+    fx.reconcile(EPOCH + 2).await;
+    let (model, calls) = uncalled_model();
+    let boot3 = fx.boot(model, EPOCH + 2).await;
+    let (_, outcome) = fx.run(&boot3).await;
+
+    receipt_ops(&outcome);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no model call");
+    assert_eq!(fx.git(&["show", &format!("{BRANCH}:value.txt")]), "fixed");
+    assert_eq!(
+        fx.git(&[
+            "rev-list",
+            "--count",
+            &format!("{}..{BRANCH}", fx.base_commit)
+        ]),
+        "1",
+        "the recovered work was committed once",
+    );
+    assert!(!first.exists() && !second.exists(), "both were cleaned up");
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,6 +1813,50 @@ async fn should_reject_when_patch_only_passes_with_a_cache_an_earlier_run_left_b
         Some(1),
         "the candidate commit fails the test where nothing was left behind",
     );
+}
+
+#[tokio::test]
+async fn should_test_the_commits_own_bytes_when_a_filter_is_planted_in_the_repository() {
+    // A worker can write the task repository's `.git/config` and
+    // `.git/info/attributes`. Here they hold a filter that makes `value.txt`
+    // read `fixed` wherever a commit is verified — and nowhere else — while the
+    // commit boot 1 left behind says `still-broken`. Accepting it would hand
+    // out a receipt for content that was never tested.
+    let Some(fx) = Fixture::new("broken\n").await else {
+        return;
+    };
+    let (model, patch_written) = PatchProvider::then_never_answers("value.txt", "still-broken\n");
+    let boot1 = fx.boot(Arc::new(model), EPOCH).await;
+    fx.start(&boot1).await;
+    reached(patch_written, "the patch on disk").await;
+    fx.git(&[
+        "config",
+        "filter.planted.smudge",
+        r#"case "$PWD" in *.verify-*) printf 'fixed\n';; *) cat;; esac"#,
+    ]);
+    std::fs::write(
+        fx.repo.path().join(".git/info/attributes"),
+        "value.txt filter=planted\n",
+    )
+    .unwrap();
+
+    fx.reconcile(EPOCH + 1).await;
+    let model = PatchProvider::new("value.txt", "fixed\n");
+    let calls = model.calls.clone();
+    let boot2 = fx.boot(Arc::new(model), EPOCH + 1).await;
+    let (_, outcome) = fx.run(&boot2).await;
+
+    // The recovered commit was tested as it is and failed; the model then
+    // finished the work, and what was accepted is what the branch holds.
+    receipt_ops(&outcome);
+    let acceptance = fx.journal(VerificationPhase::Acceptance).await;
+    assert_eq!(
+        acceptance[0].result.as_ref().unwrap().exit_status,
+        Some(1),
+        "the recovered commit does not hold the fix, whatever the filter writes",
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 1, "so the model was called");
+    assert_eq!(fx.git(&["show", &format!("{BRANCH}:value.txt")]), "fixed");
 }
 
 // ---------------------------------------------------------------------------

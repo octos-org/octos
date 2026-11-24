@@ -68,8 +68,8 @@ T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同
 | `pool::tests::record_error_keeps_guard_armed_others_disarm` | 4 | RecordError 保持 guard armed 以便 Drop 清理；Completed/Superseded/Aborted 才 disarm，覆盖基础设施失败专属映射。 |
 | `pool::tests::rejected_after_prep_leaves_no_orphaned_checkout` | 4 | worktree prep 后 launch 以 RejectedNotReady/no-handle 拒绝时，prep→launch rollback 清除 checkout，保留 branch。 |
 | `pool::tests::grant_narrowed_during_launch_is_rejected` | 4 | 名称虽为 grant narrowed，实际用连续 Retitle 改 revision：slow prep 与 replan 竞态由 CAS 拒绝，且 checkout 回滚；不冒充真实 grant mutation。 |
-| `pool::tests::dispatch_reconciles_preexisting_worktree_on_relaunch` | 4 | 崩溃遗留 branch+checkout 时，relaunch reconcile 而非冲突失败；worker commit 正常落 branch。 |
-| `pool::tests::interrupted_worktree_attempt_removes_checkout_keeps_branch` | 4 | worktree attempt 中断后 child Failed、checkout 清除、branch 保留供恢复，不遗留锁住的 checkout。 |
+| `pool::tests::dispatch_removes_a_dead_attempts_empty_checkout_on_relaunch` | 4 | 崩溃遗留 branch 与一个从未 populate 的 checkout 时，relaunch 不因 branch 已被检出而失败：遗留目录被移除，worker 在自己的新目录里运行，commit 正常落 branch。 |
+| `pool::tests::interrupted_worktree_attempt_keeps_checkout_and_branch` | 4 | worktree attempt 中断后 child Failed，checkout 与 branch 都保留：目录里可能是未提交工作的唯一副本，不得随中断删除。 |
 | `pool::tests::worktree_empty_branch_is_not_marked_succeeded` | 4 | 无 acceptance 且 worker 无产出时，empty branch 被降级 Rejected/Failed，不制造空成功。 |
 | `pool::tests::concurrent_dispatch_of_one_task_does_not_corrupt_the_worktree` | 4 | 同 task 并发 dispatch 经 per-task lock 仅一个 launch，deliverable 完整，不发生 double prep/reconcile。 |
 | `pool::tests::pool_bounds_concurrency` | 4 | 五个真实并发 attempt 的全局限额为 2，且确实发生并行，不是仅靠串行通过上限断言。 |
@@ -151,3 +151,45 @@ T-0639 第二轮（同链路合并+共享 setup，场景全保留）：四组同
 | `first_inputs_tests::should_say_in_the_first_request_which_optional_inputs_were_left_out` | 5 | Optional inputs that were left out are named with their reasons in the first request, and the task runs. |
 | `first_inputs_tests::should_never_call_an_image_too_large_for_a_model_request_delivered` | 5 | An image over the request limit is reported unsupported and is not attached. |
 | `first_inputs_tests::should_fail_a_task_whose_required_image_the_endpoint_refuses_instead_of_running_it_blind` | 1 | Against an endpoint that refuses image parts: a task with a required image makes one request and terminates with the reason; with the image optional the request goes again without it and the task runs. |
+
+## Worktree-task recovery across a host death (coding pilot, #3337)
+
+All of these run through the real pool, a real git repository and a sandbox.
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `worktree_run_tests::should_deliver_patch_with_tree_bound_receipt_when_test_fails_on_base` | 1 | The named test is recorded failing on the base, the patch is delivered, and the accepted verdict points at a receipt for exactly the delivered commit and tree. |
+| `worktree_run_tests::should_recover_work_with_zero_model_calls_when_the_host_process_is_killed` | 1 | Another OS process runs the first boot and is killed with SIGKILL while a process it started keeps writing; the next process delivers what was left without calling a model. |
+| `worktree_run_tests::should_refuse_admission_without_a_model_call_when_test_already_passes_on_base` | 5 | A test that passes on the base is not a failing test to fix: the attempt is refused and no model is called. |
+| `worktree_run_tests::should_refuse_admission_when_test_command_cannot_execute` | 5 | A command that cannot be executed on the base is refused, not read as a failing test. |
+| `worktree_run_tests::should_refuse_dispatch_when_task_naming_a_failing_test_has_no_git_worktree` | 5 | A task that names a failing test is refused at dispatch when it cannot get an isolated worktree; it never runs in a scratch directory. |
+| `worktree_run_tests::should_reject_when_worktree_task_changes_nothing` | 5 | A tree identical to the base is no deliverable. |
+| `worktree_run_tests::should_resume_the_agent_from_recovered_work_when_task_names_no_failing_test` | 5 | Without an admitted failing test, recovered work is never delivered unseen: the agent resumes from it. |
+| `worktree_run_tests::should_recover_uncommitted_patch_with_zero_model_calls_when_host_dies_before_verification` | 4 | An uncommitted patch a dead host left is committed, verified and delivered once by the next boot with no model call; the user's own checkout is untouched. |
+| `worktree_run_tests::should_continue_from_recovered_tree_when_recovered_work_does_not_pass_yet` | 4 | Recovered work that fails the test is kept as its own commit, and the model resumes from it, told that it is resuming and from which base. |
+| `worktree_run_tests::should_restore_from_branch_when_dead_attempt_never_populated_its_checkout` | 4 | A checkout the dead attempt never populated is rebuilt from the branch, never snapshotted — that would commit the deletion of every file. |
+| `worktree_run_tests::should_recover_work_when_the_dead_attempt_left_its_head_detached` | 4 | Work in a directory whose HEAD the dead attempt detached — a tracked edit and an untracked file — is committed to the task branch and delivered with no model call. |
+| `worktree_run_tests::should_recover_work_when_the_dead_attempt_left_its_head_on_another_branch` | 4 | The same when the dead attempt had switched to a branch of its own. |
+| `worktree_run_tests::should_refuse_dispatch_and_keep_the_directory_when_its_work_cannot_be_committed` | 4 | A recorded directory git can no longer commit from is not swept as a leftover: the dispatch is refused naming it, nothing of the task is removed or created, and the task runs again once the directory has been moved away. |
+| `worktree_run_tests::should_deliver_recovered_work_when_host_dies_before_the_dead_directory_is_retired` | 4 | A host that dies after recording its own directory and before retiring its predecessor's leaves a state the next boot delivers from once, with no model call, cleaning up both directories. |
+| `worktree_run_tests::should_keep_recovered_checkout_when_relaunch_is_rejected` | 4 | A redispatch that is rejected deletes nothing of the work it found and rolls back the empty checkout it created. |
+| `worktree_run_tests::should_reuse_committed_receipt_without_rerunning_test_when_host_dies_before_completion` | 4 | A committed passing result for the exact commit is reused: the test does not run again and no model is called. |
+| `worktree_run_tests::should_rerun_only_the_test_on_the_same_tree_when_its_result_was_lost` | 4 | A run whose result was lost with its host is repeated on the same commit; the patch is not made again. |
+| `worktree_run_tests::should_run_every_acceptance_command_again_when_one_of_their_results_was_lost` | 4 | With the result of one of several commands missing, all of them run again, in order, in one fresh checkout. |
+| `worktree_run_tests::should_not_repeat_admission_when_host_dies_after_it_was_committed` | 4 | A committed admission result is not repeated by the successor. |
+| `worktree_run_tests::should_refuse_as_nothing_to_fix_when_base_test_passed_and_its_result_was_lost` | 4 | A test that passed on the base and rewrote a tracked file, with its result lost, is run on the base again and refuses the task; the file it rewrote is not taken for a fix. |
+| `worktree_run_tests::should_refuse_recovered_work_when_no_run_ever_recorded_the_test_failing_on_base` | 4 | Recovered work proves nothing about the base: with no recorded failing run, the base is checked first, and the task is refused with the work left untouched. |
+| `worktree_run_tests::should_deliver_only_the_committed_work_when_the_test_writes_files_of_its_own` | 4 | Files a test writes while it runs stay in the throwaway checkout and are not delivered. |
+| `worktree_run_tests::should_reject_when_the_checkout_keeps_changing_while_it_is_verified` | 4 | A checkout something keeps writing into is rejected, rather than accepted on a receipt for a tree that is no longer the branch head. |
+| `worktree_run_tests::should_reject_when_patch_only_passes_with_a_cache_an_earlier_run_left_behind` | 4 | A commit that passes only with a git-ignored cache an earlier run left is rejected: it is tested where nothing was left behind. |
+| `worktree_run_tests::should_record_tree_bound_receipts_when_task_names_no_failing_test` | 4 | The acceptance commands of an ordinary worktree task are journaled against the commit too. |
+| `worktree_run_tests::should_accept_file_criterion_when_the_delivered_commit_holds_the_file` | 4 | A `FileExists` criterion is answered from the delivered commit. |
+| `worktree_run_tests::should_reject_file_criterion_when_the_delivered_commit_lacks_the_file` | 4 | A file the delivered commit does not hold does not satisfy `FileExists`. |
+| `worktree_run_tests::should_keep_uncommitted_work_when_attempt_is_cancelled_in_a_live_process` | 4 | When an attempt goes away in a live process (cancel, panic, store error), settling it does not delete the only copy of its patch. |
+| `worktree_run_tests::should_keep_the_checkout_when_the_task_is_not_accepted` | 4 | Only an accepted task's checkout is removed; one that did not pass keeps what was not delivered. |
+| `worktree_run_tests::should_deliver_recovered_work_when_a_process_of_the_dead_attempt_keeps_writing` | 4 | With a process of the dead attempt still writing into its directory, the successor works in another one and the recovered commit is verified once. |
+| `worktree_run_tests::should_remove_a_dead_attempts_leftover_directories_when_the_task_runs_again` | 4 | A dead attempt's work directory and the clean checkout its check ran in are both gone after the next attempt; only the directory holding unaccepted work is left. |
+| `worktree_run_tests::should_test_the_commits_own_bytes_when_a_filter_is_planted_in_the_repository` | 3 | A filter and an attribute line planted in the task repository's `.git` cannot make a commit pass: the commit's own bytes are tested, the recovered commit fails, and what is accepted is what the branch holds. |
+| `worktree_run_tests::real_macos_sandbox::should_recover_and_deliver_under_the_real_sandbox_when_reads_are_restricted` | 3 | Under the real macOS sandbox with restricted reads, admission, the recovery commit, the clean checkout and delivery all work (macOS only). |
+| `worktree_run::tests::should_quote_every_token_so_the_shell_interprets_nothing` | 3 | Every token of an acceptance command is quoted before the sandbox's shell sees it. |
+| `worktree_run::tests::should_frame_output_digest_so_the_stream_boundary_matters` | 4 | A receipt's output digest tells where stdout ends and stderr begins. |
