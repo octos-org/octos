@@ -182,10 +182,11 @@ pub(crate) fn intake(ctx: &Context, r: &Value) -> Result<Value> {
         additions.map(Vec::as_slice).unwrap_or_default(),
     )?
     .context("supply the source OCR file on first admission")?;
-    if !pinned && let Err(error) = ctx.write_json(page_pin(page), &design) {
-        if original(ctx, page, Some(&design))?.is_none() {
-            return Err(error);
-        }
+    if !pinned
+        && let Err(error) = ctx.write_json(page_pin(page), &design)
+        && original(ctx, page, Some(&design))?.is_none()
+    {
+        return Err(error);
     }
     Ok(
         json!({"source_ocr":binding,"lines":ctx.json(ctx.verify(&binding)?)?["lines"],"quality_approved":false}),

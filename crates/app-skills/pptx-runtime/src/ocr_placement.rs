@@ -158,10 +158,10 @@ pub(crate) fn apply(ctx: &Context, spec: &mut Spec) -> Result<Vec<Value>> {
             a.center = a.center.map(|coordinate| coordinate * scale);
             a.lift *= scale;
             let mut trial = t.clone();
-            if let Some(angle) = a.angle {
-                if geometry::angle(angle, trial.rotation).abs() > 3. {
-                    trial.rotation = angle;
-                }
+            if let Some(angle) = a.angle
+                && geometry::angle(angle, trial.rotation).abs() > 3.
+            {
+                trial.rotation = angle;
             }
             let (_, _, measured) = placement::measure(spec, &trial)?;
             if measured["ink"]["status"] != "measured"
