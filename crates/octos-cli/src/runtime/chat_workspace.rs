@@ -864,14 +864,39 @@ pub(crate) fn register_profile(data_dir: &Path) {
 }
 
 /// A profile that existed when the server started keeps its pre-upgrade
-/// chats root. Runtime-created profiles are deliberately not marked here.
+/// chats root — but only when that root holds real pre-upgrade data. A
+/// profile installed after the server-level root shipped has an empty or
+/// absent legacy root; marking it legacy would split its chats across roots
+/// after the first restart (T-0670). Runtime-created profiles are
+/// deliberately not marked here.
 pub(crate) fn register_existing_profile(data_dir: &Path) -> std::io::Result<()> {
     let profile_dir = canonical_dir(data_dir);
+    if !has_pre_upgrade_chat_data(&profile_dir)? {
+        return Ok(());
+    }
     reserve_profile(&profile_dir)?;
     layout_write()
         .legacy_profiles
         .insert(profile_dir.clone(), chats_root(&profile_dir));
     Ok(())
+}
+
+/// Whether the profile's legacy chats root holds something a pre-upgrade
+/// server must have written: any entry at all. An empty directory left
+/// behind by an older startup, or no directory, proves nothing. A symlink or
+/// a non-directory entry counts as evidence so the root stays reserved and
+/// reads of it fail closed instead of silently rerouting new chats.
+fn has_pre_upgrade_chat_data(profile_dir: &Path) -> std::io::Result<bool> {
+    let root = chats_root(profile_dir);
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Ok(true);
+    }
+    Ok(std::fs::read_dir(&root)?.next().is_some())
 }
 
 /// [`register_profile`], by the folder the data directory resolves to: a
@@ -1020,6 +1045,87 @@ mod server_root_tests {
     use super::*;
 
     static LAYOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A chat folder and record written the way a pre-upgrade server left
+    /// them, so startup registration sees real legacy data (T-0670).
+    fn plant_legacy_chat(data_dir: &Path, profile_id: &str, session_id: &SessionKey) -> PathBuf {
+        let root = chats_root(data_dir);
+        let name = folder_name(data_dir, session_id);
+        let folder = root.join(&name);
+        private_dir(&folder, true).unwrap();
+        std::fs::write(
+            root.join(format!("{name}.json")),
+            serde_json::to_vec(&ChatRecord {
+                session_id: session_id.0.clone(),
+                profile_id: profile_id.to_owned(),
+                created_at: Utc::now(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[tokio::test]
+    async fn should_route_a_fresh_profile_to_the_server_root_after_every_restart() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let profile_dir = temp.path().join("profiles/fresh/data");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_dir = canonical_dir(&profile_dir);
+        let mut roots = Vec::new();
+        for boot in 0..3 {
+            let hidden = hidden_fixture_guard(temp.path());
+            let server_root =
+                configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[])
+                    .unwrap();
+            // Registration at every startup must not mark the fresh profile
+            // legacy: it has no pre-upgrade chat data (T-0670).
+            register_existing_profile(&profile_dir).unwrap();
+            assert!(
+                !layout_read().legacy_profiles.contains_key(&profile_dir),
+                "boot {boot} marked a fresh profile legacy"
+            );
+            let chat = create(
+                &profile_dir,
+                "fresh",
+                &SessionKey::with_profile("fresh", "api", &format!("chat-{boot}")),
+            )
+            .unwrap();
+            assert!(chat.root.starts_with(&server_root), "{chat:?}");
+            roots.push(chat.root);
+            drop(hidden);
+        }
+        // A fresh profile never gains a legacy root with content.
+        let legacy_root = chats_root(&profile_dir);
+        assert!(
+            std::fs::read_dir(&legacy_root)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "{} must stay empty",
+            legacy_root.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_treat_an_empty_legacy_dir_as_pre_upgrade_data() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let (temp, _hidden) = tempdir_with_hidden_guard();
+        let profile_dir = temp.path().join("profiles/empty/data");
+        // An older startup created this directory for every profile; it is not
+        // evidence of pre-upgrade chats.
+        std::fs::create_dir_all(chats_root(&profile_dir)).unwrap();
+        let server_root =
+            configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[]).unwrap();
+        register_existing_profile(&profile_dir).unwrap();
+        let chat = create(
+            &profile_dir,
+            "empty",
+            &SessionKey::with_profile("empty", "api", "chat"),
+        )
+        .unwrap();
+        assert!(chat.root.starts_with(&server_root), "{chat:?}");
+    }
 
     #[test]
     fn should_refuse_server_root_overlapping_profile_or_workspace() {
@@ -1308,15 +1414,12 @@ mod server_root_tests {
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let profile_dir = temp.path().join("profiles/live/data");
         std::fs::create_dir_all(&profile_dir).unwrap();
+        let old_id = SessionKey::with_profile("live", "api", "old");
+        plant_legacy_chat(&profile_dir, "live", &old_id);
         configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[]).unwrap();
         register_existing_profile(&profile_dir).unwrap();
         install_missing_root_healer();
-        let old_chat = create(
-            &profile_dir,
-            "live",
-            &SessionKey::with_profile("live", "api", "old"),
-        )
-        .unwrap();
+        let old_chat = create(&profile_dir, "live", &old_id).unwrap();
         std::fs::write(old_chat.root.join("secret.txt"), "old-secret").unwrap();
         let legacy_root = canonical_dir(&chats_root(&profile_dir));
         let moved_root = temp.path().join("renamed-chats");
@@ -1482,6 +1585,11 @@ mod server_root_tests {
         let state_home = root_dir.join("state");
         let profile = root_dir.join("profiles/deleted/data");
         std::fs::create_dir_all(&profile).unwrap();
+        plant_legacy_chat(
+            &profile,
+            "deleted",
+            &SessionKey::with_profile("deleted", "api", "old"),
+        );
         configure_server_root(&state_home, std::slice::from_ref(&profile), &[])
             .expect("configure server root");
         register_existing_profile(&profile).expect("legacy profile root");
@@ -1534,9 +1642,10 @@ mod server_root_tests {
             updated_at: Utc::now(),
         };
         assert!(profile_store.save(&bad_profile).is_err());
+        let old_id = SessionKey::with_profile("old", "api", "old-chat");
+        plant_legacy_chat(&old_profile, "old", &old_id);
         register_existing_profile(&old_profile).expect("legacy profile root");
 
-        let old_id = SessionKey::with_profile("old", "api", "old-chat");
         let old_chat = create(&old_profile, "old", &old_id).expect("legacy chat");
         assert!(
             old_chat
