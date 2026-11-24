@@ -386,7 +386,10 @@ pub fn permission_record_path(
 /// record identity or path comparisons.
 #[cfg(windows)]
 fn permission_io_path(path: &Path) -> PathBuf {
-    use std::{ffi::OsString, path::Component, path::Prefix};
+    use std::{
+        ffi::OsString,
+        path::{Component, Prefix},
+    };
 
     if !path.is_absolute() {
         return path.to_path_buf();
@@ -395,13 +398,42 @@ fn permission_io_path(path: &Path) -> PathBuf {
     let Some(Component::Prefix(prefix)) = components.next() else {
         return path.to_path_buf();
     };
-    match prefix.kind() {
+    let prefix_kind = prefix.kind();
+    // Verbatim Windows paths bypass Win32's `.`/`..` normalization. Apply the
+    // same lexical normalization first so I/O cannot select a different record.
+    let mut normalized = PathBuf::from(prefix.as_os_str());
+    let mut depth = 0usize;
+    for component in components {
+        match component {
+            Component::RootDir => normalized.push(Path::new(r"\")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth > 0 {
+                    normalized.pop();
+                    depth -= 1;
+                }
+            }
+            Component::Normal(part) => {
+                normalized.push(part);
+                depth += 1;
+            }
+            Component::Prefix(_) => return path.to_path_buf(),
+        }
+    }
+    match prefix_kind {
         Prefix::Disk(_) => {
             let mut verbatim = OsString::from(r"\\?\");
-            verbatim.push(path.as_os_str());
+            verbatim.push(normalized.as_os_str());
             PathBuf::from(verbatim)
         }
-        Prefix::UNC(server, share) => {
+        Prefix::UNC(_, _) => {
+            let mut components = normalized.components();
+            let Some(Component::Prefix(prefix)) = components.next() else {
+                return path.to_path_buf();
+            };
+            let Prefix::UNC(server, share) = prefix.kind() else {
+                return path.to_path_buf();
+            };
             let mut verbatim = OsString::from(r"\\?\UNC\");
             verbatim.push(server);
             verbatim.push(r"\");
@@ -414,6 +446,7 @@ fn permission_io_path(path: &Path) -> PathBuf {
             }
             PathBuf::from(verbatim)
         }
+        Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => normalized,
         _ => path.to_path_buf(),
     }
 }
@@ -751,6 +784,17 @@ mod tests {
             legacy,
             "valid legacy paths must not be relocated by the bounded encoding"
         );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                permission_io_path(Path::new(r"\\server\share\staging\..\data")),
+                PathBuf::from(r"\\?\UNC\server\share\data")
+            );
+            assert_eq!(
+                permission_io_path(Path::new(r"C:\staging\..\data")),
+                PathBuf::from(r"\\?\C:\data")
+            );
+        }
     }
 
     #[test]
