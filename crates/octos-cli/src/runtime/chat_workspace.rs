@@ -32,9 +32,13 @@ struct ChatWorkspaceLayout {
     /// profiles create chats here; legacy profiles keep their old root.
     server_root: Option<PathBuf>,
     /// Server-owned roots that are safe to recreate while wrapping a command.
-    /// Keeping this separate from the current root prevents a test or gateway
-    /// reconfigure from making another root look like a legacy root.
+    /// A root leaves this set as soon as it is known to hold content.
     healable_server_roots: std::collections::BTreeSet<PathBuf>,
+    /// Canonical server root -> identity captured while it existed.
+    server_root_identities: std::collections::HashMap<PathBuf, String>,
+    /// Missing marker path -> server root whose original directory identity
+    /// must be restored before commands may run with that root hidden.
+    unresolved_server_roots: std::collections::HashMap<PathBuf, PathBuf>,
     /// Canonical profile data dir -> server-level profile root chosen for it.
     /// Keeping this separate from the current server root keeps unit-test
     /// states independent and preserves a profile across unrelated reconfigures.
@@ -109,6 +113,27 @@ pub(crate) fn chats_root(data_dir: &Path) -> PathBuf {
 
 fn canonical_dir(path: &Path) -> PathBuf {
     octos_core::canonicalize_lossy(path)
+}
+
+fn root_identity(path: &Path) -> std::io::Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!("{:?}", metadata.created().ok()))
+    }
+}
+
+fn unresolved_marker_path(root: &Path) -> std::io::Result<PathBuf> {
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("server chats root name is invalid"))?;
+    Ok(root.with_file_name(format!(".{name}.missing")))
 }
 
 fn overlaps_path(left: &Path, right: &Path) -> bool {
@@ -283,12 +308,17 @@ pub(crate) fn configure_server_root(
     validate_server_root(&root, profile_data_dirs, workspace_roots)?;
     migrate_server_root(data_dir, profile_data_dirs, &root)?;
     private_dir(&root, true)?;
+    let identity = root_identity(&root)?;
+    let is_empty = root.read_dir()?.next().is_none();
     reserved_folders()
         .add(root.clone())
         .map_err(std::io::Error::other)?;
     let mut layout = layout_write();
     layout.server_root = Some(root.clone());
-    layout.healable_server_roots.insert(root.clone());
+    layout.server_root_identities.insert(root.clone(), identity);
+    if is_empty {
+        layout.healable_server_roots.insert(root.clone());
+    }
     drop(layout);
     Ok(root)
 }
@@ -331,6 +361,25 @@ pub(crate) fn install_missing_root_healer() {
 
 fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool, String> {
     let folder = canonical_dir(folder);
+    let marker_root = layout_read().unresolved_server_roots.get(&folder).cloned();
+    if let Some(root) = marker_root {
+        let expected = layout_read().server_root_identities.get(&root).cloned();
+        let current = root_identity(&root).map_err(|error| {
+            format!(
+                "server chats root {} is still missing or changed ({error}); restore the original directory",
+                root.display()
+            )
+        })?;
+        if expected.as_deref() != Some(current.as_str()) {
+            return Err(format!(
+                "server chats root {} was replaced instead of restored; restore the original directory or have an operator account for its contents",
+                root.display()
+            ));
+        }
+        layout_write().unresolved_server_roots.remove(&folder);
+        reserved_folders().remove(&folder);
+        return Ok(false);
+    }
     if layout_read().healable_server_roots.contains(&folder) {
         if command_roots
             .iter()
@@ -349,6 +398,15 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
         })?;
         tracing::warn!(path = %folder.display(), "recreated missing server chats root");
         return Ok(true);
+    }
+    if layout_read().server_root_identities.contains_key(&folder) {
+        let marker = unresolved_marker_path(&folder).map_err(|error| error.to_string())?;
+        layout_write()
+            .unresolved_server_roots
+            .insert(marker.clone(), folder.clone());
+        reserved_folders()
+            .add(marker)
+            .map_err(|error| error.to_string())?;
     }
     Err(format!(
         "hidden chats root {} is missing. Refusing to run the command; restore the directory, or have an operator verify its contents are deleted and unregister it with the repair flow.",
@@ -388,6 +446,12 @@ impl Drop for HiddenFixtureGuard {
         layout
             .healable_server_roots
             .retain(|root| !root.starts_with(&self.root));
+        layout
+            .server_root_identities
+            .retain(|root, _| !root.starts_with(&self.root));
+        layout.unresolved_server_roots.retain(|marker, root| {
+            !marker.starts_with(&self.root) && !root.starts_with(&self.root)
+        });
         if layout
             .server_root
             .as_ref()
@@ -571,9 +635,14 @@ fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> 
         return Ok(root.clone());
     }
     if let Some(root) = server_profile_root(profile_id) {
-        layout_write()
+        let server_root = server_root().expect("server_profile_root implies server_root");
+        let mut layout = layout_write();
+        layout
             .profile_server_roots
             .insert(profile_dir, root.clone());
+        // Once a profile can create a chat here, disappearance no longer proves
+        // the root was empty; healing would hide a fresh empty replacement.
+        layout.healable_server_roots.remove(&server_root);
         return Ok(root);
     }
     if cfg!(test) {
@@ -1046,27 +1115,55 @@ mod server_root_tests {
     async fn should_refuse_renamed_server_root_inside_command_roots() {
         let _layout = LAYOUT_TEST_LOCK.lock().await;
         let (temp, _hidden) = tempdir_with_hidden_guard();
-        let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
+        let profile_dir = temp.path().join("profiles/live/data");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let server_root =
+            configure_server_root(temp.path(), std::slice::from_ref(&profile_dir), &[]).unwrap();
         install_missing_root_healer();
-        let chat_root = server_root.join("a-chat");
-        std::fs::create_dir_all(&chat_root).unwrap();
-        let secret = chat_root.join("secret.txt");
+        let chat = create(
+            &profile_dir,
+            "live",
+            &SessionKey::with_profile("live", "api", "server"),
+        )
+        .unwrap();
+        let secret = chat.root.join("secret.txt");
         std::fs::write(&secret, "server-secret").unwrap();
         let moved_root = temp.path().join("renamed-server-chats");
-        let moved_secret = moved_root.join("a-chat/secret.txt");
+        let moved_secret = moved_root
+            .join(chat.root.strip_prefix(&server_root).unwrap())
+            .join("secret.txt");
         std::fs::rename(&server_root, &moved_root).unwrap();
+        let marker = unresolved_marker_path(&server_root).unwrap();
+        let unrelated = temp.path().join("unrelated-work");
+        std::fs::create_dir_all(&unrelated).unwrap();
 
-        let error = reserved_folders()
+        let first = reserved_folders()
+            .resolve_missing_folder(&server_root, std::slice::from_ref(&unrelated))
+            .expect_err("an unrelated workspace must not recreate a populated server root");
+        let second = reserved_folders()
             .resolve_missing_folder(&server_root, &[temp.path().to_path_buf()])
-            .expect_err("a renamed server root must not self-heal");
+            .expect_err("the ancestor workspace stays blocked on the renamed root");
 
         assert!(
-            error.contains(server_root.to_string_lossy().as_ref()),
-            "{error}"
+            first.contains(server_root.to_string_lossy().as_ref()),
+            "{first}"
         );
-        assert!(error.contains("overlaps a workspace/read root"), "{error}");
+        assert!(
+            second.contains(server_root.to_string_lossy().as_ref()),
+            "{second}"
+        );
         assert!(!server_root.exists());
         assert!(moved_secret.is_file());
+        assert!(reserved_folders().folders().contains(&server_root));
+        assert!(reserved_folders().folders().contains(&marker));
+
+        std::fs::rename(&moved_root, &server_root).unwrap();
+        assert!(
+            !reserved_folders()
+                .resolve_missing_folder(&marker, &[temp.path().to_path_buf()])
+                .unwrap()
+        );
+        assert!(!reserved_folders().folders().contains(&marker));
         assert!(reserved_folders().folders().contains(&server_root));
     }
 
