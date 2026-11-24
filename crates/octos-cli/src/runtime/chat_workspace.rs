@@ -396,6 +396,15 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
                 folder.display()
             )
         })?;
+        let identity = root_identity(&folder).map_err(|error| {
+            format!(
+                "server chats root {} was recreated but its identity could not be read: {error}",
+                folder.display()
+            )
+        })?;
+        layout_write()
+            .server_root_identities
+            .insert(folder.clone(), identity);
         tracing::warn!(path = %folder.display(), "recreated missing server chats root");
         return Ok(true);
     }
@@ -1091,6 +1100,26 @@ mod server_root_tests {
         .await
         .unwrap();
         assert!(!output.status.success());
+
+        let moved_root = temp.path().join("renamed-healed-chats");
+        let moved_secret = moved_root
+            .join(chat.root.strip_prefix(&server_root).unwrap())
+            .join("secret.txt");
+        std::fs::rename(&server_root, &moved_root).unwrap();
+        let marker = unresolved_marker_path(&server_root).unwrap();
+        reserved_folders()
+            .resolve_missing_folder(&server_root, std::slice::from_ref(&work))
+            .expect_err("a populated healed root must not be replaced by a fresh empty one");
+        assert!(moved_secret.is_file());
+        assert!(reserved_folders().folders().contains(&marker));
+
+        std::fs::rename(&moved_root, &server_root).unwrap();
+        assert!(
+            !reserved_folders()
+                .resolve_missing_folder(&marker, std::slice::from_ref(&work))
+                .unwrap()
+        );
+        assert!(!reserved_folders().folders().contains(&marker));
     }
 
     #[tokio::test]
