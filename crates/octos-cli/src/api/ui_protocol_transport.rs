@@ -45,6 +45,9 @@ use crate::api::session_side_metadata::{
     SessionCompactionStore, SessionSideEntry, session_side_get, session_side_insert,
 };
 use crate::peers::workspace_team;
+use crate::runtime::session_permissions::{
+    SessionPermissionError, StoredSessionPermissionProfile, session_permission_profiles,
+};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1638,77 +1641,7 @@ fn workspace_profile_scope(profile_id: Option<&str>, session_id: &SessionKey) ->
         .to_owned()
 }
 
-#[derive(Default)]
-struct SessionPermissionProfileStore {
-    /// Security-bearing explicit choices are deliberately NOT LRU-evicted:
-    /// a miss falls back to the server default, which may be DangerFullAccess.
-    /// Delete still removes entries through `clear_session_side_metadata`.
-    selections:
-        std::sync::Mutex<HashMap<(Option<String>, SessionKey), StoredSessionPermissionProfile>>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct StoredSessionPermissionProfile {
-    selection: octos_core::ui_protocol::PermissionProfileSelection,
-    approval_policy: Option<octos_agent::ApprovalPolicy>,
-}
-
-// Raw SPA ids retain the single server-owned binding established by session/open.
-impl SessionPermissionProfileStore {
-    /// The stored selection ONLY if the session made an explicit
-    /// `/permissions` choice — `None` lets the caller apply a configurable
-    /// default (see `effective_session_permission_state`).
-    fn get_state_explicit(
-        &self,
-        session_id: &SessionKey,
-        authorized_profile_id: Option<&str>,
-    ) -> Option<StoredSessionPermissionProfile> {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.selections
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&(profile_id, session_id.clone()))
-            .copied()
-    }
-
-    fn set(
-        &self,
-        session_id: SessionKey,
-        authorized_profile_id: Option<&str>,
-        selection: octos_core::ui_protocol::PermissionProfileSelection,
-        approval_policy: Option<octos_agent::ApprovalPolicy>,
-    ) {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.selections
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                (profile_id, session_id),
-                StoredSessionPermissionProfile {
-                    selection,
-                    approval_policy,
-                },
-            );
-    }
-
-    fn remove(&self, session_id: &SessionKey, authorized_profile_id: Option<&str>) {
-        let profile_id = session_id
-            .profile_id()
-            .or(authorized_profile_id)
-            .map(ToOwned::to_owned);
-        self.selections
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&(profile_id, session_id.clone()));
-    }
-}
-
+// Durable profile-scoped permission storage lives in runtime::session_permissions.
 /// Session permission state honoring the serve-level dangerous default
 /// (`--danger-full-access`, octos' analogue of Claude Code's
 /// `--dangerously-skip-permissions`): a session with NO explicit
@@ -1717,26 +1650,41 @@ impl SessionPermissionProfileStore {
 /// workspace-write default. The flag is solo-gated at serve startup (the
 /// same keystone that gates selecting the profile from the menu), and an
 /// explicit per-session choice always wins.
+fn session_permission_error_to_rpc(error: SessionPermissionError) -> RpcError {
+    if error.kind == "session_permission_invalid" {
+        RpcError::invalid_params("stored session permission is invalid").with_data(json!({
+            "kind": error.kind,
+            "detail": error.detail,
+        }))
+    } else {
+        runtime_unavailable_error(format!(
+            "stored session permission is unavailable: {}",
+            error.detail
+        ))
+        .with_data(json!({"kind": error.kind}))
+    }
+}
+
 fn effective_session_permission_state(
     state: &AppState,
     session_id: &SessionKey,
     authorized_profile_id: Option<&str>,
-) -> StoredSessionPermissionProfile {
+) -> Result<StoredSessionPermissionProfile, RpcError> {
     if let Some(stored) =
         session_permission_profiles().get_state_explicit(session_id, authorized_profile_id)
     {
-        return stored;
+        return stored.map_err(session_permission_error_to_rpc);
     }
     // UPCR-2026-R1EFC56A3: a chat is read-only with no network unless it was
     // explicitly set otherwise, and its record survives a restart.
     if is_chat_session(state, session_id) {
-        return StoredSessionPermissionProfile {
+        return Ok(StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::ReadOnly,
                 network: octos_core::ui_protocol::PermissionNetworkPolicy::Deny,
             },
             approval_policy: None,
-        };
+        });
     }
     // The dangerous default is granted ONLY where an EXPLICIT Full Access
     // selection would also be allowed (codex P1/P2 on #1639): Local
@@ -1751,13 +1699,13 @@ fn effective_session_permission_state(
         && state.deployment_mode == crate::config::DeploymentMode::Local
         && !session_id_encodes_non_solo_scope(session_id)
     {
-        return StoredSessionPermissionProfile {
+        return Ok(StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::DangerFullAccess,
                 network: octos_core::ui_protocol::PermissionNetworkPolicy::Allow,
             },
             approval_policy: Some(octos_agent::ApprovalPolicy::Never),
-        };
+        });
     }
     // Network-on default: a fresh Local session with no explicit selection gets
     // Workspace-Write with network ALLOWED (filesystem still sandboxed, approvals
@@ -1771,15 +1719,15 @@ fn effective_session_permission_state(
         && state.deployment_mode == crate::config::DeploymentMode::Local
         && !session_id_encodes_non_solo_scope(session_id)
     {
-        return StoredSessionPermissionProfile {
+        return Ok(StoredSessionPermissionProfile {
             selection: octos_core::ui_protocol::PermissionProfileSelection {
                 mode: octos_core::ui_protocol::PermissionProfileMode::WorkspaceWrite,
                 network: octos_core::ui_protocol::PermissionNetworkPolicy::Allow,
             },
             approval_policy: None,
-        };
+        });
     }
-    StoredSessionPermissionProfile::default()
+    Ok(StoredSessionPermissionProfile::default())
 }
 
 #[derive(Default)]
@@ -3409,14 +3357,6 @@ fn evict_peer_wire_session(session_id: &SessionKey) {
     peer_wire_registry().evict_if_value(&peer_wire_key(profile_id, slug), session_id);
 }
 
-fn session_permission_profiles() -> Arc<SessionPermissionProfileStore> {
-    static SESSION_PERMISSION_PROFILES: OnceLock<Arc<SessionPermissionProfileStore>> =
-        OnceLock::new();
-    SESSION_PERMISSION_PROFILES
-        .get_or_init(|| Arc::new(SessionPermissionProfileStore::default()))
-        .clone()
-}
-
 fn session_context_statuses() -> Arc<SessionContextStatusStore> {
     static SESSION_CONTEXT_STATUSES: OnceLock<Arc<SessionContextStatusStore>> = OnceLock::new();
     SESSION_CONTEXT_STATUSES
@@ -4768,7 +4708,8 @@ async fn handle_session_compact(
     // Epoch BEFORE permission resolution (codex #1639). For an already-open
     // session this is a cache hit that returns the existing runtime.
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = effective_permissions_for_session(state, &session_id, Some(&profile_id))?;
+    let permissions =
+        effective_permissions_for_session(state, &session_id, Some(&profile_id)).await?;
     let workspace_hint = session_workspaces().runtime_hint(&profile_id, &session_id);
     let session_runtime = state
         .session_cache
@@ -8542,7 +8483,6 @@ async fn ui_protocol_connection(
                 }
             }
             UiCommand::PermissionProfileSet(params) => {
-                let session_id = params.session_id.clone();
                 match permission_profile_set_result(
                     &state,
                     params,
@@ -8552,14 +8492,6 @@ async fn ui_protocol_connection(
                 .await
                 {
                     Ok(result) => {
-                        // Evict by SESSION across every profile (codex P1 ×2
-                        // on #1639): the runtime may be cached under a
-                        // session/open `params.profile_id` this connection no
-                        // longer knows, and `invalidate_session` also bumps
-                        // the session generation so a concurrent in-flight
-                        // bootstrap can't re-cache the pre-change (possibly
-                        // dangerous) permissions after the downgrade.
-                        state.session_cache.invalidate_session(&session_id).await;
                         let _ =
                             send_ui_rpc_result(&ws, id, UiRpcResult::PermissionProfileSet(result));
                     }
@@ -9765,7 +9697,6 @@ where
                     }
                 }
                 UiCommand::PermissionProfileSet(params) => {
-                    let session_id = params.session_id.clone();
                     match permission_profile_set_result(
                         &state,
                         params,
@@ -9775,10 +9706,6 @@ where
                     .await
                     {
                         Ok(result) => {
-                            // Session-scoped eviction across all profiles + the
-                            // in-flight generation guard — see the sibling
-                            // dispatcher above (codex P1 ×2 on #1639).
-                            state.session_cache.invalidate_session(&session_id).await;
                             let _ = send_ui_rpc_result(
                                 &ws,
                                 id,
@@ -12003,22 +11930,96 @@ fn permission_selection_allowed(
             && approval_policy != Some(octos_agent::ApprovalPolicy::Never))
 }
 
-fn effective_permissions_for_session(
-    state: &AppState,
+async fn ensure_session_permission_loaded_with_fallback(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    authorized_profile_id: Option<&str>,
+    fallback_data_dir: Option<PathBuf>,
+) -> Result<(), RpcError> {
+    if session_permission_profiles()
+        .get_state_explicit(session_id, authorized_profile_id)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let data_dir =
+        if let Some(runtime) = resolve_session_profile_runtime(state, authorized_profile_id) {
+            runtime.data_dir.clone()
+        } else if let Some(data_dir) = fallback_data_dir {
+            data_dir
+        } else {
+            let sessions = state
+                .sessions
+                .clone()
+                .ok_or_else(|| runtime_unavailable_error("Sessions not available"))?;
+            match super::session_mutation_proxy::lock_sessions(sessions).await {
+                Ok(guard) => guard.data_dir(),
+                Err(_) => {
+                    return Err(runtime_unavailable_error(
+                        "Session storage is busy; please retry",
+                    ));
+                }
+            }
+        };
+    let session_id = session_id.clone();
+    let profile_id = authorized_profile_id.map(ToOwned::to_owned);
+    tokio::task::spawn_blocking(move || {
+        crate::runtime::session_permissions::load_session_permission(
+            &data_dir,
+            profile_id.as_deref(),
+            &session_id,
+        )
+    })
+    .await
+    .map_err(|_| runtime_unavailable_error("Session permission read task failed"))?
+    .map_err(session_permission_error_to_rpc)?;
+    Ok(())
+}
+
+async fn ensure_session_permission_loaded(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    authorized_profile_id: Option<&str>,
+) -> Result<(), RpcError> {
+    ensure_session_permission_loaded_with_fallback(state, session_id, authorized_profile_id, None)
+        .await
+}
+
+async fn effective_permissions_for_session(
+    state: &Arc<AppState>,
     session_id: &SessionKey,
     authorized_profile_id: Option<&str>,
 ) -> Result<octos_agent::EffectivePermissions, RpcError> {
+    ensure_session_permission_loaded(state, session_id, authorized_profile_id).await?;
     use octos_core::ui_protocol::{
         PermissionNetworkPolicy as Network, PermissionProfileMode as Mode,
     };
 
     let permission_state =
-        effective_session_permission_state(state, session_id, authorized_profile_id);
+        effective_session_permission_state(state, session_id, authorized_profile_id)?;
     let requested = match permission_state.selection.mode {
         Mode::ReadOnly => octos_agent::PermissionProfile::ReadOnly,
         Mode::WorkspaceWrite => octos_agent::PermissionProfile::WorkspaceWrite,
         Mode::DangerFullAccess => octos_agent::PermissionProfile::DangerFullAccess,
     };
+    let explicit = session_permission_profiles()
+        .get_state_explicit(session_id, authorized_profile_id)
+        .is_some();
+    if explicit
+        && !permission_selection_allowed(
+            state,
+            session_id,
+            permission_state.selection,
+            permission_state.approval_policy,
+            None,
+        )
+    {
+        return Err(permission_profile_disallowed_error(
+            state,
+            permission_state.selection,
+            permission_state.approval_policy,
+        ));
+    }
     // SECURITY KEYSTONE (yolo GAP #1): map Local onto the dangerous-capable
     // `RuntimeMode::Solo` ONLY when the operator opted in via `--solo`.
     // Without the opt-in, a Local server resolves as `RuntimeMode::Local`, so
@@ -12220,6 +12221,11 @@ async fn authorize_existing_session_scope(
         authenticated_profile_id,
     )?
     .or_else(|| routing_profile_id.map(ToOwned::to_owned));
+    // The legacy flat store may contain only the base spelling while the
+    // canonical per-user store calls the same record `default`. Use one storage
+    // identity for preflight, runtime lookup, and the manager existence check.
+    let storage_session_id = crate::runtime::session_ownership::raw_storage_identity(session_id);
+    let session_id = &storage_session_id;
     if let Some(profile_id) = active_profile_id.as_deref() {
         ensure_known_profile(state, profile_id)?;
     }
@@ -12273,7 +12279,8 @@ async fn authorize_existing_session_scope(
         preflight_session_record(&root, session_id)?;
         let permissions_epoch = state.session_cache.session_generation(session_id);
         let permissions =
-            effective_permissions_for_session(state, session_id, active_profile_id.as_deref())?;
+            effective_permissions_for_session(state, session_id, active_profile_id.as_deref())
+                .await?;
         let runtime = state
             .session_cache
             .get_or_init_with_permissions(
@@ -12321,11 +12328,18 @@ async fn permission_profile_list_result(
         routing_profile_id,
     ))
     .await?;
+    ensure_session_permission_loaded_with_fallback(
+        state,
+        &params.session_id,
+        _authorization.profile_id.as_deref(),
+        Some(_authorization._sessions_guard.data_dir()),
+    )
+    .await?;
     let current = effective_session_permission_state(
         state,
         &params.session_id,
         _authorization.profile_id.as_deref(),
-    )
+    )?
     .selection;
     let profiles = permission_profile_supported_selections(state, &params.session_id);
     Ok(octos_core::ui_protocol::PermissionProfileListResult {
@@ -12341,7 +12355,7 @@ async fn permission_profile_set_result(
     authenticated_profile_id: Option<&str>,
     routing_profile_id: Option<&str>,
 ) -> Result<octos_core::ui_protocol::PermissionProfileSetResult, RpcError> {
-    let _authorization = Box::pin(authorize_existing_session_scope(
+    let mut _authorization = Box::pin(authorize_existing_session_scope(
         state,
         &params.session_id,
         None,
@@ -12349,12 +12363,20 @@ async fn permission_profile_set_result(
         routing_profile_id,
     ))
     .await?;
-    let store = session_permission_profiles();
+    let storage_session_id =
+        crate::runtime::session_ownership::raw_storage_identity(&params.session_id);
+    ensure_session_permission_loaded_with_fallback(
+        state,
+        &params.session_id,
+        _authorization.profile_id.as_deref(),
+        Some(_authorization._sessions_guard.data_dir()),
+    )
+    .await?;
     let previous_state = effective_session_permission_state(
         state,
         &params.session_id,
         _authorization.profile_id.as_deref(),
-    );
+    )?;
     let previous = previous_state.selection;
     let approval_policy =
         parse_permission_approval_policy(params.update.approval_policy.as_deref())?
@@ -12383,17 +12405,92 @@ async fn permission_profile_set_result(
             approval_policy,
         ));
     }
-    store.set(
-        params.session_id.clone(),
-        _authorization.profile_id.as_deref(),
-        requested,
+    let data_dir = resolve_session_profile_runtime(state, _authorization.profile_id.as_deref())
+        .map(|runtime| runtime.data_dir.clone())
+        .unwrap_or_else(|| _authorization._sessions_guard.data_dir());
+    let session_id = params.session_id.clone();
+    let profile_id = _authorization.profile_id.clone();
+    let persisted = StoredSessionPermissionProfile {
+        selection: requested,
         approval_policy,
-    );
-    Ok(octos_core::ui_protocol::PermissionProfileSetResult {
-        session_id: params.session_id,
-        current: requested,
-        applied: requested != previous || approval_policy != previous_state.approval_policy,
-    })
+    };
+    let session_cache = state.session_cache.clone();
+    let commit_storage_session_id = storage_session_id.clone();
+    // Admission happens before the first write. The application-owned worker
+    // retains the authorization/mutation guard through persistence, anchoring,
+    // and both-alias invalidation even if the RPC future is cancelled.
+    let operation = async move {
+        let persisted_result = tokio::task::spawn_blocking(move || {
+            crate::runtime::session_permissions::persist_session_permission(
+                &data_dir,
+                profile_id.as_deref(),
+                &session_id,
+                persisted,
+            )
+        })
+        .await
+        .map_err(|_| SessionPermissionError {
+            kind: "session_permission_io",
+            detail: "permission write task failed".into(),
+        })
+        .and_then(|result| result);
+        if let Err(error) = persisted_result {
+            session_cache
+                .invalidate_session(&commit_storage_session_id)
+                .await;
+            return Err(session_permission_error_to_rpc(error));
+        }
+        if _authorization
+            ._sessions_guard
+            .ensure_session_record(&commit_storage_session_id)
+            .await
+            .is_err()
+        {
+            let error = SessionPermissionError {
+                kind: "session_permission_io",
+                detail: "failed to anchor the permissioned session record".into(),
+            };
+            session_permission_profiles().poison(
+                &params.session_id,
+                _authorization.profile_id.as_deref(),
+                error.clone(),
+            );
+            session_cache
+                .invalidate_session(&commit_storage_session_id)
+                .await;
+            return Err(session_permission_error_to_rpc(error));
+        }
+        session_cache
+            .invalidate_session(&commit_storage_session_id)
+            .await;
+        Ok(octos_core::ui_protocol::PermissionProfileSetResult {
+            session_id: params.session_id,
+            current: requested,
+            applied: requested != previous || approval_policy != previous_state.approval_policy,
+        })
+    };
+    let Some(commit) = state
+        .ui_protocol
+        .permission_profile_set_tasks
+        .try_spawn(operation)
+    else {
+        return Err(runtime_unavailable_error(
+            "permission commit capacity is full; please retry",
+        ));
+    };
+    match commit.await {
+        Ok(result) => result,
+        Err(_) => {
+            state
+                .session_cache
+                .invalidate_session(&storage_session_id)
+                .await;
+            Err(session_permission_error_to_rpc(SessionPermissionError {
+                kind: "session_permission_io",
+                detail: "permission commit task failed".into(),
+            }))
+        }
+    }
 }
 
 fn coding_tool_policy_view(
@@ -12452,7 +12549,8 @@ async fn tool_status_list_result(
         // can't pair a post-bump epoch with pre-bump permissions on a
         // preempted caller (codex P1 round 4 on #1639).
         let permissions_epoch = state.session_cache.session_generation(session_id);
-        let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
+        let permissions =
+            effective_permissions_for_session(state, session_id, active_profile_id).await?;
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let workspace_hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
         Some(
@@ -12497,7 +12595,9 @@ async fn tool_status_list_result(
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let permission_state = effective_session_permission_state(state, session_id, active_profile_id);
+    ensure_session_permission_loaded(state, session_id, active_profile_id).await?;
+    let permission_state =
+        effective_session_permission_state(state, session_id, active_profile_id)?;
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
 
@@ -12598,7 +12698,7 @@ fn runtime_policy_stamp_for_profile(
     profile_id: &str,
     session_id: Option<&SessionKey>,
     profile: Option<&crate::profiles::UserProfile>,
-) -> Value {
+) -> Result<Value, RpcError> {
     let runtime = state.profiles.get(profile_id);
     let primary = profile.and_then(|profile| profile.config.primary_llm());
     // The stamp reports the model that will actually SERVE the next turn,
@@ -12624,6 +12724,7 @@ fn runtime_policy_stamp_for_profile(
     };
     let permission_state = session_id
         .map(|session_id| effective_session_permission_state(state, session_id, Some(profile_id)))
+        .transpose()?
         .unwrap_or_default();
     let (approval_policy, sandbox_mode, permission_profile, filesystem_scope, network) =
         permission_selection_policy_fields(
@@ -12661,7 +12762,7 @@ fn runtime_policy_stamp_for_profile(
             mcp_servers: &[],
         },
     );
-    stamp
+    Ok(stamp)
 }
 
 fn profile_llm_list_result(
@@ -12694,7 +12795,7 @@ fn profile_llm_list_result(
             "primary": primary,
             "fallbacks": fallbacks,
         },
-        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile),
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile).unwrap_or_default(),
     })
 }
 
@@ -12929,6 +13030,13 @@ async fn raw_session_status_result(
         .profile_id
         .clone()
         .unwrap_or_else(|| MAIN_PROFILE_ID.to_string());
+    ensure_session_permission_loaded_with_fallback(
+        state,
+        &session_id,
+        authorization.profile_id.as_deref(),
+        Some(authorization._sessions_guard.data_dir()),
+    )
+    .await?;
     // Status performs further reads through the same manager; do not hold the
     // non-reentrant guard across those calls. SET/LIST retain it to linearize
     // the existence check with their permission-state operation.
@@ -12942,7 +13050,7 @@ async fn raw_session_status_result(
     }
     // Existence and tombstone were already checked by the authorization guard.
     let mut policy =
-        runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref());
+        runtime_policy_stamp_for_profile(state, &profile_id, Some(&session_id), profile.as_ref())?;
     add_autonomy_policy_stamp(&mut policy, features);
     let (context, context_state) = if features.context_lifecycle_available() {
         appui_context_status_snapshot_for_state(
@@ -14159,7 +14267,8 @@ async fn session_runtime_with_effective_permissions(
         ));
     };
     let permissions_epoch = state.session_cache.session_generation(session_id);
-    let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
+    let permissions =
+        effective_permissions_for_session(state, session_id, active_profile_id).await?;
     let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
     let workspace_hint = session_workspaces().get(&workspace_profile_id, session_id);
     state
@@ -14998,7 +15107,7 @@ async fn raw_profile_llm_select(
             &profile_id,
             Some(&session_id),
             Some(&refreshed),
-        ),
+        )?,
     });
     stamp_profile_llm_runtime_transition(
         &mut result,
@@ -15922,7 +16031,7 @@ fn sub_providers_list_result(
     json!({
         "profile_id": profile_id,
         "sub_providers": sub_providers,
-        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile),
+        "runtime_policy_stamp": runtime_policy_stamp_for_profile(state, profile_id, None, profile).unwrap_or_default(),
     })
 }
 
@@ -21847,7 +21956,11 @@ async fn handle_raw_appui_rpc_with_identity(
             )
         }
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
-            Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
+            let mut capabilities = features.advertised_capabilities(state);
+            if crate::api::host_managed::is_external(state, connection_identity) {
+                filter_capabilities_for_host_managed_external(&mut capabilities);
+            }
+            Ok(json!({ "capabilities": capabilities }))
         }
         workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
             workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
@@ -22423,6 +22536,9 @@ fn handle_client_hello_rpc(
     if session_ingress {
         filter_capabilities_for_session_ingress(&mut capabilities);
     }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut capabilities);
+    }
     let _ = send_rpc_result(
         ws,
         id,
@@ -22734,6 +22850,34 @@ fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabili
     capabilities
         .supported_methods
         .retain(|method| session_ingress_callable_method(method));
+}
+
+/// Host-managed external credentials share the exact allowlist used by the
+/// execution gate. Permission UI is advertised only when its methods survive.
+fn filter_capabilities_for_host_managed_external(capabilities: &mut UiProtocolCapabilities) {
+    capabilities.supported_methods.retain(|method| {
+        crate::api::host_managed::EXTERNAL_ALLOWED_METHODS.contains(&method.as_str())
+    });
+    if !capabilities.supported_methods.iter().any(|method| {
+        matches!(
+            method.as_str(),
+            "permission/profile/set" | "permission/profile/list"
+        )
+    }) {
+        capabilities
+            .supported_features
+            .retain(|feature| feature != APPUI_FEATURE_PERMISSION_PROFILE_V1);
+    }
+}
+
+/// Project a shared SessionOpened for one receiving connection. The durable
+/// ledger keeps the host view; replay and live delivery mutate only their clone.
+fn project_session_opened_for_external(event: &mut UiProtocolLedgerEvent, external: bool) {
+    if external
+        && let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = event
+    {
+        filter_capabilities_for_host_managed_external(&mut opened.capabilities);
+    }
 }
 
 fn validate_session_ingress_command_scope(
@@ -23119,7 +23263,7 @@ async fn handle_session_open_with_mode(
         }
     };
 
-    let outcome = match service
+    let mut outcome = match service
         .open(
             ws,
             approvals,
@@ -23154,6 +23298,54 @@ async fn handle_session_open_with_mode(
     // forwarders let the second open silently retarget the first session's
     // pump, starving it of every profile-carrying frame.
     let live_profile_scope = outcome.profile_scope.clone();
+    // A successful coding-session open joins its canonical workspace team.
+    // App peers/context sessions keep their host-owned lifecycle and authority.
+    if !session_ingress && peer_handoff_allowed_for_session(&session_id_for_subscribe) {
+        let opened = &outcome.result.opened;
+        if let (Some(runtime), Some(workspace)) = (
+            resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
+            opened.workspace_root.as_deref(),
+        ) {
+            // Eviction must not take the seat of a session whose turn is
+            // still able to record a result into the team (#2741).
+            let turn_active = active_turn_sessions(&active_turns_registry()).await;
+            if let Err(error) = state.ui_protocol.workspace_teams.join(
+                &runtime.data_dir,
+                Path::new(workspace),
+                &opened.session_id,
+                ws.connection_id.0,
+                &turn_active,
+            ) {
+                // The join failure degrades to "opened, outside the team"
+                // (#2741): a fail-closed refusal here bricks long-lived
+                // workspaces — the lifetime member accumulation + the 1024
+                // hard cap mean every open past the cap permanently fails.
+                // The session stays fully usable (the memory/skills/history
+                // bindings are durable, not team-gated); the team features
+                // (shared history, team messaging) are absent, and the
+                // operator sees the reason in the logs.
+                tracing::error!(
+                    session = %opened.session_id,
+                    workspace = %workspace,
+                    %error,
+                    "workspace team join failed; the session opened outside the team"
+                );
+            }
+        }
+    }
+
+    // #1594 follow-up: a session-ingress connection may only call the
+    // session-scoped surface, so the SessionOpened reply it receives must not
+    // advertise the raw/global methods it would be denied. Filter only this
+    // direct reply; the ledger-broadcast copy other connections observe is
+    // untouched (it reflects the session's negotiated features, not this
+    // credential's scope).
+    if session_ingress {
+        filter_capabilities_for_session_ingress(&mut outcome.result.opened.capabilities);
+    }
+    if ws.is_external() {
+        filter_capabilities_for_host_managed_external(&mut outcome.result.opened.capabilities);
+    }
     let result = match serde_json::to_value(outcome.result) {
         Ok(result) => result,
         Err(error) => {
@@ -23191,7 +23383,9 @@ async fn handle_session_open_with_mode(
     // would overstate the delivery path's defences.
     for event in outcome.replay {
         let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-        let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+        let mut event_for_wire =
+            context_event_for_features(projected.unwrap_or(event.event), features);
+        project_session_opened_for_external(&mut event_for_wire, ws.is_external());
         if !live_event_passes_capability_filter(&event_for_wire, features) {
             continue;
         }
@@ -23253,6 +23447,20 @@ async fn handle_session_open_with_mode(
         }
     }
 
+    // #1594 follow-up: the SessionOpened NOTIFICATION is a documented
+    // capability-discovery path (UPCR-2026-007), so an ingress connection's
+    // direct-sent copy must be filtered just like the RPC result was. This
+    // mutates only the per-connection clone in `outcome`; the shared ledger
+    // entry (already appended, broadcast to other connections) is untouched, and
+    // `send_ledger_event_durable` sends without re-appending.
+    if session_ingress {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) =
+            &mut outcome.opened_event.event
+        {
+            filter_capabilities_for_session_ingress(&mut opened.capabilities);
+        }
+    }
+    project_session_opened_for_external(&mut outcome.opened_event.event, ws.is_external());
     let ledger_for_forwarder = ledger.clone();
     let opened_event_for_wire =
         context_event_for_features(outcome.opened_event.event, ws.snapshot_live_features());
@@ -23753,7 +23961,8 @@ async fn forward_live_ledger_event(
         return Ok(());
     }
     let projected = project_lifecycle_event_to_v2_wire(ledger, &event.event, &event.cursor);
-    let event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    let mut event_for_wire = context_event_for_features(projected.unwrap_or(event.event), features);
+    project_session_opened_for_external(&mut event_for_wire, ws.is_external());
     if !live_event_passes_capability_filter(&event_for_wire, features) {
         return Ok(());
     }
@@ -24450,7 +24659,8 @@ async fn open_session_result_with_mode(
             state,
             &params.session_id,
             active_profile_id.as_deref(),
-        )?;
+        )
+        .await?;
         let sandbox_override = validate_requested_session_sandbox(
             features,
             &params,
@@ -26911,7 +27121,8 @@ async fn resolve_voice_admission_runtime(
     let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
     let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
     let permissions_epoch = state.session_cache.session_generation(session_id);
-    let permissions = effective_permissions_for_session(state, session_id, active_profile_id)?;
+    let permissions =
+        effective_permissions_for_session(state, session_id, active_profile_id).await?;
     state
         .session_cache
         .get_or_init_with_permissions(
@@ -36554,33 +36765,32 @@ async fn run_native_code_review_turn(
     let workspace_profile_id = workspace_profile_scope(active_profile_id.as_deref(), &session_id);
     let hint = session_workspaces().runtime_hint(&workspace_profile_id, &session_id);
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = match effective_permissions_for_session(
-        &state,
-        &session_id,
-        active_profile_id.as_deref(),
-    ) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            let message = error.message.clone();
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("permission_denied", message.as_str())),
-                None,
-                None,
-                None,
-                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
-            )
+    let permissions =
+        match effective_permissions_for_session(&state, &session_id, active_profile_id.as_deref())
             .await
-            .unwrap_or_else(report_terminal_delivery_error);
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
-        }
-    };
+        {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                let message = error.message.clone();
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("permission_denied", message.as_str())),
+                    None,
+                    None,
+                    None,
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
+                )
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        };
     let session_runtime = match state
         .session_cache
         .get_or_init_with_permissions(
@@ -38949,33 +39159,32 @@ async fn run_standalone_turn(
         );
     }
     let permissions_epoch = state.session_cache.session_generation(&session_id);
-    let permissions = match effective_permissions_for_session(
-        &state,
-        &session_id,
-        active_profile_id.as_deref(),
-    ) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            let message = error.message.clone();
-            try_emit_terminal(
-                &turn_state,
-                TerminalReason::Errored,
-                &ws,
-                &ledger,
-                &session_id,
-                &turn_id,
-                Some(("permission_denied", message.as_str())),
-                None,
-                steer_buffer.as_ref(),
-                None,
-                // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
-            )
+    let permissions =
+        match effective_permissions_for_session(&state, &session_id, active_profile_id.as_deref())
             .await
-            .unwrap_or_else(report_terminal_delivery_error);
-            contracts.scopes.evict_turn(&session_id, &turn_id);
-            return;
-        }
-    };
+        {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                let message = error.message.clone();
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("permission_denied", message.as_str())),
+                    None,
+                    steer_buffer.as_ref(),
+                    None,
+                    // Outer-loop #4 (§4.2): peer sessions release their held slot at the interrupted terminal; None = no peer context on this path.
+                )
+                .await
+                .unwrap_or_else(report_terminal_delivery_error);
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        };
     let session_runtime = match state
         .session_cache
         .get_or_init_with_permissions(

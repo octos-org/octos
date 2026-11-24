@@ -2887,7 +2887,7 @@ async fn update_session_title_response(
     // did not contain profile-scoped runtime sessions and returned
     // `NOT_FOUND` for raw `web-*` ids under profile auth.
     for key in candidates {
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
+        let sessions = match super::ui_protocol_transport::resolve_sessions_for_mutation(
             &state,
             None,
             routed_profile_id.as_deref(),
@@ -2895,7 +2895,17 @@ async fn update_session_title_response(
             canonical,
         )
         .await
-        else {
+        {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session store is unavailable",
+                )
+                    .into_response();
+            }
+        };
+        let Some(sessions) = sessions else {
             if canonical {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2919,6 +2929,7 @@ async fn update_session_title_response(
                     key.clone(),
                     endpoint,
                     Some(title.clone()),
+                    None,
                 )
                 .await;
                 if response.status().is_success() {
@@ -3042,12 +3053,11 @@ pub async fn delete_session(
                 "failed to remove deleted session's session_ref registry rows");
         }
         super::ui_protocol_transport::restore_session_chat_folder(&state, &key);
-        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_mutation(
+        let Some(sessions) = super::ui_protocol_transport::resolve_sessions_for_delete(
             &state,
             None,
             routed_profile_id.as_deref(),
             &key,
-            canonical,
         )
         .await
         else {
@@ -3055,6 +3065,32 @@ pub async fn delete_session(
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "session store is unavailable",
+                )
+                    .into_response();
+            }
+            let permission_data_dir =
+                super::ui_protocol_transport::resolve_session_profile_runtime(
+                    &state,
+                    Some(&candidate_profile_id),
+                )
+                .map(|runtime| runtime.data_dir.clone())
+                .or_else(|| {
+                    let store = state.profile_store.as_ref()?;
+                    let profile = store.get(&candidate_profile_id).ok().flatten()?;
+                    Some(store.resolve_data_dir(&profile))
+                });
+            if let Some(data_dir) = permission_data_dir
+                && let Err(error) =
+                    crate::runtime::session_permissions::clear_session_permission_scope(
+                        &data_dir,
+                        Some(&candidate_profile_id),
+                        &key,
+                    )
+            {
+                tracing::warn!(session_key = %key, error = %error.detail, "failed to clear durable session permission without runtime");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not delete session settings",
                 )
                     .into_response();
             }
@@ -3073,12 +3109,20 @@ pub async fn delete_session(
             Err(response) => return response,
             Ok(Some(endpoint)) => {
                 delegated = true;
+                let permission_data_dir =
+                    super::ui_protocol_transport::resolve_session_profile_runtime(
+                        &state,
+                        Some(&candidate_profile_id),
+                    )
+                    .map(|runtime| runtime.data_dir.clone())
+                    .unwrap_or_else(|| sess.data_dir());
                 let response = super::session_mutation_proxy::delegate(
                     state.clone(),
                     sess,
                     key.clone(),
                     endpoint,
                     None,
+                    Some((candidate_profile_id.clone(), permission_data_dir)),
                 )
                 .await;
                 if !response.status().is_success() {
@@ -3130,6 +3174,24 @@ pub async fn delete_session(
         if let Err(error) = super::ui_protocol_transport::remove_session_chat_record(&state, &key) {
             tracing::warn!(session_key = %key, %error, "failed to remove the chat record");
             return chat_workspace_not_deleted();
+        }
+        let permission_data_dir = super::ui_protocol_transport::resolve_session_profile_runtime(
+            &state,
+            Some(&candidate_profile_id),
+        )
+        .map(|runtime| runtime.data_dir.clone())
+        .unwrap_or_else(|| data_dir.clone());
+        if let Err(error) = crate::runtime::session_permissions::clear_session_permission_scope(
+            &permission_data_dir,
+            Some(&candidate_profile_id),
+            &key,
+        ) {
+            tracing::warn!(session_key = %key, error = %error.detail, "failed to clear durable session permission");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete session settings",
+            )
+                .into_response();
         }
         if let Err(e) = super::ui_protocol_reasoning_effort::clear_reasoning_effort(&data_dir, &key)
         {

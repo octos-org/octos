@@ -94,7 +94,9 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     }
 
     // Read-only and offline by default; never the network or the host.
-    let permission = effective_session_permission_state(&state, &a, None).selection;
+    let permission = effective_session_permission_state(&state, &a, None)
+        .unwrap()
+        .selection;
     assert_eq!(permission.mode, PermissionProfileMode::ReadOnly);
     assert_eq!(permission.network, PermissionNetworkPolicy::Deny);
     let set = |mode, network| {

@@ -1974,6 +1974,17 @@ Clients must use that method list to enable or disable slash commands.
   the marker, long IDs use bounded hash-suffixed
   filenames, and missing/corrupt/mismatched markers fail closed
 - returns `current` plus server-supported permission profiles
+- a successful explicit selection survives Core restart; only a missing durable
+  record inherits the configured server default (UPCR-2026-R2E4C10A7)
+- omitted and explicit `default` topics share the durable record, payload identity,
+  cache, generation key, existence preflight, and runtime invalidation; SET evicts
+  and bootstrap-generation-fences both exact runtime spellings. Over-limit sidecar
+  components use bounded hash-suffixed paths in a `~` namespace disjoint from
+  literal encodings, without relocating valid legacy paths or colliding with a
+  short raw ID named like the bounded stem.
+  Base deletion unlinks every sidecar in the verified authorized scope without
+  parsing doomed records, and clears matching cache/in-flight-read generations;
+  ordinary corrupt-record reads still fail closed
 - local solo servers MAY include `danger_full_access`; tenant/cloud servers
   must omit it or reject attempts to select it
 
@@ -1983,6 +1994,18 @@ Clients must use that method list to enable or disable slash commands.
 - validates authenticated session ownership and real existence before changing
   state; cross-scope calls make no mutation, while empty, unknown, and deleted
   IDs return `unknown_session` (UPCR-2026-RC81B9296)
+- persists the complete mode/network/approval selection atomically before
+  updating memory or returning success; a durable write failure returns
+  `session_permission_io`, poisons the in-process selection, and invalidates the
+  cached runtime rather than continuing with wider cached permissions
+- once admitted, the complete write→session-anchor→runtime-invalidation operation
+  is owned by a bounded application task (64 slots), retains the session mutation
+  guard, and survives RPC cancellation/disconnection. Capacity is rejected before
+  the first write; a successful RPC response still follows invalidation
+- corrupt, partial, misplaced, unsupported-version, or unreadable durable records
+  fail closed (`session_permission_invalid` or `session_permission_io`), never as
+  a legacy default; recovered dangerous choices are revalidated against the
+  current runtime mode (UPCR-2026-R2E4C10A7)
 - accepted `mode` values are `read_only`, `workspace_write`, and
   `danger_full_access`
 - accepted `update.approval_policy` values are `on-request`, `on_request`,
@@ -1993,6 +2016,11 @@ Clients must use that method list to enable or disable slash commands.
   `network=allowed`
 - dangerous full-host access is rejected outside local solo mode using
   `permission_denied` and `data.kind = "permission_profile_disallowed"`
+- host-managed external connections do not advertise SET/LIST or
+  `permission.profile.v1` in hello, config capabilities, direct open results, or
+  recipient-side live/replayed SessionOpened projections; shared ledger records
+  keep the host view. Direct calls still return `external_method_denied`. Host/admin advertisements
+  are unchanged (UPCR-2026-R63A91C4E)
 
 `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`:
 
