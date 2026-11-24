@@ -1492,6 +1492,17 @@ impl GatewayRuntime {
             tokio::sync::mpsc::unbounded_channel::<String>();
 
         let mut channel_mgr = ChannelManager::new();
+        // T-0654: the bots this gateway's channels consume stay locked to it
+        // until it exits.
+        #[cfg(feature = "telegram")]
+        let mut bot_owners = Vec::new();
+        #[cfg(feature = "telegram")]
+        let bot_owner_dir = crate::bot_owner::default_dir();
+        #[cfg(feature = "telegram")]
+        let bot_holder = format!(
+            "octos gateway, profile {}",
+            profile_id.as_deref().unwrap_or("(none)")
+        );
         {
             let delete_tx = session_delete_tx.clone();
             // M7.9 / W2: bridge SessionTaskQueryStore::cancel/relaunch
@@ -1555,6 +1566,12 @@ impl GatewayRuntime {
                 })),
                 #[cfg(feature = "matrix")]
                 matrix_channel: &mut matrix_channel,
+                #[cfg(feature = "telegram")]
+                bot_owners: adapters::BotOwners {
+                    dir: bot_owner_dir.as_deref(),
+                    holder: &bot_holder,
+                    held: &mut bot_owners,
+                },
             };
             adapters::register_all(&mut channel_mgr, &channels_for_reg, &mut reg_ctx)?;
         }

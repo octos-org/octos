@@ -5,7 +5,8 @@ use std::sync::atomic::AtomicBool;
 use eyre::WrapErr;
 use octos_bus::ChannelManager;
 
-use super::settings_str;
+use super::{BotOwners, settings_str};
+use crate::bot_owner::BotOwner;
 use crate::config::ChannelEntry;
 
 pub fn register(
@@ -13,10 +14,17 @@ pub fn register(
     entry: &ChannelEntry,
     shutdown: &Arc<AtomicBool>,
     media_dir: &Path,
+    owners: &mut BotOwners<'_>,
 ) -> eyre::Result<()> {
     let env = settings_str(&entry.settings, "token_env", "TELEGRAM_BOT_TOKEN");
     let token =
         std::env::var(&env).wrap_err_with(|| format!("{env} environment variable not set"))?;
+    // T-0654: the bot is this gateway's alone, or the gateway does not start.
+    if let Some(owner) = BotOwner::claim_for_gateway(&token, owners.dir, owners.holder)
+        .map_err(|why| eyre::eyre!(why))?
+    {
+        owners.held.push(owner);
+    }
     let bot_username = entry
         .settings
         .get("bot_username")

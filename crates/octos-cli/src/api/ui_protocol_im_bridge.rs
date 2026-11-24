@@ -533,4 +533,4 @@ fn turn_id_for(binding: &ImBinding, message_id: i64) -> TurnId {
 
 #[cfg(test)]
 #[path = "ui_protocol_im_bridge_tests.rs"]
-mod tests;
+pub(super) mod tests;

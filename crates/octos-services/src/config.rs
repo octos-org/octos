@@ -496,6 +496,62 @@ pub struct Config {
     /// byte-identical.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub cli: std::collections::BTreeMap<String, serde_json::Value>,
+
+    /// Settings only `octos serve` reads. Omitted when absent, so configs
+    /// that never used it stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeConfig>,
+}
+
+/// The `serve` section.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Bots `octos serve` consumes itself, each driving chats the operator
+    /// bound (`docs/IM_REMOTE_CONTROL.md` §7, §11). Serve is a listed bot's
+    /// one owner: no gateway may use it.
+    #[serde(default)]
+    pub im: Vec<ServeImChannel>,
+}
+
+/// One bot in `serve.im`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeImChannel {
+    #[serde(rename = "type")]
+    pub platform: ServeImPlatform,
+    /// The environment variable that holds the bot's token.
+    pub token_env: String,
+    /// The numeric ids of the people who may use the bot. Unlike a gateway
+    /// channel's, an empty list allows no one.
+    pub allowed_senders: Vec<i64>,
+    /// How old a message may be, by its platform time, and still run.
+    #[serde(default = "default_serve_im_ttl_secs")]
+    pub ttl_secs: u64,
+    pub bindings: Vec<ServeImBinding>,
+}
+
+fn default_serve_im_ttl_secs() -> u64 {
+    600
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServeImPlatform {
+    Telegram,
+}
+
+/// A chat with the bot, its one sender, and the octos chat they drive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeImBinding {
+    /// The platform's numeric id of the chat.
+    pub chat: i64,
+    /// The platform's numeric id of the person.
+    pub sender: i64,
+    pub profile: String,
+    /// The chat session, as `<profile>:api:<chat>`.
+    pub session: String,
 }
 
 /// Plugin loader policy.

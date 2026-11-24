@@ -10,6 +10,8 @@ mod durable_delivery;
 mod external_turns;
 #[path = "ui_protocol_im_bridge.rs"]
 mod im_bridge;
+#[path = "ui_protocol_im_config.rs"]
+mod im_config;
 #[path = "ui_protocol_memory_entries.rs"]
 mod memory_entries;
 #[path = "ui_protocol_memory_requests.rs"]
@@ -24,6 +26,7 @@ mod ui_protocol_persistence;
 mod workspace_team_rpc;
 use super::delivered_media::store_delivered_media_copies;
 pub(crate) use dto::*;
+pub(crate) use im_config::start_serve_im;
 pub(crate) use octos_core::autonomy_rpc::{AutonomyCommand, parse_autonomy_command};
 use session_turn_service::{SessionTurnService, TurnCaller};
 use turn_connection::TurnConnection;

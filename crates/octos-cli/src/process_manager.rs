@@ -827,6 +827,7 @@ impl ProcessManager {
                     if let Some(weak) = pm_weak.clone() {
                         let pid2 = profile_id.clone();
                         let ps2 = profile_store_for_restart.clone();
+                        let history = log_history.clone();
                         // Use spawn_local-safe pattern: sleep then restart on current runtime
                         let rt = tokio::runtime::Handle::current();
                         std::thread::spawn(move || {
@@ -843,6 +844,19 @@ impl ProcessManager {
                                                 profile = %pid2,
                                                 "skipping auto-restart: no LLM provider configured"
                                             );
+                                            return;
+                                        }
+                                        // T-0654: a gateway refused its bot (taken, or no
+                                        // usable lock), even after the startup check,
+                                        // would only be refused again.
+                                        let refused = history
+                                            .lock()
+                                            .await
+                                            .iter()
+                                            .find(|line| line.contains(crate::bot_owner::REFUSED))
+                                            .map(|line| line.trim().to_string());
+                                        if let Some(line) = refused {
+                                            pm.record_configuration_error(&pid2, line).await;
                                             return;
                                         }
                                         if pm.has_configuration_error(&pid2).await {
