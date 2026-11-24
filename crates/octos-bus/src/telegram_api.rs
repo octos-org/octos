@@ -39,17 +39,22 @@ impl std::fmt::Debug for TelegramBotApi {
 pub enum ApiError {
     /// No answer from the API: the request may still have taken effect.
     Unanswered(String),
-    /// The API answered and refused: nothing took effect.
-    Refused { code: i64, description: String },
+    /// The API answered and refused: nothing took effect. Asked to slow
+    /// down (429), it says how long to wait first.
+    Refused {
+        code: i64,
+        description: String,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unanswered(why) => write!(f, "no answer from Telegram: {why}"),
-            Self::Refused { code, description } => {
-                write!(f, "Telegram refused ({code}): {description}")
-            }
+            Self::Refused {
+                code, description, ..
+            } => write!(f, "Telegram refused ({code}): {description}"),
         }
     }
 }
@@ -112,10 +117,12 @@ impl TelegramBotApi {
     pub async fn get_updates(&self, offset: i64, wait: Duration) -> Result<Vec<Update>, ApiError> {
         let body =
             json!({ "offset": offset, "timeout": wait.as_secs(), "allowed_updates": ["message"] });
-        let result = self.call("getUpdates", body).await?;
-        serde_json::from_value(result).map_err(|error| {
-            ApiError::Unanswered(format!("getUpdates: unreadable updates: {error}"))
-        })
+        let Value::Array(updates) = self.call("getUpdates", body).await? else {
+            return Err(ApiError::Unanswered(
+                "getUpdates: the result is not a list".into(),
+            ));
+        };
+        Ok(updates.into_iter().filter_map(read_update).collect())
     }
 
     /// Send `text` to `chat`, as HTML if `html`, as a reply to `reply_to`
@@ -163,6 +170,9 @@ impl TelegramBotApi {
             (Some(code), Some(description)) => Err(ApiError::Refused {
                 code,
                 description: self.redact(format!("{method}: {description}")),
+                retry_after: answer["parameters"]["retry_after"]
+                    .as_u64()
+                    .map(Duration::from_secs),
             }),
             _ => Err(unanswered(format!("HTTP {status} without an API answer"))),
         }
@@ -171,6 +181,21 @@ impl TelegramBotApi {
     fn redact(&self, text: String) -> String {
         text.replace(&self.token, "<token>")
     }
+}
+
+/// One update as Telegram sent it. One that does not read as an update is
+/// kept by its id without its message, so it is confirmed and skipped
+/// instead of holding up the updates after it (T-0665). Only its id is
+/// logged: the rest may be someone's message.
+fn read_update(update: Value) -> Option<Update> {
+    let update_id = update["update_id"].as_i64();
+    serde_json::from_value(update).ok().or_else(|| {
+        tracing::warn!(?update_id, "Telegram update unreadable; skipped");
+        Some(Update {
+            update_id: update_id?,
+            message: None,
+        })
+    })
 }
 
 /// What went wrong with a request that got no answer, without its URL.

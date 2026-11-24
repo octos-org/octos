@@ -117,6 +117,9 @@ pub(crate) enum Handled {
     /// A `/stop` already decided; nothing was done again and nothing was
     /// answered.
     Repeated,
+    /// Not answered: a chat that is neither bound nor direct was already told
+    /// it is not linked, and telling everyone in it again is noise.
+    Ignored,
     /// A turn started; `delivery` ends once its result has gone out, or
     /// could not.
     Started(tokio::task::JoinHandle<Delivery>),
@@ -165,6 +168,9 @@ pub(crate) struct ServeImBridge {
     /// The turn the bridge last started in each chat, while it runs, and
     /// the id of the message that started it.
     running: StdMutex<HashMap<SessionKey, (TurnId, i64)>>,
+    /// The chats, neither bound nor direct, already told they are not
+    /// linked: each is told once while the bridge runs (T-0665).
+    told_unlinked: StdMutex<HashSet<i64>>,
 }
 
 impl ServeImBridge {
@@ -219,6 +225,7 @@ impl ServeImBridge {
             bindings: StdMutex::new(bindings),
             ttl,
             running: StdMutex::default(),
+            told_unlinked: StdMutex::default(),
         }))
     }
 
@@ -243,6 +250,13 @@ impl ServeImBridge {
     pub(crate) async fn handle(self: &Arc<Self>, message: ImMessage) -> Handled {
         let refusal = 'checks: {
             let Some(binding) = self.binding(message.chat) else {
+                let told = |chat| {
+                    let mut told = self.told_unlinked.lock().unwrap_or_else(|p| p.into_inner());
+                    !told.insert(chat)
+                };
+                if !message.direct && told(message.chat) {
+                    return Handled::Ignored;
+                }
                 break 'checks Refusal::UnknownChat;
             };
             if !message.direct {

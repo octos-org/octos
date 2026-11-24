@@ -20,9 +20,19 @@
 //! A reply goes out in pieces Telegram accepts, as HTML when it formats,
 //! the first piece as a reply to the message. A send Telegram did not
 //! answer may still have arrived, so it is not tried again and the bridge
-//! takes the result as not confirmed. The one send repeated is one Telegram
-//! refused for its HTML: that one did not arrive, and goes again as text.
+//! takes the result as not confirmed. Only a send Telegram refused is ever
+//! repeated, since a refusal means it did not arrive: once after the wait
+//! Telegram asked for, when it refused for sending too fast (429), and once
+//! as text, when it refused for the HTML (T-0665).
+//!
+//! The loop is the bot's only poller, and nothing stops it but serve: an
+//! update that does not read is skipped by `telegram_api`, and a message
+//! whose handling panics is logged and skipped after a backoff, in the same
+//! task, so the bot is never polled twice (T-0665).
 
+use std::panic::AssertUnwindSafe;
+
+use futures::FutureExt;
 use octos_bus::coalesce::{ChunkConfig, split_message};
 use octos_bus::markdown_html::markdown_to_telegram_html;
 use octos_bus::telegram_api::{ApiError, Message, TelegramBotApi};
@@ -36,6 +46,9 @@ const WAIT: Duration = Duration::from_secs(25);
 /// The wait after a failed `getUpdates`, doubled on each failure in a row.
 const BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// The longest wait Telegram may ask for that is waited out before a send
+/// is repeated; a poll waits at most this long too.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub(crate) struct TelegramBot {
     id: ImChannelId,
@@ -45,6 +58,27 @@ pub(crate) struct TelegramBot {
 impl TelegramBot {
     pub(crate) fn new(id: ImChannelId, api: TelegramBotApi) -> Self {
         Self { id, api }
+    }
+
+    /// Send one piece, and once more after the wait Telegram asked for if
+    /// it refused it for sending too fast and the wait is short.
+    async fn send_piece(
+        &self,
+        chat: i64,
+        text: &str,
+        html: bool,
+        reply_to: Option<i64>,
+    ) -> Result<(), ApiError> {
+        match self.api.send_message(chat, text, html, reply_to).await {
+            Err(ApiError::Refused {
+                retry_after: Some(wait),
+                ..
+            }) if wait <= MAX_RETRY_AFTER => {
+                tokio::time::sleep(wait).await;
+                self.api.send_message(chat, text, html, reply_to).await
+            }
+            sent => sent,
+        }
     }
 }
 
@@ -61,11 +95,11 @@ impl ImChannel for TelegramBot {
         {
             let reply_to = reply_to.filter(|_| index == 0);
             let html = markdown_to_telegram_html(piece);
-            match self.api.send_message(chat, &html, true, reply_to).await {
+            match self.send_piece(chat, &html, true, reply_to).await {
                 Err(ApiError::Refused { description, .. })
                     if description.contains("can't parse entities") =>
                 {
-                    self.api.send_message(chat, piece, false, reply_to).await?
+                    self.send_piece(chat, piece, false, reply_to).await?
                 }
                 sent => sent?,
             }
@@ -99,6 +133,20 @@ pub(crate) fn im_message(message: &Message) -> ImMessage {
 
 /// Give `bot`'s messages to `bridge` until aborted.
 pub(crate) async fn poll(bridge: Arc<ServeImBridge>, bot: Arc<TelegramBot>) {
+    poll_with(&bot, |message| {
+        let bridge = bridge.clone();
+        // A turn this starts runs on and replies by itself.
+        async move { drop(bridge.handle(message).await) }
+    })
+    .await
+}
+
+/// Give `bot`'s messages to `handle` until aborted.
+pub(crate) async fn poll_with<F, Fut>(bot: &TelegramBot, handle: F)
+where
+    F: Fn(ImMessage) -> Fut,
+    Fut: Future<Output = ()>,
+{
     // After the last batch, the offset that confirms it; else 0.
     let mut offset = 0;
     let mut backoff = BACKOFF;
@@ -108,7 +156,14 @@ pub(crate) async fn poll(bridge: Arc<ServeImBridge>, bot: Arc<TelegramBot>) {
             Ok(updates) => updates,
             Err(error) => {
                 warn!(bot = bot.id.bot, %error, "serve.im: Telegram getUpdates failed; asking again");
-                tokio::time::sleep(backoff).await;
+                let wait = match &error {
+                    ApiError::Refused {
+                        retry_after: Some(wait),
+                        ..
+                    } => (*wait).min(MAX_RETRY_AFTER),
+                    _ => backoff,
+                };
+                tokio::time::sleep(wait).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
@@ -116,8 +171,17 @@ pub(crate) async fn poll(bridge: Arc<ServeImBridge>, bot: Arc<TelegramBot>) {
         backoff = BACKOFF;
         for update in updates {
             if let Some(message) = &update.message {
-                // A turn this starts runs on and replies by itself.
-                drop(bridge.handle(im_message(message)).await);
+                let handled = AssertUnwindSafe(async { handle(im_message(message)).await });
+                if handled.catch_unwind().await.is_err() {
+                    tracing::error!(
+                        bot = bot.id.bot,
+                        update_id = update.update_id,
+                        chat = message.chat.id,
+                        "serve.im: handling a Telegram message panicked; skipped it"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
             }
             offset = offset.max(update.update_id + 1);
         }
