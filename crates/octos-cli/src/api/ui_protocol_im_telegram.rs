@@ -22,8 +22,10 @@
 //! answer may still have arrived, so it is not tried again and the bridge
 //! takes the result as not confirmed. Only a send Telegram refused is ever
 //! repeated, since a refusal means it did not arrive: once after the wait
-//! Telegram asked for, when it refused for sending too fast (429), and once
-//! as text, when it refused for the HTML (T-0665).
+//! Telegram asked for, when it refused a result for sending too fast (429),
+//! and once as text, when it refused the HTML (T-0665). An answer the bridge
+//! gives while it handles a message (a refusal, a command's reply) holds up
+//! the messages after it, so its rate limit is not waited out.
 //!
 //! The loop is the bot's only poller, and nothing stops it but serve: an
 //! update that does not read is skipped by `telegram_api`, and a message
@@ -60,20 +62,49 @@ impl TelegramBot {
         Self { id, api }
     }
 
-    /// Send one piece, and once more after the wait Telegram asked for if
-    /// it refused it for sending too fast and the wait is short.
+    /// Send `text` in pieces; if `patient`, wait out Telegram's rate limit
+    /// on a piece.
+    async fn deliver(
+        &self,
+        chat: i64,
+        text: &str,
+        reply_to: Option<i64>,
+        patient: bool,
+    ) -> eyre::Result<()> {
+        for (index, piece) in split_message(text, &ChunkConfig::telegram())
+            .iter()
+            .enumerate()
+        {
+            let reply_to = reply_to.filter(|_| index == 0);
+            let html = markdown_to_telegram_html(piece);
+            match self.send_piece(chat, &html, true, reply_to, patient).await {
+                Err(ApiError::Refused { description, .. })
+                    if description.contains("can't parse entities") =>
+                {
+                    self.send_piece(chat, piece, false, reply_to, patient)
+                        .await?
+                }
+                sent => sent?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Send one piece, and, if `patient`, once more after the wait Telegram
+    /// asked for if it refused it for sending too fast and the wait is short.
     async fn send_piece(
         &self,
         chat: i64,
         text: &str,
         html: bool,
         reply_to: Option<i64>,
+        patient: bool,
     ) -> Result<(), ApiError> {
         match self.api.send_message(chat, text, html, reply_to).await {
             Err(ApiError::Refused {
                 retry_after: Some(wait),
                 ..
-            }) if wait <= MAX_RETRY_AFTER => {
+            }) if patient && wait <= MAX_RETRY_AFTER => {
                 tokio::time::sleep(wait).await;
                 self.api.send_message(chat, text, html, reply_to).await
             }
@@ -89,22 +120,13 @@ impl ImChannel for TelegramBot {
     }
 
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()> {
-        for (index, piece) in split_message(text, &ChunkConfig::telegram())
-            .iter()
-            .enumerate()
-        {
-            let reply_to = reply_to.filter(|_| index == 0);
-            let html = markdown_to_telegram_html(piece);
-            match self.send_piece(chat, &html, true, reply_to).await {
-                Err(ApiError::Refused { description, .. })
-                    if description.contains("can't parse entities") =>
-                {
-                    self.send_piece(chat, piece, false, reply_to).await?
-                }
-                sent => sent?,
-            }
-        }
-        Ok(())
+        self.deliver(chat, text, reply_to, true).await
+    }
+
+    /// The poller waits on an answer, so a rate limit is not waited out:
+    /// the answer is tried once and, refused, dropped (T-0665).
+    async fn answer(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()> {
+        self.deliver(chat, text, reply_to, false).await
     }
 }
 

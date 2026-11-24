@@ -14,8 +14,12 @@ Nothing on the wire changes:
 - No method, params, result, error code, message, `data`, capability,
   feature token or event shape is added, removed or altered.
 - `api/ui_protocol_im_telegram.rs`:
-  - A piece Telegram refused with a 429 and a short `retry_after` is sent
-    once more after that wait. A poll told to slow down waits as asked.
+  - A piece of a turn's result that Telegram refused with a 429 and a short
+    `retry_after` is sent once more after that wait. A poll told to slow
+    down waits as asked.
+  - An answer given while a message is handled (a refusal, a command's
+    reply) goes through the new `ImChannel::answer`, which is tried once and
+    never waits out a rate limit, so it does not hold up the next message.
   - A message whose handling panics is logged and skipped after a backoff,
     within the same polling task.
 - `octos_bus::telegram_api`:

@@ -23,6 +23,7 @@ const GROUP: i64 = -100_200;
 /// Telegram's answer to a bot sending too fast.
 const SLOW_DOWN_1S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}"#;
 const SLOW_DOWN_2S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}"#;
+const SLOW_DOWN_30S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 30","parameters":{"retry_after":30}}"#;
 const SLOW_DOWN_1H: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3600","parameters":{"retry_after":3600}}"#;
 
 /// An answer the fake gives instead of its own.
@@ -320,6 +321,38 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     assert_eq!(sends, [(ME, "reply: again".into(), Some(52), true)]);
     let prompts = llm.prompts.lock().unwrap().clone();
     assert_eq!(prompts, ["hello", "a week later", "again"]);
+}
+
+#[tokio::test]
+async fn a_rate_limited_refusal_does_not_hold_up_the_next_stop() {
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
+    let fx = serve(dir.path(), scripted()).await;
+    let chat = unique("im-telegram-stop");
+    fx.chat(&chat).await;
+    let owners = tempfile::tempdir().unwrap();
+    let (fake, url) = FakeTelegram::start().await;
+    // The unlinked group's refusal is told to wait 30 s, longer than this
+    // test waits; the /stop after it in the same batch is answered anyway.
+    let slow_down = (StatusCode::TOO_MANY_REQUESTS, SLOW_DOWN_30S);
+    fake.answer_next("sendMessage", Some(slow_down));
+    fake.push(update(70, GROUP, "group", "hello all"));
+    fake.push(update(71, ME, "private", "/stop"));
+    let im = start(
+        &fx.state,
+        &entries(&chat),
+        env,
+        owners.path(),
+        "serve",
+        &url,
+    )
+    .await;
+    let _im = im.unwrap();
+    let sends = until("the /stop's answer", || {
+        Some(fake.sends()).filter(|s| s.len() == 2)
+    })
+    .await;
+    let answered: Vec<_> = sends.iter().map(|s| (s.0, s.2)).collect();
+    assert_eq!(answered, [(GROUP, Some(70)), (ME, Some(71))]);
 }
 
 #[tokio::test]

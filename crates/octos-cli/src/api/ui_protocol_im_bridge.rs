@@ -60,7 +60,14 @@ pub(crate) struct ImChannelId {
 #[async_trait::async_trait]
 pub(crate) trait ImChannel: Send + Sync {
     fn id(&self) -> ImChannelId;
+    /// Send a turn's result.
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()>;
+    /// Answer a message while it is handled: a refusal or a command's reply.
+    /// The messages after it wait on this, so a channel that waits out rate
+    /// limits in `send` does not here (T-0665).
+    async fn answer(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()> {
+        self.send(chat, text, reply_to).await
+    }
 }
 
 /// Who sent a message, as the platform tells it.
@@ -319,7 +326,7 @@ impl ServeImBridge {
                     .await;
             }
         };
-        self.send(binding.chat, reply, Some(message_id)).await;
+        self.answer(binding.chat, reply, Some(message_id)).await;
         Handled::Answered
     }
 
@@ -468,12 +475,12 @@ impl ServeImBridge {
             }
             Refusal::NotStarted(reason) => format!("Could not start: {reason}"),
         };
-        self.send(chat, &reply, message_id).await;
+        self.answer(chat, &reply, message_id).await;
         Handled::Refused(refusal)
     }
 
-    async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) {
-        if let Err(error) = self.channel.send(chat, text, reply_to).await {
+    async fn answer(&self, chat: i64, text: &str, reply_to: Option<i64>) {
+        if let Err(error) = self.channel.answer(chat, text, reply_to).await {
             tracing::warn!(chat, %error, "IM reply send failed");
         }
     }
