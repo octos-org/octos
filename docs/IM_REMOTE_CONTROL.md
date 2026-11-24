@@ -116,7 +116,7 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
 
 ### 9.3 恢复与存储
 
-- **断线恢复**：bridge 重启后先跑 §9.1/§9.2 的对账，再恢复消费平台 cursor。Telegram 用 `getUpdates` offset 续拉；Discord 不支持回溯则明确丢弃缺口并 loud 说明，符合"恢复只补状态"语义。
+- **断线恢复**：bridge 重启后先跑 §9.1/§9.2 的对账，再恢复消费平台 cursor。Telegram 用 `getUpdates` offset 续拉（第三刀：处理完才确认，见 §14）；Discord 不支持回溯则明确丢弃缺口并 loud 说明，符合"恢复只补状态"语义。
 - **serve 离线**：渠道侧错误由渠道自身表面呈现；serve 恢复后 bridge 按上面对账。
 - 现有 mpsc 内存 bus 不承担这些保证（T-0093 已点名）；inbox/outbox 用 sqlite 或 append-only 文件，跟 profile 数据目录走。
 
@@ -199,6 +199,31 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
   2. 把每个 binding 解析成 `BoundChat`；
   3. 把整项交给 `ServeImBridge::new` 检查。
 - 真实的 Telegram 传输还没接，是下一刀。这一刀装好的 bridge 收不到消息，serve 只是占住这个 bot，不让任何 gateway 用。
+
+第三刀（T-0663，Telegram 私聊传输）：
+
+- **Bot API**：`octos-bus` 的 `telegram_api` 只做 `getUpdates` 和 `sendMessage`，走渠道共用的 HTTP client，不依赖 `telegram` feature。不用 teloxide 的 polling，原因有两个：
+  - 它把 update 交出去就确认了；
+  - 它转成 `InboundMessage` 时丢了 chat 类型、sender 类别和平台时间。
+- **收**：每个 bot 一个循环。
+  - 用 `getUpdates` 拉还没确认的消息（只要 `message`），逐条交给 bridge。
+  - bridge 处理完（turn 已落盘，或已在 chat 里回复），才从下一个 offset 再拉；Telegram 正是靠这次请求得知前面的 update 已确认。
+  - 所以重启、断线、Telegram 重发同一个 update，都只会撞上已有的 turn，什么都不跑。
+  - offset 只在 Telegram 那边：它保留未确认的 update 24 小时，过期的由 bridge 的 TTL 拒绝。
+  - 只有处理完一批之后的那一次拉取带 offset，用来确认这一批；其余拉取（上一次为空或失败之后）都从 0 拉，也就是从 Telegram 最早的未确认 update 拉。原因：一周没有 update 之后，Telegram 会随机给下一个 update 编号，可能比旧 offset 小，带着旧 offset 拉会把它没交给 bridge 就确认掉（评审）。最坏情况是确认丢失的那一批再来一次，什么都不会重跑。
+  - 拉取失败按 1 秒起翻倍、最多 60 秒退避，然后继续拉。
+- **识别**：
+  - chat 类型是 `private` 的才算私聊；
+  - `sender_chat` 存在时，sender 是那个 chat（匿名管理员、频道）；
+  - `from.is_bot` 为真的是 bot，否则是人；
+  - `date` 是平台时间；
+  - 没有 `text` 的消息（图片、文件、贴纸、位置、服务消息）一律按附件拒绝。
+- **发**：
+  - 回复按 Telegram 的长度切块，能转 HTML 就发 HTML，第一块回复原消息（原消息已删也照发）；
+  - 没得到应答的发送可能已经送达，不重发，bridge 记为未确认；
+  - 只有因 HTML 解析失败被拒的那一块会改成纯文本再发一次，因为被拒说明它没送达。
+- **token**：只从 `token_env` 读。请求路径里带着 token，所以 `telegram_api` 的错误不带 URL，客户端的 Debug 也不打印 token。
+- **测试**：用本地假 Bot API server，不是真实渠道 e2e。真实 bot、token 和公网入口不在本刀。
 
 ## 15. 待 Claude / shu 定（本文不擅自决定）
 

@@ -122,6 +122,16 @@ Each test sends the same requests through the WebSocket handler and straight to 
 | 3 | `api::ui_protocol_transport::im_config::tests::a_bot_has_one_owner_serve_or_one_gateway` | A bot serve owns is refused to a second serve and to any gateway, by the bot's id whatever token names it, with the holder named; a gateway's other bots and tokens with no bot id start as before, a lock directory it cannot use refuses it instead of leaving it unlocked, and the bot is free once serve lets go. |
 | 3 | `api::ui_protocol_transport::im_config::tests::a_binding_taken_out_of_the_config_is_refused_from_the_next_start` | After a restart with a chat's binding taken out of the config, its next message and a redelivery of its last are refused and run nothing. |
 
+## IM Telegram transport (T-0663, `docs/IM_REMOTE_CONTROL.md` §9, §14)
+
+A `serve.im` bot's Telegram transport against a local fake Bot API server (not Telegram), a real serve runtime and an existing chat.
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::ui_protocol_transport::im_telegram::tests::a_telegram_message_reads_as_the_platform_tells_it` | Only a `private` chat is direct; a message in a chat's name (an anonymous admin) is the chat's, a bot's is a bot's, a person's is theirs; the platform's date is the send time; a message without text is an attachment whatever its caption. |
+| 4 | `api::ui_protocol_transport::im_telegram::tests::a_direct_message_runs_once_across_a_redelivery_and_a_restart` | A bound direct message runs and its reply goes back to it, an unbound group is answered and runs nothing, a failed poll is retried, and handled updates are confirmed by the next offset; a message Telegram numbers below that offset after a quiet spell still reaches the bridge before it is confirmed; after a restart an update Telegram sends again runs and sends nothing, and only the new one runs. |
+| 4 | `api::ui_protocol_transport::im_telegram::tests::a_send_telegram_did_not_answer_is_not_repeated_and_no_error_shows_the_token` | A send whose answer was lost is not sent again; only a piece refused for its HTML goes again as text, and a long reply goes in pieces with only the first a reply; neither a refusal, a request with no answer nor the client's Debug shows the token or its URL. |
+
 ## Peer host tools and shared history
 
 | Cat. | Exact test | Guard |

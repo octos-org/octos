@@ -18,6 +18,7 @@ pub mod profile_map;
 pub mod resume_policy;
 pub mod session;
 pub mod session_artifacts;
+pub mod telegram_api;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
