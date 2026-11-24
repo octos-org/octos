@@ -69,10 +69,12 @@ A connection that does not request it sees byte-identical replies.
   above the legacy data directory is not refused by that rule, because the data
   directory may sit in a project (`--data-dir`, `OCTOS_HOME`) or in the user's
   home, and refusing those would refuse the project or the home itself. The
-  server-level root follows the legacy ancestor rule: startup still refuses any
-  overlap with a profile data directory, and it refuses a Code workspace at or
-  below the root, but it allows a larger ancestor workspace such as a standard
-  install's `$HOME`; the root itself is in the precomputed hidden set. Such a
+  server-level root follows the legacy ancestor rule: startup refuses any
+  overlap with a legacy profile chats root, and it refuses a Code workspace at
+  or below the root, but it allows a profile data directory or larger workspace
+  that is only an ancestor (including a standard install whose `_main` data
+  directory is the state home itself); the root itself is in the precomputed
+  hidden set. Such a
   session still never reaches a chat folder of any profile. One workspace may hold several profiles' data directories (a project
   above them), so the reserved folders are the legacy `chats` folders of every
   profile the server stores or has started, plus the server-level root, not only
@@ -148,8 +150,9 @@ A connection that does not request it sees byte-identical replies.
 
 - A chat's folder is either `<profile data dir>/chats/<name>/` for a profile
   already present when the server starts, or
-  `<shared server data root>/chats/<profile>/<name>/` for a Profile registered
-  while the server runs. `<profile>` and `<name>` are SHA-256-derived path
+  `<shared server data root>/chat-workspaces/<profile>/<name>/` for a Profile
+  registered while the server runs. `<profile>` and `<name>` are SHA-256-derived
+  path
   components; the server-level root is created before the first sandbox. Every
   chat folder is created with mode `0700`.
   `<name>` is the first 32 hex digits of SHA-256 of the session id without its
@@ -265,6 +268,11 @@ The file tools resolve every path through the scope:
   migrated. A rollback to an older binary cannot see chats stored under the
   server-level root, but those folders and records remain on disk and become
   visible again after upgrading.
+- Pre-release #3326 development instances that used `<server data root>/chats`
+  as the server-level root are moved to `<server data root>/chat-workspaces` on
+  startup. If that old path is also a startup profile's legacy chats root, it
+  stays in place. If both old and new server roots contain data, startup
+  refuses rather than merging or choosing one.
 - Old clients cannot create or list chats.
 - An old server rejects `session/chat/create` as an unknown method.
 - An old server ignores `work_mode` on `session/list` and returns its ordinary
