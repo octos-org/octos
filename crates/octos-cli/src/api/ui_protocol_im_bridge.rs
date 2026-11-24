@@ -60,7 +60,14 @@ pub(crate) struct ImChannelId {
 #[async_trait::async_trait]
 pub(crate) trait ImChannel: Send + Sync {
     fn id(&self) -> ImChannelId;
+    /// Send a turn's result.
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()>;
+    /// Answer a message while it is handled: a refusal or a command's reply.
+    /// The messages after it wait on this, so a channel that waits out rate
+    /// limits in `send` does not here (T-0665).
+    async fn answer(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()> {
+        self.send(chat, text, reply_to).await
+    }
 }
 
 /// Who sent a message, as the platform tells it.
@@ -117,6 +124,9 @@ pub(crate) enum Handled {
     /// A `/stop` already decided; nothing was done again and nothing was
     /// answered.
     Repeated,
+    /// Not answered: a chat that is neither bound nor direct was already told
+    /// it is not linked, and telling everyone in it again is noise.
+    Ignored,
     /// A turn started; `delivery` ends once its result has gone out, or
     /// could not.
     Started(tokio::task::JoinHandle<Delivery>),
@@ -165,6 +175,9 @@ pub(crate) struct ServeImBridge {
     /// The turn the bridge last started in each chat, while it runs, and
     /// the id of the message that started it.
     running: StdMutex<HashMap<SessionKey, (TurnId, i64)>>,
+    /// The chats, neither bound nor direct, already told they are not
+    /// linked: each is told once while the bridge runs (T-0665).
+    told_unlinked: StdMutex<HashSet<i64>>,
 }
 
 impl ServeImBridge {
@@ -219,6 +232,7 @@ impl ServeImBridge {
             bindings: StdMutex::new(bindings),
             ttl,
             running: StdMutex::default(),
+            told_unlinked: StdMutex::default(),
         }))
     }
 
@@ -243,6 +257,13 @@ impl ServeImBridge {
     pub(crate) async fn handle(self: &Arc<Self>, message: ImMessage) -> Handled {
         let refusal = 'checks: {
             let Some(binding) = self.binding(message.chat) else {
+                let told = |chat| {
+                    let mut told = self.told_unlinked.lock().unwrap_or_else(|p| p.into_inner());
+                    !told.insert(chat)
+                };
+                if !message.direct && told(message.chat) {
+                    return Handled::Ignored;
+                }
                 break 'checks Refusal::UnknownChat;
             };
             if !message.direct {
@@ -305,7 +326,7 @@ impl ServeImBridge {
                     .await;
             }
         };
-        self.send(binding.chat, reply, Some(message_id)).await;
+        self.answer(binding.chat, reply, Some(message_id)).await;
         Handled::Answered
     }
 
@@ -454,12 +475,12 @@ impl ServeImBridge {
             }
             Refusal::NotStarted(reason) => format!("Could not start: {reason}"),
         };
-        self.send(chat, &reply, message_id).await;
+        self.answer(chat, &reply, message_id).await;
         Handled::Refused(refusal)
     }
 
-    async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) {
-        if let Err(error) = self.channel.send(chat, text, reply_to).await {
+    async fn answer(&self, chat: i64, text: &str, reply_to: Option<i64>) {
+        if let Err(error) = self.channel.answer(chat, text, reply_to).await {
             tracing::warn!(chat, %error, "IM reply send failed");
         }
     }

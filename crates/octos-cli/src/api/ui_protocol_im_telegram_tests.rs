@@ -1,7 +1,9 @@
-//! T-0663: the Telegram transport against a local fake Bot API server, a
-//! real serve runtime and an existing chat. The fake is not Telegram: no
-//! real bot, token or network is involved.
+//! T-0663, T-0665: the Telegram transport against a local fake Bot API
+//! server, a real serve runtime and an existing chat. The fake is not
+//! Telegram: no real bot, token or network is involved.
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
@@ -18,14 +20,25 @@ use crate::config::{ServeImBinding, ServeImChannel, ServeImPlatform};
 
 const TOKEN: &str = "900:fake-secret";
 const GROUP: i64 = -100_200;
+/// Telegram's answer to a bot sending too fast.
+const SLOW_DOWN_1S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}"#;
+const SLOW_DOWN_2S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}"#;
+const SLOW_DOWN_30S: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 30","parameters":{"retry_after":30}}"#;
+const SLOW_DOWN_1H: &str = r#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 3600","parameters":{"retry_after":3600}}"#;
+
+/// An answer the fake gives instead of its own.
+type Answer = (StatusCode, &'static str);
 
 /// A local Bot API server for one bot: the updates it holds, what it was
-/// asked, and answers it gives before its own.
+/// asked and when, answers it gives before its own (`None`: its own), and
+/// the most `getUpdates` it had at once.
 #[derive(Default)]
 struct FakeTelegram {
     pending: StdMutex<Vec<Value>>,
-    calls: StdMutex<Vec<(String, Value)>>,
-    answers: StdMutex<HashMap<String, VecDeque<(StatusCode, &'static str)>>>,
+    calls: StdMutex<Vec<(String, Value, Instant)>>,
+    answers: StdMutex<HashMap<String, VecDeque<Option<Answer>>>>,
+    polling: AtomicUsize,
+    most_polling: AtomicUsize,
 }
 
 impl FakeTelegram {
@@ -40,13 +53,17 @@ impl FakeTelegram {
         (fake, url)
     }
 
-    /// Answer the next call of `method` so, whatever it asks.
-    fn answer_next(&self, method: &str, status: StatusCode, body: &'static str) {
+    /// Answer the next call of `method` so, whatever it asks; `None`
+    /// answers it as Telegram would.
+    fn answer_next(&self, method: &str, answer: Option<Answer>) {
         let mut answers = self.answers.lock().unwrap();
-        answers
-            .entry(method.into())
-            .or_default()
-            .push_back((status, body));
+        answers.entry(method.into()).or_default().push_back(answer);
+    }
+
+    fn times(&self, method: &str) -> Vec<Instant> {
+        let calls = self.calls.lock().unwrap();
+        let calls = calls.iter().filter(|(called, ..)| called == method);
+        calls.map(|(.., at)| *at).collect()
     }
 
     fn push(&self, update: Value) {
@@ -56,9 +73,9 @@ impl FakeTelegram {
     /// Each `sendMessage`: chat, text, the message replied to, and HTML.
     fn sends(&self) -> Vec<(i64, String, Option<i64>, bool)> {
         let calls = self.calls.lock().unwrap();
-        let sends = calls.iter().filter(|(method, _)| method == "sendMessage");
+        let sends = calls.iter().filter(|(method, ..)| method == "sendMessage");
         sends
-            .map(|(_, body)| {
+            .map(|(_, body, _)| {
                 let text = body["text"].as_str().unwrap().to_owned();
                 let reply_to = body["reply_parameters"]["message_id"].as_i64();
                 (
@@ -78,9 +95,9 @@ impl FakeTelegram {
     /// The offset of each `getUpdates`, in order.
     fn polls(&self) -> Vec<i64> {
         let calls = self.calls.lock().unwrap();
-        let polls = calls.iter().filter(|(method, _)| method == "getUpdates");
+        let polls = calls.iter().filter(|(method, ..)| method == "getUpdates");
         polls
-            .map(|(_, body)| body["offset"].as_i64().unwrap())
+            .map(|(_, body, _)| body["offset"].as_i64().unwrap())
             .collect()
     }
 }
@@ -93,17 +110,18 @@ async fn answer(
     if bot != format!("bot{TOKEN}") {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let _polling = Polling::start(&fake, &method);
     fake.calls
         .lock()
         .unwrap()
-        .push((method.clone(), body.clone()));
+        .push((method.clone(), body.clone(), Instant::now()));
     let next = fake
         .answers
         .lock()
         .unwrap()
         .get_mut(&method)
         .and_then(VecDeque::pop_front);
-    if let Some(answer) = next {
+    if let Some(Some(answer)) = next {
         return answer.into_response();
     }
     let result = if method == "getUpdates" {
@@ -122,6 +140,28 @@ async fn answer(
         json!({ "message_id": 1 })
     };
     Json(json!({ "ok": true, "result": result })).into_response()
+}
+
+/// A `getUpdates` the fake is answering.
+struct Polling<'a>(Option<&'a FakeTelegram>);
+
+impl<'a> Polling<'a> {
+    fn start(fake: &'a FakeTelegram, method: &str) -> Self {
+        let fake = (method == "getUpdates").then_some(fake);
+        if let Some(fake) = fake {
+            let now = fake.polling.fetch_add(1, Ordering::SeqCst) + 1;
+            fake.most_polling.fetch_max(now, Ordering::SeqCst);
+        }
+        Self(fake)
+    }
+}
+
+impl Drop for Polling<'_> {
+    fn drop(&mut self) {
+        if let Some(fake) = self.0 {
+            fake.polling.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 fn update(id: i64, chat: i64, kind: &str, text: &str) -> Value {
@@ -221,7 +261,7 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     let owners = tempfile::tempdir().unwrap();
     let (fake, url) = FakeTelegram::start().await;
     // The first poll gets no answer; the transport asks again.
-    fake.answer_next("getUpdates", StatusCode::BAD_GATEWAY, "Bad Gateway");
+    fake.answer_next("getUpdates", Some((StatusCode::BAD_GATEWAY, "Bad Gateway")));
     fake.push(update(50, ME, "private", "hello"));
     fake.push(update(51, GROUP, "group", "hello all"));
     let im = start(
@@ -250,6 +290,8 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     until("a poll after telling", polled_since).await;
     // After a quiet week Telegram numbers the next update at random, here
     // below the last offset: it still reaches the bridge before it is told.
+    // The unlinked group, told once, is not told again.
+    fake.push(update(6, GROUP, "group", "hello again"));
     fake.push(update(7, ME, "private", "a week later"));
     let sends = until("the reply", || Some(fake.sends()).filter(|s| s.len() == 3)).await;
     assert_eq!(sends[2], (ME, "reply: a week later".into(), Some(7), true));
@@ -282,6 +324,38 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_refusal_does_not_hold_up_the_next_stop() {
+    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
+    let fx = serve(dir.path(), scripted()).await;
+    let chat = unique("im-telegram-stop");
+    fx.chat(&chat).await;
+    let owners = tempfile::tempdir().unwrap();
+    let (fake, url) = FakeTelegram::start().await;
+    // The unlinked group's refusal is told to wait 30 s, longer than this
+    // test waits; the /stop after it in the same batch is answered anyway.
+    let slow_down = (StatusCode::TOO_MANY_REQUESTS, SLOW_DOWN_30S);
+    fake.answer_next("sendMessage", Some(slow_down));
+    fake.push(update(70, GROUP, "group", "hello all"));
+    fake.push(update(71, ME, "private", "/stop"));
+    let im = start(
+        &fx.state,
+        &entries(&chat),
+        env,
+        owners.path(),
+        "serve",
+        &url,
+    )
+    .await;
+    let _im = im.unwrap();
+    let sends = until("the /stop's answer", || {
+        Some(fake.sends()).filter(|s| s.len() == 2)
+    })
+    .await;
+    let answered: Vec<_> = sends.iter().map(|s| (s.0, s.2)).collect();
+    assert_eq!(answered, [(GROUP, Some(70)), (ME, Some(71))]);
+}
+
+#[tokio::test]
 async fn a_send_telegram_did_not_answer_is_not_repeated_and_no_error_shows_the_token() {
     let (fake, url) = FakeTelegram::start().await;
     let id = ImChannelId {
@@ -289,23 +363,45 @@ async fn a_send_telegram_did_not_answer_is_not_repeated_and_no_error_shows_the_t
         bot: 900,
     };
     let bot = TelegramBot::new(id, TelegramBotApi::new(&url, TOKEN));
+    let sent_since =
+        |from: usize| -> Vec<_> { fake.sends()[from..].iter().map(|s| (s.2, s.3)).collect() };
     // Telegram took it, but its answer was lost.
-    fake.answer_next("sendMessage", StatusCode::BAD_GATEWAY, "Bad Gateway");
+    fake.answer_next(
+        "sendMessage",
+        Some((StatusCode::BAD_GATEWAY, "Bad Gateway")),
+    );
     let lost = bot.send(ME, "hi", Some(7)).await.unwrap_err().to_string();
     assert_eq!(fake.sends(), [(ME, "hi".into(), Some(7), true)]);
 
-    // A piece refused for its HTML goes again as text; a long reply goes in
-    // pieces, only the first a reply.
+    // A long reply goes in pieces, only the first a reply. One Telegram
+    // refused for sending too fast goes again after the wait it asked for,
+    // and the pieces after it still go.
+    fake.answer_next("sendMessage", None);
+    fake.answer_next(
+        "sendMessage",
+        Some((StatusCode::TOO_MANY_REQUESTS, SLOW_DOWN_1S)),
+    );
+    bot.send(ME, &"word ".repeat(1000), Some(8)).await.unwrap();
+    assert_eq!(sent_since(1), [(Some(8), true), (None, true), (None, true)]);
+    let times = fake.times("sendMessage");
+    assert!(times[3] - times[2] >= Duration::from_secs(1));
+    // A piece refused for its HTML goes again as text. Told to wait longer
+    // than a send may, it is not repeated.
     let bad_html =
         r#"{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities"}"#;
-    fake.answer_next("sendMessage", StatusCode::BAD_REQUEST, bad_html);
-    bot.send(ME, &"word ".repeat(1000), Some(8)).await.unwrap();
-    let sent: Vec<_> = fake.sends()[1..].iter().map(|s| (s.2, s.3)).collect();
-    assert_eq!(sent, [(Some(8), true), (Some(8), false), (None, true)]);
+    fake.answer_next("sendMessage", Some((StatusCode::BAD_REQUEST, bad_html)));
+    bot.send(ME, "hi", Some(9)).await.unwrap();
+    fake.answer_next(
+        "sendMessage",
+        Some((StatusCode::TOO_MANY_REQUESTS, SLOW_DOWN_1H)),
+    );
+    assert!(bot.send(ME, "hi", Some(10)).await.is_err());
+    let sent = sent_since(4);
+    assert_eq!(sent, [(Some(9), true), (Some(9), false), (Some(10), true)]);
 
     // Neither a refusal nor a request with no answer names the token.
     let unauthorized = r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#;
-    fake.answer_next("getUpdates", StatusCode::UNAUTHORIZED, unauthorized);
+    fake.answer_next("getUpdates", Some((StatusCode::UNAUTHORIZED, unauthorized)));
     let api = TelegramBotApi::new(&url, TOKEN);
     let refused = api.get_updates(0, Duration::ZERO).await.unwrap_err();
     assert!(matches!(refused, ApiError::Refused { code: 401, .. }));
@@ -327,4 +423,50 @@ async fn a_send_telegram_did_not_answer_is_not_repeated_and_no_error_shows_the_t
             "{error}"
         );
     }
+}
+
+#[tokio::test]
+async fn neither_an_unreadable_update_nor_a_panic_holds_up_the_bot_and_it_is_polled_once() {
+    let (fake, url) = FakeTelegram::start().await;
+    let id = ImChannelId {
+        platform: "telegram".into(),
+        bot: 900,
+    };
+    let bot = TelegramBot::new(id, TelegramBotApi::new(&url, TOKEN));
+    // Told to slow down, the poller waits as long as Telegram asked, which
+    // is longer than its own backoff.
+    fake.answer_next(
+        "getUpdates",
+        Some((StatusCode::TOO_MANY_REQUESTS, SLOW_DOWN_2S)),
+    );
+    fake.push(update(60, ME, "private", "one"));
+    // No chat: it does not read as a message.
+    fake.push(json!({ "update_id": 61, "message": { "message_id": 61, "date": 0, "text": "?" } }));
+    fake.push(update(62, ME, "private", "panic"));
+    fake.push(update(63, ME, "private", "two"));
+    let seen = Arc::new(StdMutex::new(Vec::<String>::new()));
+    let handled = seen.clone();
+    let poller = tokio::spawn(async move {
+        let handle = |message: ImMessage| {
+            let handled = handled.clone();
+            async move {
+                handled.lock().unwrap().push(message.text.clone());
+                assert_ne!(message.text, "panic", "a bug that panics on one message");
+            }
+        };
+        poll_with(&bot, handle).await
+    });
+    until("asking from 64", || fake.asked_from(64).then_some(())).await;
+    assert_eq!(*seen.lock().unwrap(), ["one", "panic", "two"]);
+    let polls = fake.times("getUpdates");
+    assert!(polls[1] - polls[0] >= Duration::from_secs(2));
+    // The next batch is handled too, and the bot never had two polls.
+    fake.push(update(65, ME, "private", "three"));
+    until("asking from 66", || fake.asked_from(66).then_some(())).await;
+    assert_eq!(
+        seen.lock().unwrap().last().map(String::as_str),
+        Some("three")
+    );
+    assert_eq!(fake.most_polling.load(Ordering::SeqCst), 1);
+    poller.abort();
 }
