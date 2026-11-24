@@ -244,7 +244,11 @@ fn read_only_view_rules(view: &super::SandboxReadOnlyView, real_cwd: &str) -> Op
 /// so the shell cannot rename one to move the folder out from under these
 /// rules. `None` when a path cannot be written into SBPL safely (the caller
 /// refuses to run).
-fn hidden_folder_rules(hidden: &[std::path::PathBuf], real_cwd: &Path) -> Option<String> {
+fn hidden_folder_rules(
+    hidden: &octos_core::HiddenFolders,
+    real_cwd: &Path,
+    read_allow_paths: &[String],
+) -> Option<String> {
     let mut rules = String::new();
     let mut deny = |rule: &str, path: &Path| {
         let path = path.to_string_lossy();
@@ -254,9 +258,26 @@ fn hidden_folder_rules(hidden: &[std::path::PathBuf], real_cwd: &Path) -> Option
         rules.push_str(&format!("(deny {rule} \"{path}\"))\n"));
         Some(())
     };
-    for folder in hidden {
-        let real = std::fs::canonicalize(folder).ok()?;
-        for path in [folder, &real] {
+    let command_roots: Vec<std::path::PathBuf> = std::iter::once(real_cwd.to_path_buf())
+        .chain(read_allow_paths.iter().map(std::path::PathBuf::from))
+        .collect();
+    for registered in hidden.folders() {
+        let real = match std::fs::canonicalize(&registered) {
+            Ok(real) => {
+                hidden.resolve_existing_folder(&registered, &real).ok()?;
+                real
+            }
+            Err(_) => match hidden.resolve_missing_folder(&registered, &command_roots) {
+                Ok(true) => {
+                    let real = std::fs::canonicalize(&registered).ok()?;
+                    hidden.resolve_existing_folder(&registered, &real).ok()?;
+                    real
+                }
+                Ok(false) => continue,
+                Err(_) => return None,
+            },
+        };
+        for path in [&registered, &real] {
             deny("file-read* file-write* (subpath", path)?;
         }
         let between = real.ancestors().skip(1);
@@ -655,19 +676,21 @@ impl Sandbox for MacosSandbox {
         // session that is not a chat), whatever the rules above grant.
         let hidden_rules = match &self.hidden_folders {
             None => String::new(),
-            Some(hidden) => match hidden_folder_rules(&hidden.folders(), Path::new(&real_cwd)) {
-                Some(rules) => rules,
-                None => {
-                    tracing::error!(
-                        "hidden folder is unavailable or contains SBPL metacharacters, refusing to execute"
-                    );
-                    let mut cmd = Command::new("sh");
-                    cmd.arg("-c").arg(
+            Some(hidden) => {
+                match hidden_folder_rules(hidden, Path::new(&real_cwd), &self.read_allow_paths) {
+                    Some(rules) => rules,
+                    None => {
+                        tracing::error!(
+                            "hidden folder is unavailable or contains SBPL metacharacters, refusing to execute"
+                        );
+                        let mut cmd = Command::new("sh");
+                        cmd.arg("-c").arg(
                         "echo 'sandbox error: hidden folder is unavailable or invalid' >&2; exit 1",
                     );
-                    return cmd;
+                        return cmd;
+                    }
                 }
-            },
+            }
         };
 
         let profile = format!(
@@ -722,6 +745,8 @@ mod tests {
     fn should_refuse_rules_when_hidden_folder_was_deleted() {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("deleted-hidden");
-        assert!(hidden_folder_rules(&[missing], temp.path()).is_none());
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(missing).unwrap();
+        assert!(hidden_folder_rules(&hidden, temp.path(), &[]).is_none());
     }
 }

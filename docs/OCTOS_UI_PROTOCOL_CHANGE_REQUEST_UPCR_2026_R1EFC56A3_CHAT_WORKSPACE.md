@@ -96,7 +96,17 @@ A connection that does not request it sees byte-identical replies.
     folders between the working folder and them. Landlock, Docker and
     AppContainer cannot hide a folder inside one they grant, so there a
     command whose working folder (or a configured read path) holds one
-    refuses to run. Without a sandbox (`sandbox.enabled = false`,
+    refuses to run. If a registered folder is missing when a command is
+    wrapped, only a server-level root known to be empty may be repaired, and
+    only when this command's workspace/read roots cannot reach it; it is
+    recreated privately and hidden. Once the root can hold a chat, its
+    directory identity is recorded and validated on every command wrap, using
+    the registered path as the lookup key; a symlink or replacement directory
+    keeps commands refused until the original directory is restored. A legacy
+    root always keeps the command refused
+    because the folder may have been renamed into the command's reach. Restore
+    it, or have an operator verify deletion and unregister it with the repair
+    flow. Without a sandbox (`sandbox.enabled = false`,
     `mode = "none"`, or `auto` finding no backend) a command can read any
     path the server can for as long as it runs, and a chat may be made
     while it runs, so every command refuses while any profile's `chats`

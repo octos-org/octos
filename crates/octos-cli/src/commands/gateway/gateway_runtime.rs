@@ -382,6 +382,7 @@ impl GatewayRuntime {
                 std::slice::from_ref(&cwd),
             )
             .wrap_err("gateway chats root is unsafe")?;
+            crate::runtime::chat_workspace::install_missing_root_healer();
             for profile_data_dir in &profile_data_dirs {
                 crate::runtime::chat_workspace::register_existing_profile(profile_data_dir)
                     .wrap_err("failed to reserve an existing profile's legacy chats root")?;

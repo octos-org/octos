@@ -45,7 +45,7 @@ pub struct BwrapSandbox {
 /// mount point cannot be renamed or removed, so the shell cannot move a
 /// hidden folder out from under the next command's mounts.
 fn hidden_mounts(
-    hidden: &[PathBuf],
+    hidden: &octos_core::HiddenFolders,
     cwd: &Path,
     view_root: Option<&Path>,
     cwd_writable: bool,
@@ -56,13 +56,52 @@ fn hidden_mounts(
     let bound: Vec<(&Path, PathBuf)> = bound
         .filter_map(|path| Some((path, std::fs::canonicalize(path).ok()?)))
         .collect();
-    for folder in hidden {
-        let folder = std::fs::canonicalize(folder).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("cannot resolve hidden folder {}: {error}", folder.display()),
-            )
-        })?;
+    let command_roots: Vec<PathBuf> = std::iter::once(cwd.to_path_buf())
+        .chain(view_root.map(Path::to_path_buf))
+        .collect();
+    for registered in hidden.folders() {
+        let folder = match std::fs::canonicalize(&registered) {
+            Ok(folder) => {
+                hidden
+                    .resolve_existing_folder(&registered, &folder)
+                    .map_err(|reason| {
+                        std::io::Error::other(format!(
+                            "hidden folder {} failed ownership validation: {reason}",
+                            registered.display()
+                        ))
+                    })?;
+                folder
+            }
+            Err(error) => match hidden.resolve_missing_folder(&registered, &command_roots) {
+                Ok(true) => {
+                    let folder = std::fs::canonicalize(&registered).map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "hidden folder {} was restored but still cannot resolve: {error}",
+                                registered.display()
+                            ),
+                        )
+                    })?;
+                    hidden
+                        .resolve_existing_folder(&registered, &folder)
+                        .map_err(|reason| {
+                            std::io::Error::other(format!(
+                                "hidden folder {} failed ownership validation after restore: {reason}",
+                                registered.display()
+                            ))
+                        })?;
+                    folder
+                }
+                Ok(false) => continue,
+                Err(reason) => {
+                    return Err(std::io::Error::other(format!(
+                        "cannot resolve hidden folder {}: {error}; {reason}",
+                        registered.display()
+                    )));
+                }
+            },
+        };
         for (path, real) in &bound {
             if let Ok(below) = folder.strip_prefix(real) {
                 covers.insert(path.join(below));
@@ -190,12 +229,7 @@ impl Sandbox for BwrapSandbox {
         // leading to it pinned in place.
         if let Some(hidden) = &self.hidden_folders {
             let view_root = self.read_only_view.as_ref().map(|view| view.root.as_path());
-            let (covers, pins) = match hidden_mounts(
-                &hidden.folders(),
-                cwd,
-                view_root,
-                self.workspace_write,
-            ) {
+            let (covers, pins) = match hidden_mounts(hidden, cwd, view_root, self.workspace_write) {
                 Ok(mounts) => mounts,
                 Err(error) => {
                     return super::refusing_command(
