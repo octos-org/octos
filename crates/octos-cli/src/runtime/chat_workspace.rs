@@ -36,9 +36,9 @@ struct ChatWorkspaceLayout {
     healable_server_roots: std::collections::BTreeSet<PathBuf>,
     /// Canonical server root -> identity captured while it existed.
     server_root_identities: std::collections::HashMap<PathBuf, String>,
-    /// Identity marker path -> populated server root. The marker stays missing
-    /// inside the root, so every command wrap revalidates the root's identity.
-    unresolved_server_roots: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Server roots that may hold chats and therefore require their recorded
+    /// directory identity to match on every command wrap.
+    populated_server_roots: std::collections::BTreeSet<PathBuf>,
     /// Canonical profile data dir -> server-level profile root chosen for it.
     /// Keeping this separate from the current server root keeps unit-test
     /// states independent and preserves a profile across unrelated reconfigures.
@@ -132,13 +132,8 @@ fn root_identity(path: &Path) -> std::io::Result<String> {
     }
 }
 
-fn unresolved_marker_path(root: &Path) -> std::io::Result<PathBuf> {
-    Ok(registered_path(root).join(".octos-root-identity"))
-}
-
 fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
     let root = registered_path(root);
-    let marker = unresolved_marker_path(&root)?;
     let current = root_identity(&root)?;
     let expected = layout_read().server_root_identities.get(&root).cloned();
     if expected.as_deref() != Some(current.as_str()) {
@@ -149,13 +144,8 @@ fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
     }
     let mut layout = layout_write();
     layout.healable_server_roots.remove(&root);
-    layout
-        .unresolved_server_roots
-        .insert(marker.clone(), root.to_path_buf());
-    drop(layout);
-    reserved_folders()
-        .add(marker)
-        .map_err(std::io::Error::other)
+    layout.populated_server_roots.insert(root);
+    Ok(())
 }
 
 fn overlaps_path(left: &Path, right: &Path) -> bool {
@@ -400,16 +390,7 @@ fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> 
             folder.display()
         ));
     }
-    if layout_read().unresolved_server_roots.contains_key(&folder) {
-        return Err(format!(
-            "server chats identity marker {} must stay absent",
-            folder.display()
-        ));
-    }
-    let populated = layout_read()
-        .unresolved_server_roots
-        .values()
-        .any(|root| root == &folder);
+    let populated = layout_read().populated_server_roots.contains(&folder);
     if !populated {
         return Ok(());
     }
@@ -433,24 +414,6 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
     // The registered path is the lookup key; normalizing strips a trailing
     // separator without resolving a symlink replacement.
     let folder = registered_path(folder);
-    let marker_root = layout_read().unresolved_server_roots.get(&folder).cloned();
-    if let Some(root) = marker_root {
-        let expected = layout_read().server_root_identities.get(&root).cloned();
-        let current = root_identity(&root).map_err(|error| {
-            format!(
-                "server chats root {} is still missing or changed ({error}); restore the original directory",
-                root.display()
-            )
-        })?;
-        if expected.as_deref() != Some(current.as_str()) {
-            return Err(format!(
-                "server chats root {} was replaced instead of restored; restore the original directory or have an operator account for its contents",
-                root.display()
-            ));
-        }
-        // Keep the marker registered: the next wrap must verify the root again.
-        return Ok(false);
-    }
     if layout_read().healable_server_roots.contains(&folder) {
         if command_roots
             .iter()
@@ -478,15 +441,6 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
             .insert(folder.clone(), identity);
         tracing::warn!(path = %folder.display(), "recreated missing server chats root");
         return Ok(true);
-    }
-    if layout_read().server_root_identities.contains_key(&folder) {
-        let marker = unresolved_marker_path(&folder).map_err(|error| error.to_string())?;
-        layout_write()
-            .unresolved_server_roots
-            .insert(marker.clone(), folder.clone());
-        reserved_folders()
-            .add(marker)
-            .map_err(|error| error.to_string())?;
     }
     Err(format!(
         "hidden chats root {} is missing. Refusing to run the command; restore the directory, or have an operator verify its contents are deleted and unregister it with the repair flow.",
@@ -539,9 +493,9 @@ impl Drop for HiddenFixtureGuard {
         layout
             .server_root_identities
             .retain(|root, _| !root.starts_with(&self.root));
-        layout.unresolved_server_roots.retain(|marker, root| {
-            !marker.starts_with(&self.root) && !root.starts_with(&self.root)
-        });
+        layout
+            .populated_server_roots
+            .retain(|root| !root.starts_with(&self.root));
         if layout
             .server_root
             .as_ref()
@@ -1114,10 +1068,7 @@ mod server_root_tests {
         // is the case under test and must reach the resolver.
         let reserved = reserved_folders();
         for folder in reserved.folders() {
-            let identity_marker = folder
-                .file_name()
-                .is_some_and(|name| name == ".octos-root-identity");
-            if !folder.exists() && !folder.starts_with(root) && !identity_marker {
+            if !folder.exists() && !folder.starts_with(root) {
                 reserved.remove(&folder);
             }
         }
@@ -1190,20 +1141,16 @@ mod server_root_tests {
             .join(chat.root.strip_prefix(&server_root).unwrap())
             .join("secret.txt");
         std::fs::rename(&server_root, &moved_root).unwrap();
-        let marker = unresolved_marker_path(&server_root).unwrap();
         reserved_folders()
             .resolve_missing_folder(&server_root, std::slice::from_ref(&work))
             .expect_err("a populated healed root must not be replaced by a fresh empty one");
         assert!(moved_secret.is_file());
-        assert!(reserved_folders().folders().contains(&marker));
+        assert!(reserved_folders().folders().contains(&server_root));
 
         std::fs::rename(&moved_root, &server_root).unwrap();
-        assert!(
-            !reserved_folders()
-                .resolve_missing_folder(&marker, std::slice::from_ref(&work))
-                .unwrap()
-        );
-        assert!(reserved_folders().folders().contains(&marker));
+        reserved_folders()
+            .resolve_existing_folder(&server_root, &server_root)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1246,7 +1193,6 @@ mod server_root_tests {
             .join(chat.root.strip_prefix(&server_root).unwrap())
             .join("secret.txt");
         std::fs::rename(&server_root, &moved_root).unwrap();
-        let marker = unresolved_marker_path(&server_root).unwrap();
         let unrelated = temp.path().join("unrelated-work");
         std::fs::create_dir_all(&unrelated).unwrap();
 
@@ -1268,7 +1214,6 @@ mod server_root_tests {
         assert!(!server_root.exists());
         assert!(moved_secret.is_file());
         assert!(reserved_folders().folders().contains(&server_root));
-        assert!(reserved_folders().folders().contains(&marker));
 
         std::fs::create_dir_all(&server_root).unwrap();
         let other_profile = temp.path().join("profiles/other/data");
@@ -1290,22 +1235,6 @@ mod server_root_tests {
         );
 
         let command_marker = unrelated.join("ran");
-        std::fs::create_dir_all(&marker).unwrap();
-        if let Some(output) = run_hidden_command(
-            &unrelated,
-            &format!("printf ran > \"{}\"", command_marker.display()),
-        )
-        .await
-        {
-            assert!(
-                !output.status.success(),
-                "status={:?} stdout={} stderr={}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::fs::remove_dir_all(&marker).unwrap();
         if let Some(output) = run_hidden_command(
             &unrelated,
             &format!("printf ran > \"{}\"", command_marker.display()),
@@ -1353,12 +1282,9 @@ mod server_root_tests {
         }
 
         std::fs::rename(&moved_root, &server_path).unwrap();
-        assert!(
-            !reserved_folders()
-                .resolve_missing_folder(&marker, &[temp.path().to_path_buf()])
-                .unwrap()
-        );
-        assert!(reserved_folders().folders().contains(&marker));
+        reserved_folders()
+            .resolve_existing_folder(&server_path, &server_path)
+            .unwrap();
         assert!(reserved_folders().folders().contains(&server_root));
         if let Some(output) = run_hidden_command(
             &unrelated,
