@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 const FIELD: &str = "source_copy_review";
 const ARCHIVE: &str = ".octos/source-copy-reviews";
@@ -200,11 +201,14 @@ fn reconcile(report: &Report, copy: &mut editable_copy::Copy) -> Result<Reconcil
 
 fn receipt(ctx: &Context, binding: &Value) -> Result<Value> {
     let sha = string(binding, "sha256")?;
+    let path = Path::new(string(binding, "path")?);
     ensure!(
-        binding["path"] == format!("{ARCHIVE}/{sha}.json"),
+        sha.len() == 64
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            && path == Path::new(ARCHIVE).join(format!("{sha}.json")),
         "expected a native source-copy receipt"
     );
-    let bytes = ctx.read(string(binding, "path")?)?;
+    let bytes = ctx.read(path)?;
     ensure!(fs::digest(&bytes) == sha, "source-copy receipt changed");
     let saved: Value = serde_json::from_slice(&bytes)?;
     ensure!(
