@@ -198,7 +198,7 @@ fn page_patch_binds_all_sources_but_checks_only_its_own_assets() {
     let sources = result["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 3);
     for path in ["paged.json", "pages/first.json", "pages/second.json"] {
-        assert!(sources.iter().any(|source| source["path"] == path));
+        assert!(sources.contains(&ctx.binding(path).unwrap()));
     }
     assert_eq!(ctx.read("paged.json").unwrap(), original);
     assert!(temp.path().join("out/first.json").exists());
