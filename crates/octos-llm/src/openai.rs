@@ -1392,20 +1392,31 @@ fn is_image_modality_error(body: &str) -> bool {
 }
 
 /// Whether an endpoint's refusal of image parts leaves this request nothing
-/// to fall back to: it carries an image its task requires
-/// ([`vision::is_required_input_snapshot`]). Sent again text-only, the model would
-/// do the task without that image while the task's report calls it
-/// delivered, so the request fails with the refusal instead.
+/// to fall back to: it is the request that brings the model an image its
+/// task requires ([`vision::is_required_input_snapshot`]) — no reply follows
+/// the message that carries it. Sent again text-only, the model would do the
+/// task without that image while the task's report calls it delivered, so
+/// the request fails with the refusal instead.
+///
+/// A required image further back, in a message the model has already
+/// answered, does not hold a later request to an endpoint that takes images:
+/// that request falls back like any other, and says in the message's own
+/// text that the image is not in it ([`vision::INPUT_IMAGE_WITHHELD`]).
 fn must_keep_its_images(messages: &[Message], hints: &ModelHints, body: &str) -> bool {
-    !hints.lacks_vision
-        && is_image_modality_error(body)
-        && messages.iter().any(|message| {
-            message.role == MessageRole::User
-                && message
-                    .media
-                    .iter()
-                    .any(|path| vision::is_required_input_snapshot(path))
-        })
+    if hints.lacks_vision || !is_image_modality_error(body) {
+        return false;
+    }
+    let unanswered = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::Assistant)
+        .map_or(0, |last_reply| last_reply + 1);
+    messages[unanswered..].iter().any(|message| {
+        message.role == MessageRole::User
+            && message
+                .media
+                .iter()
+                .any(|path| vision::is_required_input_snapshot(path))
+    })
 }
 
 /// Record the declared input images this request is about to be sent again
@@ -2260,6 +2271,28 @@ mod tests {
         assert_eq!(chats().await, 4);
         assert!(vision::take_input_image_dropped(&optional));
         assert!(!vision::take_input_image_dropped(&optional));
+
+        // The required image further back, in a message the model has
+        // answered: a later request is not held to it. It goes again
+        // text-only, and that message's own text says the image is not in it.
+        let mut first = msg_with_user_image();
+        first.content = format!("1. `page.png` — {} 1", vision::INPUT_IMAGE_DELIVERED);
+        first.media = vec![frozen(true)];
+        let later = [
+            first,
+            Message::assistant("reviewed"),
+            Message::user("now the next page"),
+        ];
+        let _ = provider.chat(&later, &[], &config).await;
+        assert_eq!(chats().await, 6);
+        let requests = server.received_requests().await.unwrap();
+        let resent = requests
+            .iter()
+            .rfind(|request| request.url.path() == "/chat/completions")
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .unwrap();
+        assert!(!resent.contains("image_url"), "{resent}");
+        assert!(resent.contains("NOT delivered (unsupported)"), "{resent}");
     }
 
     #[test]

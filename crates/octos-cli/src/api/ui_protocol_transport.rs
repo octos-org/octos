@@ -16966,6 +16966,9 @@ fn deliver_peer_send_input(
     // (distinct calls never collapse) and map the REAL delivery
     // status to the result: a durable-persist failure is an
     // error, not a false success ack; Queued/Duplicate are ok.
+    let unchecked = message_inputs
+        .as_ref()
+        .is_some_and(|inputs| !inputs.checked);
     default_agent_orchestrator()
         .enqueue_peer_send_input_continuation(
             &target,
@@ -16973,9 +16976,16 @@ fn deliver_peer_send_input(
             &slug,
             &peer_send_input_occurrence_id(origin_session, turn_id, &req.occurrence_id),
             &req.message,
-            message_inputs,
+            message_inputs.map(|inputs| inputs.encoded),
         )
         .into_callback_result(&slug)
+        .map(|delivery| match delivery {
+            // Say so when nothing looked at the files the message declares.
+            octos_agent::PeerSendInputDelivery::Queued if unchecked => {
+                octos_agent::PeerSendInputDelivery::QueuedUnchecked
+            }
+            delivery => delivery,
+        })
 }
 
 /// The wait of a `peer_send_input` call of `origin_session` (turn `turn_id`)
@@ -41482,6 +41492,8 @@ async fn run_standalone_turn(
     // They are read under this session's own reach and before the message is
     // committed, so the first model request of the task carries them and
     // every later one replays them.
+    // Where the prompt as asked ends and attached inputs begin, when any are.
+    let mut asked_len = None;
     if !skip_internal_user_persist && (opens_the_conversation || message_inputs.is_some()) {
         let authority = match request_agent.session_scope() {
             Some(scope) => crate::peers::first_inputs::PeerReadAuthority::Session(scope.clone()),
@@ -41511,6 +41523,7 @@ async fn run_standalone_turn(
         }
         prompt = first.content;
         turn_media_paths = first.media;
+        asked_len = Some(typed_len);
     }
     // task-turn-interrupt-steer-correlation-logs: every agent-side log line
     // (LLM calls, tool batches, steer drains, EndTurn rounds) inherits
@@ -41520,7 +41533,10 @@ async fn run_standalone_turn(
     // #2244 — snapshot the turn summary now that every prompt rewrite above
     // (STT transcription merge, voice-mode suffix) has landed; `prompt`
     // itself moves into the agent task below.
-    let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
+    // It is of what the turn was asked: the declared inputs attached above
+    // are files, and their text is not handed to a turn-end hook as a summary.
+    let turn_end_summary =
+        crate::session_actor::git_turn_summary(&prompt[..asked_len.unwrap_or(prompt.len())]);
     // UPCR-2026-034, the parallel person context with shared history: until
     // this turn's response reaches the transcript (at its end), the other
     // lane sees the text streamed so far and what it waits on. The request

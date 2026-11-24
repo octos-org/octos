@@ -250,6 +250,17 @@ async fn fixture(needs: Vec<Need>, context_window: Option<u32>) -> Fx {
             panic!("the freshly bootstrapped runtime has one owner");
         };
         runtime.llm = llm;
+        // A turn-end hook that keeps the payload it is handed.
+        #[cfg(unix)]
+        {
+            let keep = format!("cat > '{}'", data_dir.join(TURN_END_PAYLOAD).display());
+            let hook: octos_agent::HookConfig = serde_json::from_value(json!({
+                "event": "on_turn_end",
+                "command": ["sh", "-c", keep],
+            }))
+            .unwrap();
+            runtime.hook_executor = Some(Arc::new(octos_agent::HookExecutor::new(vec![hook])));
+        }
         Arc::new(runtime)
     };
     let mut state = AppState::empty_for_tests();
@@ -279,6 +290,9 @@ async fn fixture(needs: Vec<Need>, context_window: Option<u32>) -> Fx {
     }
 }
 
+/// Where the fixture's turn-end hook leaves its payload, under the data dir.
+const TURN_END_PAYLOAD: &str = "turn-end.json";
+
 fn write(root: &Path, name: &str, bytes: impl AsRef<[u8]>) {
     let file = root.join(name);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -299,6 +313,17 @@ async fn hand_off(
     name: &str,
     inputs: Option<Value>,
 ) -> (octos_agent::ToolResult, Option<PeerStagedEvent>) {
+    hand_off_into(fx, name, inputs, false).await
+}
+
+/// [`hand_off`], to a peer that works in the master's directory or, `fenced`,
+/// in a git worktree of its own.
+async fn hand_off_into(
+    fx: &Fx,
+    name: &str,
+    inputs: Option<Value>,
+    fenced: bool,
+) -> (octos_agent::ToolResult, Option<PeerStagedEvent>) {
     let staged: Arc<std::sync::Mutex<Vec<PeerStagedEvent>>> = Arc::default();
     let seen = staged.clone();
     let stage = crate::peers::build_peer_handoff_callback(
@@ -313,7 +338,7 @@ async fn hand_off(
         Arc::new(AtomicU32::new(0)),
         Arc::new(move |event| seen.lock().unwrap().push(event)),
     );
-    let mut args = json!({ "name": name, "brief": BRIEF, "worktree": false });
+    let mut args = json!({ "name": name, "brief": BRIEF, "worktree": fenced });
     if let Some(inputs) = inputs {
         args["inputs"] = inputs;
     }
@@ -527,6 +552,56 @@ async fn should_refuse_the_handoff_when_a_required_input_is_missing() {
     assert!(sent(&fx.server).await.is_empty());
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A fenced peer works in its own git worktree, which holds what is
+/// committed. The master's directory also holds the uncommitted rendering,
+/// and what the master can read there says nothing of what the peer will find.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_refuse_a_fenced_handoff_whose_required_input_is_not_committed() {
+    let fx = fixture(Vec::new(), None).await;
+    write(&fx.workspace, "pages/page-03.json", PAGE_DATA);
+    git(&fx.workspace, &["init", "-q"]);
+    git(&fx.workspace, &["add", "pages"]);
+    git(&fx.workspace, &["commit", "-q", "-m", "page data"]);
+    write(&fx.workspace, "renders/page-03.png", PAGE_IMAGE);
+
+    let (result, peer) = hand_off_into(
+        &fx,
+        "Page Fenced",
+        Some(json!(["pages/page-03.json", "renders/page-03.png"])),
+        true,
+    )
+    .await;
+
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result
+            .output
+            .contains("`renders/page-03.png`: NOT ready (required, missing)"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("holds only committed files"),
+        "{}",
+        result.output
+    );
+    assert!(peer.is_none(), "no client was told to open a peer");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_tell_the_peer_nothing_was_delivered_when_a_required_input_changed_or_went() {
     let fx = fixture(Vec::new(), None).await;
@@ -737,21 +812,24 @@ async fn send_input(
     message: &str,
     inputs: Value,
 ) -> octos_agent::ToolResult {
+    let workspace = fx.workspace.clone();
+    let scope = octos_core::SessionScope::solo(workspace, Vec::new()).expect("test scope");
+    send_input_to(fx, peer, message, inputs, Some(Arc::new(scope))).await
+}
+
+/// [`send_input`], with the peer's session live (`scope` is its reach) or not.
+async fn send_input_to(
+    fx: &Fx,
+    peer: &PeerStagedEvent,
+    message: &str,
+    inputs: Value,
+    scope: Option<Arc<octos_core::SessionScope>>,
+) -> octos_agent::ToolResult {
     let peers_root = fx.data_dir.join("peers");
     let origin = fx.master.to_string();
     let turn = TurnId::new();
-    let workspace = fx.workspace.clone();
-    let scope =
-        Arc::new(octos_core::SessionScope::solo(workspace, Vec::new()).expect("test scope"));
     let tool = octos_agent::PeerSendInputTool::new(Arc::new(move |request| {
-        deliver_peer_send_input(
-            "dev",
-            &peers_root,
-            &origin,
-            &turn,
-            request,
-            Some(scope.clone()),
-        )
+        deliver_peer_send_input("dev", &peers_root, &origin, &turn, request, scope.clone())
     }));
     tool.execute(&json!({ "slug": peer.slug, "message": message, "inputs": inputs }))
         .await
@@ -929,6 +1007,63 @@ async fn should_refuse_a_message_whose_required_input_is_missing_and_tell_the_pe
 
 /// From here on the endpoint behind `server` takes no image parts: a request
 /// with one is refused, as a text-only proxy in front of a vision model does.
+/// With the peer's session not live, nothing looks at the files a message
+/// declares, and the sender is not left believing something did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_tell_the_sender_when_a_messages_inputs_were_not_checked() {
+    let fx = fixture(page_needs(), None).await;
+    let (peer, _session) = drafted(&fx, "Page Unchecked").await;
+
+    let sent = send_input_to(&fx, &peer, REPAIR, json!(["review/not-written.md"]), None).await;
+
+    assert!(sent.success, "{}", sent.output);
+    assert!(
+        sent.output
+            .contains("Its 1 declared input(s) were NOT checked here"),
+        "{}",
+        sent.output
+    );
+    assert!(!sent.output.contains("missing"), "{}", sent.output);
+}
+
+/// The summary a turn-end hook is handed is of what the turn was asked. The
+/// files attached to that message went to the model, not into the summary.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_summarize_a_turn_for_its_end_hook_by_what_it_was_asked_not_by_its_inputs() {
+    let fx = fixture(page_needs(), None).await;
+    page_workspace(&fx);
+    let (result, peer) = hand_off(
+        &fx,
+        "Page Hooked",
+        Some(json!(["pages/page-03.json", "renders/page-03.png"])),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+
+    peer_turn(&fx, &peer.unwrap(), BRIEF).await;
+
+    let kept = fx.data_dir.join(TURN_END_PAYLOAD);
+    let deadline = std::time::Instant::now() + TURN_BUDGET;
+    let payload = loop {
+        let read = std::fs::read_to_string(&kept).ok();
+        if let Some(payload) = read.and_then(|body| serde_json::from_str::<Value>(&body).ok()) {
+            break payload;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no turn-end hook payload"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let summary = payload["turn_summary"].as_str().unwrap();
+    assert!(summary.starts_with("Review slide 3"), "{summary}");
+    assert!(!summary.contains("Task inputs"), "{summary}");
+    assert!(!summary.contains("Roadmap"), "{summary}");
+    // The request itself carried the page data.
+    assert!(request_text(&sent(&fx.server).await[0]).contains(PAGE_DATA));
+}
+
 async fn refusing_images(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))

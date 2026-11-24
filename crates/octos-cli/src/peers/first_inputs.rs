@@ -73,17 +73,40 @@ pub(crate) fn check_for_message(
     peer_dir: &Path,
     inputs: &[DeclaredInput],
     session_scope: Option<&SessionScope>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<MessageInputs>, String> {
     if inputs.is_empty() {
         return Ok(None);
     }
+    let mut checked = false;
     if let Some((cwd, fenced)) = working_dir(peer_dir) {
         check_in_working_dir(&cwd, fenced, inputs, session_scope)
             .map_err(|why| format!("input not sent: {why}"))?;
+        checked = session_scope.is_some();
     }
     serde_json::to_string(inputs)
-        .map(Some)
+        .map(|encoded| Some(MessageInputs { encoded, checked }))
         .map_err(|err| format!("failed to encode the declared inputs: {err}"))
+}
+
+/// A message's declaration, ready for the queue that carries the message.
+#[derive(Debug)]
+pub(crate) struct MessageInputs {
+    pub(crate) encoded: String,
+    /// Whether the files were looked at when the message was sent. They are
+    /// not when the peer's session is not live, or the peer has no recorded
+    /// working directory: the sender is then told only that the peer's turn
+    /// decides.
+    pub(crate) checked: bool,
+}
+
+/// A session's own reach, as the `read_file` it was given has it: under a
+/// host scope that tool is confined to the workspace and shows no images.
+fn session_authority(scope: &SessionScope) -> InputAuthority<'_> {
+    if crate::runtime::host_scope::active() {
+        InputAuthority::ConfinedSession(scope)
+    } else {
+        InputAuthority::Session(scope)
+    }
 }
 
 /// Where a staged peer works, and whether that is its own git worktree.
@@ -108,7 +131,20 @@ fn check_in_working_dir(
     let Some(scope) = session_scope else {
         return Ok(deferred_report(inputs));
     };
-    let report = check_declared_inputs(inputs, InputAuthority::Session(scope));
+    // The scope is that of a session working in `cwd` — the peer's own, or a
+    // master's whose peer shares its directory — or of a master whose peer
+    // works elsewhere, in a git worktree of its own. There the master's reach
+    // says what it may ask about, and the peer's directory what is there.
+    let authority = if scope.workspace() == cwd {
+        session_authority(scope)
+    } else {
+        InputAuthority::WorkingDir {
+            base_dir: cwd,
+            asker: scope,
+            asker_confined: crate::runtime::host_scope::active(),
+        }
+    };
+    let report = check_declared_inputs(inputs, authority);
     if report
         .undelivered_required()
         .any(|record| !left_to_the_peers_reach(&record.outcome))
@@ -309,7 +345,7 @@ pub(crate) async fn attach_to_message(
     let accepts_images = llm.accepts_image_input();
     let resolved = tokio::task::spawn_blocking(move || {
         let authority = match &authority {
-            PeerReadAuthority::Session(scope) => InputAuthority::Session(scope),
+            PeerReadAuthority::Session(scope) => session_authority(scope),
             PeerReadAuthority::Filesystem { base_dir, scope } => InputAuthority::Filesystem {
                 base_dir,
                 scope: *scope,
@@ -556,7 +592,8 @@ mod tests {
 
         let encoded = check_for_message(&peer_dir, &[input], Some(&scope))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .encoded;
 
         assert!(!encoded.contains("hidden chat secret"), "{encoded}");
         assert!(
