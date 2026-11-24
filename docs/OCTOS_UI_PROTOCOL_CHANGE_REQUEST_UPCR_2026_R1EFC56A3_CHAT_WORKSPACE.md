@@ -100,9 +100,10 @@ A connection that does not request it sees byte-identical replies.
     wrapped, only a server-level root known to be empty may be repaired, and
     only when this command's workspace/read roots cannot reach it; it is
     recreated privately and hidden. Once the root can hold a chat, its
-    directory identity is recorded and validated on every command wrap, so a
-    renamed or replaced root keeps commands refused until the original
-    directory is restored. A legacy root always keeps the command refused
+    directory identity is recorded and validated on every command wrap, using
+    the registered path as the lookup key; a symlink or replacement directory
+    keeps commands refused until the original directory is restored. A legacy
+    root always keeps the command refused
     because the folder may have been renamed into the command's reach. Restore
     it, or have an operator verify deletion and unregister it with the repair
     flow. Without a sandbox (`sandbox.enabled = false`,

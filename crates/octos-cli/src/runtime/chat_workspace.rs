@@ -383,7 +383,18 @@ pub(crate) fn install_missing_root_healer() {
 }
 
 fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> {
-    let folder = canonical_dir(folder);
+    // The registered path is the lookup key; `resolved` only describes the
+    // object currently found there.
+    let folder = folder.to_path_buf();
+    if std::fs::symlink_metadata(&folder)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "hidden chats path {} is a symlink replacement",
+            folder.display()
+        ));
+    }
     if layout_read().unresolved_server_roots.contains_key(&folder) {
         return Err(format!(
             "server chats identity marker {} must stay absent",
@@ -414,7 +425,9 @@ fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> 
 }
 
 fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool, String> {
-    let folder = canonical_dir(folder);
+    // The registered path is the lookup key; canonicalizing here would resolve
+    // a symlink replacement before the ownership map can identify it.
+    let folder = folder.to_path_buf();
     let marker_root = layout_read().unresolved_server_roots.get(&folder).cloned();
     if let Some(root) = marker_root {
         let expected = layout_read().server_root_identities.get(&root).cloned();
@@ -1294,7 +1307,37 @@ mod server_root_tests {
         }
         std::fs::remove_dir_all(&server_root).unwrap();
 
-        std::fs::rename(&moved_root, &server_root).unwrap();
+        let server_path: PathBuf = server_root.components().collect();
+        #[cfg(unix)]
+        {
+            assert!(moved_root.is_dir());
+            assert!(server_path.parent().unwrap().is_dir());
+            std::fs::create_dir_all(server_path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&moved_root, &server_path).unwrap_or_else(|error| {
+                panic!(
+                    "symlink {} -> {} failed: {error}",
+                    moved_root.display(),
+                    server_path.display()
+                )
+            });
+            if let Some(output) = run_hidden_command(
+                &unrelated,
+                &format!("printf ran > \"{}\"", command_marker.display()),
+            )
+            .await
+            {
+                assert!(
+                    !output.status.success(),
+                    "status={:?} stdout={} stderr={}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::fs::remove_file(&server_path).unwrap();
+        }
+
+        std::fs::rename(&moved_root, &server_path).unwrap();
         assert!(
             !reserved_folders()
                 .resolve_missing_folder(&marker, &[temp.path().to_path_buf()])
