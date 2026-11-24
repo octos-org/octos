@@ -1,5 +1,12 @@
 # Repair image-to-editable reconstruction failures
 
+For a source-image reconstruction, pass the registered OCR observations to the native
+builder on every repair. Keep the design hash, canvas, occurrence ID, line text and full
+polygon together. The runtime can discover a matching `ocr.json` beside the page or
+accept the bound page field `source_ocr`. Preserve the measured position of each word;
+the visual reader resolves its meaning, notices omissions and flags faulty detections.
+Check the build receipt's `ocr_placement` and the rendered page after a proposed move.
+
 Use this procedure when designed source images are readable but native conversion loses labels, moves copy into another object, or overflows retained artwork. Continue with the producer's own source and design; this reference supplies no page layout or supervisor approval gate.
 
 ## Reconcile occurrences, not just strings
@@ -40,3 +47,5 @@ Before dismissing a missing native label as retained raster text, inspect the ac
 When comparing the original and final render, check visible strokes even when the exact words are uncertain. Record whether each disputed region is missing, retained in artwork, or reproduced by native text. For slanted lettering inspect both the baseline direction and the glyph inclination in enlarged paired views. Match each editable label to the actual PPTX object. A scoped repair closes its named findings; sign the whole page only after checking the remaining source details.
 
 Retain generation/render receipts and old candidates. Every changed render uses a fresh job ID and output directory; do not delete old receipts or outputs to force an ID to rerun, including in recovery instructions. Bind the final artifact and review evidence to its hashes. Finish independently when the concrete repairs and full affected-page review are complete.
+
+Register every observed text line on the original via the Rust `source_lines` tool before drafting. Reconcile a second reader's additions with `additional_lines` on the same original. Carry the returned `source_line_ids` into editable objects. Keep them through copy corrections, object renames and splits. Review the list starting from the original, including observations that have no editable counterpart. An independent reviewer compares each region against the current rendered page. Use `source_line_coverage.pending_ids` to assign repairs by their original IDs.

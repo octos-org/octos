@@ -9,6 +9,27 @@ an image generator or another task scheduler. Use the existing image-generation 
 and peer sessions selected for the task. Read the returned PNG files with the host's
 image-capable `read_file` tool; paths alone are not visual review.
 
+For the full-deck one-maker-per-page workflow, read [page-first admission](references/page-first.md).
+For new separable decks, give each page its own maker and independent reviewer. Use each executing session’s exact identity. When staging returns only a slug or queue key, put a lightweight doctor call (`check_renderer:false`) in the initial peer briefs and collect `continuation.host_identity` replies in parallel. Freeze their version 2 plan with `evidence_init` using `verification_mode:"per_page"`. Every page owns its art, render, repair and final visual verdict before compilation.
+The coordinator dispatches unresolved scoring and capability questions to Octos
+peers through [page dispatch](references/page-dispatch.md). The original
+reviewer retains the verdict and the quality gate remains in force.
+The coordinator declares the complete task-local plan before production. `page_gate`
+reports bound per-page review readiness; `build`/`cycle` and `batch` then refuse
+multi-page output until the active plan passes. This checks evidence and ownership
+declarations, not whether real peers ran or whether a model's visual score is correct.
+
+`page_publish` derives the assigned candidate manifest from a current one-page
+cycle and native render receipts. A one-page `cycle` accepts
+`publish_candidate:true` to do this in the same call. Existing post-build edits
+require the actual `artifact`, `render_receipt` and ordered native `receipts`;
+do not silently publish the pre-repair PPTX. Publication emits review handoff
+data. Use `freeze_inputs:true` to keep the published page's root and
+source immutable. Reviewers submit their own judgment and actual evidence with
+`page_review_submit` using the exact candidate ID. See
+[page verdict](references/page-verdict.md). The host uses its existing
+peer queue to route the fresh candidate to its independent reviewer.
+
 Choose local text targets and same-role sizes from the artwork before fitting.
 `patch` merges partial `set.format` values by default and reports effective
 before/after formatting; use explicit `format_mode:"replace"` to reset overrides.
@@ -16,6 +37,20 @@ before/after formatting; use explicit `format_mode:"replace"` to reset overrides
 retains the canonical copy, and validates complete non-overlapping `copy_range`
 coverage. It cannot replace a written symbol with a claimed raster equivalent.
 See the production skill's `references/rust-runtime.md` for these schemas.
+
+Stage approved text on the page row as `editable_copy`, mapping each occurrence ID to its text. On publication the independent reviewer compares the reconstruction with its original and records any material discrepancies against that candidate. A draft cycle lists all missing native occurrences in `missing_editable_copy`. Restore them before sending the page for review.
+
+When preparation identifies local illustrations to retain, bind its reference,
+preparation and text measurements once on the coordinator's page assignment.
+The runtime picks up bound `preparation` and `measurements` job inputs alongside
+the reference, or an explicit `source_artwork` handoff. Build and cycle inherit those regions even when the maker omits
+them. Consecutive `text.fitSingleLine` operations report conflicting font floors
+together with the affected shape names and native point sizes.
+
+For a single-page PPTX, `batch` accepts `shape.matchStroke`, `text.fitSingleLine`
+and `shape.replaceWithLayout`. Use these when the reference stroke, legal text box
+or replacement layout is known. The runtime chooses the physical edits and
+returns their results. See `help` with `topic:"batch"` for the parameter names.
 
 `cycle` also emits native QA for every text object. `evidence_record` independently
 remeasures the actual PPTX and cannot clear machine failures through model
@@ -37,7 +72,7 @@ matched before/current contextual crops for changed objects, and the persistent,
 new and no-longer-detected mechanical findings. The report never labels a blank
 as a design reference. Read the images using the host's image-capable tool and
 give the pack to the existing independent peer; generating it is not inspection.
-`pages` optionally limits an intermediate check; final review must cover all pages.
+`pages` / `page_numbers` selects a page batch. Unscoped multi-page requests return a lightweight plan without crops. Submit the page reviews, then use `review_merge` to combine their attested evidence before `evidence_record`; final review must cover all pages. See [review lifecycle](references/review-lifecycle.md).
 Changed acceptance targets or measurement criteria cannot count as repaired defects.
 
 `review_pack` also produces a detector-independent inventory of **every** text
@@ -203,3 +238,7 @@ and binds their image bytes into the checked cycle. Use this path for supported
 local repairs instead of post-build insertion/reordering. It does not approve
 texture seams, erase glyphs automatically, or make raster text editable. Schemas
 are in the production skill's native-builder and rust-runtime references.
+
+For a deck assembled from accepted page artifacts, use the [assembled delivery review](references/assembled-delivery.md). With per-page delivery the coordinator supplies the assembly receipt and QA path to `evidence_assembled`. An explicitly requested independent whole-deck review uses the separate rendered-deck procedure.
+
+For reconstruction from an original image, use `source_lines` before making the first spec. Keep the returned source IDs on editable objects, repair by the same IDs, and complete the independent per-line review on the actual candidate. See `references/placement.md` and `references/review-lifecycle.md`.

@@ -8,7 +8,7 @@
   "tools": [
     {
       "name": "pptx_tool",
-      "description": "Build/edit editable PPTX, render PNG, inspect layout, enforce native QA gates, propose text fit, localize text with OCR (macOS), compare/crop images and record review evidence. No Python, Node or LibreOffice. Read the pptx skill for schemas; action=help lists operations. Outputs are workspace files. Read returned PNGs with read_file to review their pixels; success does not approve design. Use operations to combine crop/OCR/patch/cycle steps in one call; explicit images and review_view return pixels directly to the model. Stops on first failed step; no automatic quality approval.",
+      "description": "Build/edit editable PPTX, render PNG, inspect layout, enforce native QA gates, propose text fit, localize text with OCR (macOS), compare/crop images and record review evidence. No Python, Node or LibreOffice. Read the pptx skill for schemas; action=help lists operations. Outputs are workspace files. Read returned PNGs with read_file to review their pixels; success does not approve design. Use operations to combine crop/OCR/patch/cycle steps in one call; explicit images and review_view return pixels directly to the model. Stops on first failed step; no automatic quality approval. page_gate returns per-page work_stage; page_dispatch checks declared ready-work coverage and serial reviewer queues without scheduling or grading.",
       "concurrency_class": "exclusive",
       "input_schema": {
         "type": "object",
@@ -16,17 +16,34 @@
           "action"
         ],
         "properties": {
+          "design": {"type":"string","description":"Original image for source_lines intake"},
+          "ocr": {"type":"string","description":"Source OCR file for source_lines intake"},
+          "additional_lines": {"type":"array","items":{"type":"object"},"description":"Extra lines observed on the original in OCR canvas coordinates"},
           "action": {
             "type": "string",
             "enum": [
+              "source_lines",
               "help",
               "doctor",
+              "page_gate",
+              "page_progress",
+              "page_assemble",
+              "assembly_review_submit",
+              "evidence_assembled",
+              "source_copy_review",
+              "page_assignments",
+              "page_dispatch",
+              "page_publish",
+              "page_review_submit",
+              "page_repair_decide",
               "build",
               "cycle",
               "render",
               "inspect",
               "review_pack",
+              "review_preview",
               "review_submit",
+              "review_merge",
               "fit",
               "layout_search",
               "layout_region",
@@ -41,6 +58,7 @@
               "geometry",
               "evidence_init",
               "evidence_record",
+              "evidence_blocked",
               "evidence_status",
               "ocr",
               "raster_overlap",
@@ -56,6 +74,25 @@
           "spec": {
             "type": "string"
           },
+          "repair_review": {
+            "type": "object",
+            "required": ["path", "sha256"],
+            "properties": {"path":{"type":"string"},"sha256":{"type":"string"}},
+            "additionalProperties": false,
+            "description": "page_assemble: previous independently submitted failing final verdict binding for a coordinator to replace its reviewed deck and renders after approved page repairs."
+          },
+          "assembly": {
+            "type": "string",
+            "description": "assembly_review_submit or per_page evidence_assembled: persisted native page_assemble receipt path for the delivered PPTX."
+          },
+          "report": {
+            "type": "string",
+            "description": "Independent reviewer report path for source_copy_review or assembly_review_submit."
+          },
+          "qa": {
+            "type": "string",
+            "description": "evidence_assembled: delivery path for the runtime's combined package and independent QA JSON."
+          },
           "input": {
             "type": "string"
           },
@@ -64,6 +101,70 @@
           },
           "page": {
             "type": "string"
+          },
+          "check_renderer": {"type":"boolean","description":"doctor: exercise picture scaling and check the rendered pixels."},
+          "probe_fixture_output": {"type":"string","description":"doctor: write the synthetic probe PPTX to a new workspace path."},
+          "probe_render_receipt": {"type":"string","description":"doctor: check an existing same-engine render of the probe at width 320."},
+          "refresh_render_only": {"type":"boolean","description":"page_publish: assigned v2 reviewer changes only the preview of the exact existing candidate; supply page, candidate_id and render_receipt."},
+          "resume_after_round": {"type":"integer","minimum":1,"maximum":4294967295,"description":"page_assignments with only_page: resume the required owner after its specified terminal peer round ended with work still unfinished. The host verifies the current terminal record. Replays of that round are deduplicated."},
+          "only_page": {"type":"string","description":"page_gate: validate only this page and its bound evidence. This query makes no deck-wide assembly decision."},
+          "stage_repair_render": {"type":"boolean","description":"page_assemble with repair_review: stage an independently authorized repair for rendering with the approved DeckCraft deployment before promotion."},
+          "template_output": {"type":"string","description":"assembly_review_submit: write an unanswered, source-bound observations template to a new non-delivery JSON path. Supply assembly and render_receipt. Omit observations, report and output until submitting."},
+          "freeze_inputs": {
+            "type": "boolean",
+            "description": "build or cycle: the assigned maker freezes its resolved one-page and root JSON before building, including when rendering and publication occur later."
+          },
+          "candidate_id": {
+            "type": "string",
+            "description": "page_review_submit: opaque identifier from the exact page publication the reviewer inspected."
+          },
+          "verdict_id": {"type":"string","description":"page_repair_decide: exact signed verdict under independent arbitration."},
+          "decision": {"type":"string","enum":["confirm","dispute"]},
+          "finding_observations": {"type":"object","additionalProperties":{"type":"string"},"description":"page_repair_decide: independent observations at presentation scale, keyed by each manual finding ID."},
+          "replaces_verdict_id": {
+            "type": "string",
+            "description": "page_review_submit: current verdict identifier when revising an existing native verdict."
+          },
+          "blocked_report": {
+            "type": "string",
+            "description": "page_review_submit: bind a finished specialist report to the existing rejected verdict using candidate_id and replaces_verdict_id. Omit verdict."
+          },
+          "verdict": {
+            "type": "object",
+            "description": "Independent decision for page_review_submit. Fill the review_request_template from the candidate handoff or page_gate(only_page). Put per_page delivery_checks inside verdict and include your actual evidence.",
+            "required": ["accepted", "score", "critical_defects", "open_required_findings", "evidence"],
+            "properties": {
+              "accepted": {"type": "boolean"},
+              "score": {"type": "number", "minimum": 0, "maximum": 100},
+              "critical_defects": {"type": "array"},
+              "open_required_findings": {"type": "array", "description": "For a requirement involving known editable text IDs and exact source wording, include native_text mapping each stable ID to its expected string."},
+              "evidence": {"type": "array", "minItems": 1},
+              "component_scores": {"type": "object"},
+              "source_detail_review": {
+                "type": "object",
+                "description": "For image reconstruction, complete the source regions in the review template. Record glyph inclination separately from baseline tilt, retain earlier findings and bind the original and current render.",
+                "properties": {
+                  "scope": {"type": ["string", "null"], "enum": ["local", "whole_page", null]},
+                  "regions": {"type": "object"},
+                  "resolved_findings": {"type": "object"}
+                }
+              },
+              "delivery_checks": {
+                "type": "object",
+                "description": "Required for accepted per_page verdicts. Include all four keys: copy, artwork, readability, editability. Each must have status equal to the string pass and basis containing the specific evidence observed for this page.",
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "status": {"type": "string"},
+                    "basis": {"type": "string", "description": "What you actually observed in the reviewed page."}
+                  }
+                }
+              }
+            }
+          },
+          "output_page": {
+            "type": "string",
+            "description": "patch: emit only this page's source JSON at output. Every edit and artwork update must target this page. All source JSON is bound and structurally validated; only the selected page's assets are checked. Assemble the page into a root spec and run a full build to check every page's assets."
           },
           "width": {
             "type": "integer",
@@ -79,7 +180,7 @@
           },
           "observations": {
             "type": "string",
-            "description": "review_submit: authored JSON containing review_id and object_reviews. Rust binds hashes without changing judgments."
+            "description": "review_submit: review_id and object_reviews JSON path. For assembly_review_submit: independent per-page final observations JSON path; help topic assembly_review_submit gives the schema."
           },
           "previous_cycle": {
             "type": "string",
@@ -90,7 +191,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Optional source page IDs for an intermediate review_pack. Omit for all pages."
+            "description": "review_pack: select source page IDs. Omit on a multi-page cycle to get a lightweight plan of per-page requests; final review must cover every page."
           },
           "page_numbers": {
             "type": "array",
@@ -263,6 +364,10 @@
               "type": "object"
             }
           },
+          "guarded_text_edits": {
+            "type": "boolean",
+            "description": "batch: refuse text.set and require a slide text.find match in text.replace.at. This guards common scope/formatting mistakes; it does not certify formatting or package preservation."
+          },
           "expected_sha256": {
             "type": "string"
           },
@@ -310,6 +415,20 @@
             "minimum": 0,
             "maximum": 8,
             "description": "Pixel neighborhood tolerance for background-subtracted compare; not a quality threshold."
+          },
+          "regions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "description": "For compare: measure multiple named rectangles in the original before and after images in one call, with a common origin and scale. Returns RGB means and absolute errors. Can save a JSON receipt.",
+            "items": {
+              "type": "object",
+              "required": ["id", "box"],
+              "properties": {
+                "id": {"type": "string"},
+                "box": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "integer", "minimum": 0}, "description": "x, y, width, height in source pixels"}
+              }
+            }
           },
           "threshold": {
             "type": "integer"
@@ -375,15 +494,16 @@
           },
           "previous_review": {
             "type": "string",
-            "description": "review_pack: prior bound review with previous_cycle. Rust reuses only identical local pixels and unchanged neighboring declarations."
+            "description": "assembly_review_submit: previous verdict SHA-256 when revising an existing verdict. review_pack: prior bound review with previous_cycle. Rust reuses only identical local pixels and unchanged neighboring declarations."
           },
           "verification_mode": {
             "type": "string",
             "enum": [
               "strict",
-              "independent_visual"
+              "independent_visual",
+              "per_page"
             ],
-            "description": "evidence_init only. Freeze before work; default strict. Independent route retains unknown measurements and requires a different host reviewer."
+            "description": "evidence_init only. A version 2 plan with multiple pages defaults to per_page and requires a distinct independent reviewer_session for every page. Other tasks default to strict. Page verdicts in per_page mode are final before compilation. independent_visual uses a designated whole-deck reviewer."
           },
           "reviewer_agent": {
             "type": "string",
@@ -391,7 +511,7 @@
           },
           "arbiter_agent": {
             "type": "string",
-            "description": "evidence_init with independent_visual: optional frozen third-session identity, distinct from Maker and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. Cannot be added after work starts."
+            "description": "evidence_init with independent_visual: optional frozen session identity, distinct from the policy owner and Reviewer, allowed to adjudicate a registered fidelity false positive using current bound evidence. In a shared page fleet the coordinator is the policy owner and cannot also be arbiter. Cannot be added after work starts."
           },
           "findings": {
             "type": "array",
@@ -403,13 +523,27 @@
           "topic": {
             "type": "string",
             "enum": [
+              "page_gate",
+              "page_progress",
+              "page_assemble",
+              "assembly_review_submit",
+              "evidence_assembled",
+              "page_review_submit",
+              "page_repair_decide",
+              "source_copy_review",
+              "page_assignments",
+              "page_dispatch",
               "evidence_record",
               "review",
+              "review_preview",
               "finding_register",
               "review_pack",
-              "review_submit"
+              "review_submit",
+              "patch",
+              "batch",
+              "review_merge"
             ],
-            "description": "action=help: request focused evidence or review documentation without unrelated builder schemas."
+            "description": "action=help: request focused evidence/review documentation or patch/batch capability information."
           },
           "steps": {
             "type": "array",
@@ -446,7 +580,25 @@
           "artwork_layers": {
             "type": "array",
             "description": "patch: rows {page,layers} replace the complete local raster-layer array on selected pages. Each layer has id,image,box,optional rotation,basis; painted above background and below editable text. Relative images use the source spec directory. Included in the same checked cycle.",
-            "items": {"type":"object","required":["page","layers"],"properties":{"page":{"type":"string"},"layers":{"type":"array","items":{"type":"object"}}},"additionalProperties":false}
+            "items": {
+              "type": "object",
+              "required": [
+                "page",
+                "layers"
+              ],
+              "properties": {
+                "page": {
+                  "type": "string"
+                },
+                "layers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
           },
           "reuse": {
             "type": "object",
@@ -455,6 +607,121 @@
               "sha256"
             ],
             "description": "crop: verified prior receipt binding; reuse only matching input bytes, algorithm and viewport. No visual verdict is reused."
+          },
+          "reviews": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 512,
+            "items": {
+              "type": "string"
+            },
+            "description": "review_merge: direct, bound review_submit output paths for this exact cycle. Independent provenance is revalidated; conflicting observations are rejected."
+          },
+          "all_pages": {
+            "type": "boolean",
+            "description": "review_pack: explicitly opt into one combined pack. By default an unscoped multi-page cycle returns a lightweight page request plan without generating crops."
+          },
+          "publish_candidate": {
+            "type": "boolean",
+            "description": "cycle: atomically publish the current one-page native candidate for its declared maker; no quality approval or peer notification."
+          },
+          "artifact": {
+            "type": "string",
+            "description": "page_publish: preserve this actual post-build PPTX, backed by native receipts and its render."
+          },
+          "render_receipt": {
+            "type": "string",
+            "description": "page_publish: native render receipt for the actual current PPTX."
+          },
+          "receipts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "page_publish: ordered native post-build receipt paths; not model-authored approval claims."
+          },
+          "assignments": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "page",
+                "phase",
+                "peer",
+                "state"
+              ],
+              "properties": {
+                "page": {
+                  "type": "string"
+                },
+                "phase": {
+                  "type": "string",
+                  "enum": [
+                    "make",
+                    "review",
+                    "repair",
+                    "arbitrate",
+                    "diagnose"
+                  ]
+                },
+                "peer": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "running",
+                    "queued",
+                    "waiting"
+                  ]
+                },
+                "candidate_sha256": {
+                  "type": "string"
+                },
+                "dependency": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "page_dispatch: coordinator-declared peer jobs. All phases after make require the current candidate SHA-256 for active coverage. Arbitration and technical diagnosis are dispatchable peer work."
+          },
+          "peers": {
+            "type": "array",
+            "maxItems": 1024,
+            "items": {
+              "type": "object",
+              "required": [
+                "peer",
+                "state"
+              ],
+              "properties": {
+                "peer": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "idle",
+                    "running",
+                    "queued",
+                    "unknown",
+                    "unavailable"
+                  ]
+                },
+                "authorized": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "attached": {
+                  "type": "boolean",
+                  "default": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "description": "page_dispatch: coordinator-declared current peer availability; preserve unknown. Neither this input nor output is host-verified execution evidence."
           }
         }
       },

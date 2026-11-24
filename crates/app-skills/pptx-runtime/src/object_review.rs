@@ -37,6 +37,19 @@ pub fn attach_relations(ctx: &Context, template: &mut Value, binding: &Value) ->
             && report["cycle"]["sha256"] == template["cycle_sha256"],
         "stale relation report"
     );
+    // Page-selected packs can be signed separately and merged without duplicate lines.
+    if let Some(rows) = template
+        .get_mut("source_line_reviews")
+        .and_then(Value::as_array_mut)
+    {
+        let pages: BTreeSet<_> = report["pages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["page"].as_str())
+            .collect();
+        rows.retain(|r| r["page"].as_str().is_some_and(|p| pages.contains(p)));
+    }
     let signals: Vec<Value> = report["pages"]
         .as_array()
         .into_iter()
@@ -67,15 +80,36 @@ pub fn attach_comparisons(
     spec: &Spec,
     binding: &Value,
 ) -> Result<()> {
+    attach_comparisons_scoped(ctx, template, cycle, spec, binding, None)
+}
+
+pub fn attach_comparisons_scoped(
+    ctx: &Context,
+    template: &mut Value,
+    cycle: &Value,
+    spec: &Spec,
+    binding: &Value,
+    pages: Option<&BTreeSet<String>>,
+) -> Result<()> {
     let path = ctx.verify(binding)?;
-    crate::comparison_review::assess(ctx, cycle, spec, &json!({}), &json!({}), path.to_str())?;
+    crate::comparison_review::assess_scoped(
+        ctx,
+        cycle,
+        spec,
+        &json!({}),
+        &json!({}),
+        path.to_str(),
+        pages,
+    )?;
     let manifest = ctx.json(&path)?;
     let mut rows = Vec::new();
     for entry in manifest["pages"]
         .as_array()
         .context("object_review::attach_comparisons: missing required value")?
     {
-        if entry["status"] != "ready" {
+        if entry["status"] != "ready"
+            || pages.is_some_and(|pages| !entry["page"].as_str().is_some_and(|p| pages.contains(p)))
+        {
             continue; // Missing/failed comparisons remain unknown in assess.
         }
         let report = ctx.json(ctx.verify(&entry["report"])?)?;
@@ -157,6 +191,11 @@ pub fn bind_observations(template: &Value, observations: &Value) -> Result<Value
         result["relations"] = template["relations"].clone();
     }
     result["object_reviews"] = json!(bound);
+    let lines = template["source_line_reviews"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::source_lines::coverage(lines, observations, false)?;
     if let Some(rows) = observations.get("comparisons") {
         let required = template["comparisons"].as_array().ok_or_else(|| {
             anyhow::anyhow!("comparison observations require a pack with comparisons")
@@ -230,8 +269,21 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     if pack["relations"].is_object() {
         attach_relations(ctx, &mut fresh, &pack["relations"])?;
     }
+    // Old frozen packs predate page-scoped comparison templates.
+    let pages: Option<BTreeSet<String>> = pack
+        .get("selected_pages")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
     if pack["comparisons"].is_object() {
-        attach_comparisons(ctx, &mut fresh, &cycle, &spec, &pack["comparisons"])?;
+        attach_comparisons_scoped(
+            ctx,
+            &mut fresh,
+            &cycle,
+            &spec,
+            &pack["comparisons"],
+            pages.as_ref(),
+        )?;
     }
     ensure!(
         saved == fresh,
@@ -254,7 +306,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
         } else {
             Vec::new()
         };
-        let reuse = crate::review_reuse::collect(
+        let reuse = crate::review_reuse::collect_scoped(
             ctx,
             &cycle_path,
             previous_cycle
@@ -264,6 +316,7 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
                 .to_str()
                 .context("object_review::submit: missing required value")?,
             &signals,
+            pages.as_ref(),
         )?;
         let mut comparable = reuse.clone();
         // Older packs omitted defect metadata. Recompute it from their verified
@@ -345,8 +398,15 @@ pub fn submit(ctx: &Context, request: &Value) -> Result<Value> {
     )?;
     let assessment = assess(&cycle, &spec, &bound, &json!({}))?;
     let comparison_path = pack["comparisons"]["path"].as_str();
-    let comparisons =
-        crate::comparison_review::assess(ctx, &cycle, &spec, &bound, &json!({}), comparison_path)?;
+    let comparisons = crate::comparison_review::assess_scoped(
+        ctx,
+        &cycle,
+        &spec,
+        &bound,
+        &json!({}),
+        comparison_path,
+        pages.as_ref(),
+    )?;
     // The model already explicitly inspected/classified each bound whole-page
     // comparison. Do not require it to transcribe the same source page IDs into
     // three additional coverage arrays. Defects and unknown observations remain
@@ -586,8 +646,11 @@ pub fn template(ctx: &Context, cycle: &std::path::Path, objects: &[Value]) -> Re
         }
         reviews.push(json!({"page":v["page"],"object_id":v["object_id"],"evidence_hash":v["evidence_hash"],"checks":checks}));
     }
-    Ok(
-        json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":reviews,
-        "note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root}),
-    )
+    let mut template = json!({"cycle_sha256":cycle_digest,"review_id":review_id(&cycle_digest,&receipt_rows)?,"object_reviews":reviews,
+        "note":"Merge these observations into the existing cycle review; keep comparison findings and full-page coverage. This is not a completed review.","workspace":ctx.root});
+    let receipt = ctx.json(cycle)?;
+    if let Some(lines) = receipt["source_lines"].as_array() {
+        template["source_line_reviews"]=json!(lines.iter().map(|r|json!({"page":r["page"],"source_line_id":r["source_line_id"],"source":r["source"],"canvas":r["canvas"],"objects":r["objects"],"status":"unknown","observation":""})).collect::<Vec<_>>());
+    }
+    Ok(template)
 }

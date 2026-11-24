@@ -35,7 +35,8 @@ result and surrounding objects before claiming resolution.
 
 Default `evidence_init` is strict. Where the intended acceptance combines native
 measurements with independent visual verification of unsupported boundaries,
-Maker initializes with:
+the task policy owner initializes with (the coordinator for a shared-workspace
+page fleet; the maker for an independent single-maker task):
 
 ```json
 {"action":"evidence_init","task_id":"deck-task","stagnant_attempts":3,
@@ -43,8 +44,9 @@ Maker initializes with:
  "reviewer_agent":"EXACT-REVIEWER-SESSION-FROM-HOST"}
 ```
 
-Omit `owner_agent` under Octos: the host binds Maker identity. Freeze the real,
-different Reviewer identity. Do not replace an existing policy or retarget the
+Omit `owner_agent` under Octos: the host binds the actual policy-owner identity.
+Freeze a different Reviewer identity; in a page fleet it must also be separate
+from every page maker. Do not replace an existing policy or retarget the
 route after encountering failures. A legacy strict task stays strict.
 
 Reviewer reads original/blank/current crops and complete object boundaries,
@@ -92,6 +94,44 @@ For pages with complete bound whole-page comparison observations, review_submit
 also fills missing inspected-page coverage arrays. It carries observed coverage,
 not a pass verdict. Incomplete comparisons and object checks remain blocking.
 An attestation proves provenance, not visual correctness or hostile-write security.
+
+## Review in bounded page batches
+
+An unscoped multi-page `review_pack` now returns `mode: "page_batches"`,
+`pack_created: false`, a bound plan, and executable per-page `batches` requests.
+It generates no crops or observations. Dispatch those requests through the
+already frozen independent review route; do not create a second full-deck pack.
+`pages` / `page_numbers` scope images, comparisons and native measurement
+candidates together. Deck-wide findings remain visible. `all_pages: true` is an
+explicit opt-in for a combined pack, not the default final-review workflow.
+Final coverage must still include every page.
+
+Reviewer reads each page's actual evidence and calls `review_submit` for that
+page. After every required page is submitted, the coordinator combines the
+bound results without re-authoring observations:
+
+```json
+{"action":"review_merge","cycle":"final/cycle.json",
+ "reviews":["reviews/page-001-bound.json","reviews/page-002-bound.json"],
+ "output":"reviews/final-bound.json"}
+```
+
+Then call `evidence_record` with that merged review, followed by `evidence_status`
+on a subsequent tool turn. A deck score or `accepted: true` report does not
+replace structured object, comparison, relation or measurement observations.
+Do this evidence handoff on the first page before producing the full deck, so
+interface failures surface early rather than after all pages have been scored.
+
+`review_merge` accepts only direct `review_submit` outputs for the exact same
+cycle from the frozen independent Reviewer/Arbiter. It preserves provenance and
+unknowns, rejects conflicting overlapping rows, stale/tampered inputs and scores,
+and cannot turn missing checks into passes. Source reviews and receipts remain
+required artifacts; keep them with the final QA evidence. Nested merges are not
+supported. Merge receipts do not impersonate an Arbiter for new arbitration.
+Reviews from earlier cycles require the existing local evidence reuse route,
+not a cross-cycle merge. Do not change identities or reset the policy to make
+aggregation succeed. After repair, resubmit a replacement page review and merge
+the current set once; do not combine contradictory old and replacement rows.
 
 ## Reference fidelity is separate from readability
 
@@ -141,11 +181,14 @@ constraints remain frozen. The revision and pixel proof are recorded; adoption
 requires all existing gates to pass. No automatic artwork rewriting occurs.
 
 If arbitration may be needed, freeze an optional `arbiter_agent` at evidence_init
-alongside reviewer_agent. It must be an actual host session distinct from Maker
-and Reviewer; the existing Supervisor can serve. No extra vision service is
+alongside reviewer_agent. It must be an actual host session distinct from the
+policy owner and Reviewer. An existing Supervisor can serve only when it is not
+that policy owner. The coordinator owning a shared-workspace fleet policy cannot
+also be its Arbiter; do not invent another role or change an active policy to
+work around that constraint. No extra vision service is
 introduced. This Arbiter can submit a current review that dismisses a registered
 false positive using `state:"dismissed", arbitration:{"basis":"..."}`. Host
-attestation and original/current evidence are required. Maker and Reviewer cannot
+attestation and original/current evidence are required. The policy owner and Reviewer cannot
 grant themselves this role. Native failures and currently reported fidelity
 defects remain blocking. Changed local pixels invalidate an arbitrated exception.
 
@@ -187,3 +230,5 @@ cancellable. Timeout is not completion; compare task/turn and artifact versions.
 Only the final returned result is marked consumed, not intermediate polling.
 Publication alone does not wake an idle peer; keep the persistent supervisor
 host alive. Do not resend the same assignment while its peer is still working.
+
+For reconstructions with a registered source line inventory, initialize `independent_visual` with the independent reviewer's session. The review draft includes `source_line_reviews` for the current candidate, including lines with no native object. Use the original region indicated by `source.box` or `source.polygon`, its coordinate canvas, the current render and the linked text. Submit each observed `page`, `source_line_id`, `status` and a specific `observation`. Use `native` for verified editable text, `defect` for a visible discrepancy, and `unknown` for unresolved evidence. Only the independent reviewer can close a detected non-text mark as `not_text`, or an unreadable marking visibly preserved as artwork as `illegible_artwork`. Missing native text or an unchecked line cannot silently pass the copy check. Look in `source_line_coverage.pending_ids` for the next repair. If review discovers a new line, register it and review a new cycle containing it.

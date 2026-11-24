@@ -6,6 +6,14 @@ to the task directory. Paths stay inside that directory. Existing outputs are
 never overwritten. No interpreter or office conversion process is launched.
 `doctor` reports the binary and pinned engine revision; it is not a visual pass.
 
+For full-deck page-first production, call `help` with `topic:"page_gate"` for the
+task-local plan and candidate/review schemas. Once `.octos/pptx-page-plan.json`
+exists, supported native builds reject multi-page `build`/`cycle`/`batch` output
+until every current page has bound independent acceptance. `page_gate` reports
+the exact pending/stale page; `doctor.page_first_gate` reports support/activation.
+This checks declared ownership/evidence, not actual peer execution or visual
+truth. See [independent pages](independent-pages.md) for coordinator behavior.
+
 For current visual evidence, `review_pack` includes full-page context plus matched
 native-pixel crops for every text object, even with no detector finding. Follow
 [object visual review](object-visual-review.md); merge the generated template's
@@ -102,6 +110,22 @@ separate artifact and `processing_reused` reports what happened.
 
 ## Batch corrections and native drawing
 
+For a one-page PPTX, send the identified goal as a native `batch` command.
+Use shape IDs from that page. Each command takes `command` and `params`.
+
+- `shape.matchStroke` takes `id` and `reference`. The reference supplies its explicit stroke.
+- `text.fitSingleLine` takes `id`, `box:[x,y,width,height]` in points and `min_pt`.
+  It measures uniform-size text with the renderer and chooses the largest fitting size up to
+  the current size. A failure at the font floor requires a layout decision.
+- `shape.replaceWithLayout` takes the full-slide picture's `id` and the workspace `path`
+  of a same-canvas, same-theme static layout PPTX. The source shapes and embedded pictures
+  replace that picture at its original layer position. For a partially executed import,
+  optional `prior_copies` maps source IDs to existing IDs recorded by the earlier copy.
+  The executor verifies those shapes against the source before reusing them.
+
+These commands share the batch's single output write. Inspect and render that output using
+the usual page review flow.
+
 Plan a whole related label group before revising it. Once local regions and
 common-size alternatives are decided, `layout_region` measures and renders those
 alternatives in one call. It returns the reference context and each feasible
@@ -126,6 +150,26 @@ source; this prevents silently blessing OCR errors. Locked shared styles cannot
 be locally overridden. Optional `expected_sha256` rejects a stale source.
 Build another cycle in a new directory. Do not edit a receipt or old candidate.
 
+For source-image reconstruction, retain the preparation output in the coordinator's
+page assignment. Existing hash-bound job inputs with roles `preparation` and
+`measurements` and a bound `reference` (or input role `design`) are picked up
+automatically. Alternatively set `source_artwork` to an object containing `image`,
+`preparation` and `measurements`, each a workspace-relative `{path,sha256}` binding. A standalone
+deck can put the same object on a `pages:[{path,source_artwork}]` reference. Paths
+on a standalone reference resolve relative to the deck manifest. The frozen
+per-page assignment takes precedence and stays available if the maker omits it.
+
+Preparation declares `graphics` with `treatment:"crop"` and canvas-pixel
+`box:[x,y,w,h]`. A stable `id` can come from the declaration or a matching
+`graphicRegions` entry in measurements. Measurements contain `canvas:[w,h]`,
+`sourceSha256` of the original image and `lines` with measured text boxes.
+Build and cycle restore missing declared illustrations below authored artwork
+and native text. Overlapping OCR rectangles with a corresponding native text or
+copy ID are transparent in the stored crop. Other artwork pixels are retained. The reference crop does
+not reconstruct any background texture hidden behind the original letters.
+A matching authored artwork layer ID keeps the maker's rendition. Inspect it
+visually. A page without an artwork handoff keeps its existing build behavior.
+
 `patch` also accepts `artwork_layers:[{"page":"overview","layers":[...]}]`
 alongside `edits`. Each row explicitly replaces that page's complete local layer
 array; `layers:[]` removes it. Entries use the page `artwork_layers` schema in
@@ -141,6 +185,22 @@ and alignment. `changes` returns effective formats before/after plus changed fie
 names. An edit may explicitly set `format_mode:"replace"`; then `format:{}` (or
 null) clears overrides. Do not rely on omission to clear properties. A failed
 edit validates the whole result before saving; it does not write a partial output.
+
+For page-owned parallel work, first call
+`{"action":"help","topic":"patch"}` and require `supports_output_page:true`;
+an older runtime may silently ignore an unknown argument. A worker can then
+set `output_page` to its assigned page ID and write one page JSON instead of a
+full spec. Every text edit and artwork update must target that page. Require
+`output_kind:"page"`, the expected `page_id`, and source bindings in the
+response. Assemble successful page files in the coordinator's ordered root spec
+and run one combined cycle. The coordinator's authorized workspace must contain
+those files and their referenced assets; a peer's absolute path is not a grant.
+Page output binds and structurally validates all source JSON but checks only
+that page's assets. The final combined cycle must check every page's assets;
+success on one page does not establish that unrelated images are present.
+The `sources` array covers root/page JSON files, not image bytes. Compare the
+emitted page's background, design and artwork-layer image hashes with the
+frozen input inventory, or with an explicitly approved new repair asset.
 
 To restructure a wide text object without rewriting canonical copy:
 
@@ -179,6 +239,23 @@ to discover DeckCraft command IDs/parameters, then `batch` with `commands` rows
 with `file.new`. Optional `output` saves a fresh PPTX. Commands run in order and
 stop on error; batch cannot overwrite sources through file commands. Units here
 are points. This route does not replace an image-first route chosen by the user.
+
+Check the installed command descriptions before editing existing text.
+`text.set` replaces the whole shape and retains only the first run's
+formatting; it can flatten mixed sizes or emphasis. `text.replace` without
+an `at` match can replace occurrences on other pages. Use `text.find`,
+verify the target slide and shape, and pass the specific match as `at`.
+Refresh matches after edits that change offsets; re-check actual runs and the
+render after saving. The batch writer serializes a new PPTX package, so command
+success does not itself prove that untouched content, shared dependencies or
+native editability survived.
+
+If `{"action":"help","topic":"batch"}` returns
+`supports_guarded_text_edits:true`, set `guarded_text_edits:true` and
+require the same value in the batch response. It rejects `text.set` and
+untargeted `text.replace`; it does not certify typography, ownership or
+package preservation. Do not rely on the argument when capability preflight
+fails, because an older runtime may ignore it.
 
 ## Visual aids
 
@@ -388,7 +465,7 @@ the end of the agent turn.
 Rendering success never means the deck is done. Reconcile copy, artwork and actual
 readability separately, retain unresolved defects, and follow the existing peer
 exit rules. No automatic OCR/model reviewer is hidden in this binary: use the
-host's configured OCR/image tools and real peer sessions when needed. Image
-generation and text removal remain operations of the selected image service.
+host's configured OCR/image tools and real peer sessions when needed. Bind the
+supplied background as the page artwork during reconstruction.
 
 Read [review lifecycle](review-lifecycle.md) before a repair cycle: register defects before editing, freeze the verification route, and reuse only unchanged local evidence.

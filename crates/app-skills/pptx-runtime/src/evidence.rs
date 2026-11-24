@@ -27,34 +27,14 @@ mod tests {
     }
 }
 
-struct EvidenceLock(std::fs::File);
+pub(crate) const LOCK: &str = ".octos/pptx-evidence.lock";
 
-impl Drop for EvidenceLock {
-    fn drop(&mut self) {
-        // A concurrent fork can temporarily inherit the file descriptor, so
-        // closing this handle alone may not release the lock before exec.
-        let _ = fs2::FileExt::unlock(&self.0);
-    }
-}
-
-fn lock(ctx: &Context) -> Result<EvidenceLock> {
-    use fs2::FileExt;
-    let dir = ctx.path(".octos")?;
-    std::fs::create_dir_all(&dir)?;
-    ctx.path(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(ctx.path(".octos/pptx-evidence.lock")?)?;
-    file.try_lock_exclusive()
-        .map_err(|e| anyhow::anyhow!("another evidence writer is active: {e}"))?;
-    Ok(EvidenceLock(file))
+fn lock(ctx: &Context) -> Result<crate::fs::WorkspaceLock> {
+    ctx.lock_file(LOCK)
 }
 
 pub fn init(ctx: &Context, r: &Value) -> Result<Value> {
-    let _lock = lock(ctx)?;
+    let _lock = ctx.wait_for_lock(LOCK)?;
     ensure!(
         [
             POLICY,
@@ -105,7 +85,37 @@ pub fn init(ctx: &Context, r: &Value) -> Result<Value> {
             "deliverables must name individual files, not directories: {p}"
         );
     }
-    let plan = crate::review_routes::plan(r, owner)?;
+    let mut plan = crate::review_routes::workspace_plan(ctx, r, owner)?;
+    if plan["mode"] == "per_page" {
+        let binding = ctx.binding(crate::page_gate::PLAN)?;
+        let pages = crate::page_gate::plan(ctx)?;
+        crate::page_gate::validate_per_page_plan(&pages, owner)?;
+        crate::repair_gate::validate_rules(&pages)?;
+        crate::source_copy_review::check_before_freeze(ctx, &pages)?;
+        crate::source_detail_review::freeze(ctx, &pages, &mut plan)?;
+        if let Some(canvas) = crate::page_canvas::freeze(ctx, &pages)? {
+            plan["canvas"] = serde_json::to_value(canvas)?;
+        }
+        if r.get("arbiter_agent").is_some() {
+            let arbiter = string(r, "arbiter_agent")?;
+            crate::page_gate::independent(&pages, &Value::Null, arbiter)?;
+            ensure!(
+                !crate::page_gate::identity(arbiter).trim().is_empty()
+                    && pages["pages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|p| p["reviewer_session"]
+                            .as_str()
+                            .map(crate::page_gate::identity)
+                            != Some(crate::page_gate::identity(arbiter))),
+                "per_page arbiter must be distinct from all page reviewers"
+            );
+            plan["arbiter_agent"] = json!(arbiter);
+        }
+        ctx.verify(&binding)?;
+        plan["page_plan"] = binding;
+    }
     let policy = json!({"schema_version":1,"task_id":task,"owner_agent":owner,"evidence_file":".octos/iteration-evidence.json","stagnant_attempts":window,"deliverables":delivery,"required_checks":[{"id":"package","epsilon":0},{"id":"copy","epsilon":0},{"id":"artwork","epsilon":0},{"id":"readability","epsilon":0}]});
     // Publish a pending snapshot BEFORE enabling the observer. Otherwise the
     // first tool batch sees a missing evidence file and can yield before the
@@ -205,6 +215,53 @@ pub fn retarget(ctx: &Context, r: &Value) -> Result<Value> {
         json!({"changed":true,"policy":ctx.binding(POLICY)?,"revision":ctx.binding(revision)?,"history_preserved":true,"quality_approved":false,"next":"Record the current checked cycle; retargeting is not a review."}),
     )
 }
+/// Match the owner's one-level manifest contract. No file digest is reused
+/// between status calls; verdict/restart identity alone cannot establish liveness.
+fn current_bindings(ctx: &Context, snapshot: &Value) -> Result<()> {
+    let mut seen = BTreeMap::new();
+    let mut verify = |row: &Value| -> Result<()> {
+        let path = ctx.path(string(row, "path")?)?;
+        let hash = string(row, "sha256")?;
+        if let Some(prior) = seen.get(&path) {
+            ensure!(prior == hash, "conflicting dependency binding");
+        } else {
+            ctx.verify(row)?;
+            seen.insert(path, hash.to_owned());
+        }
+        Ok(())
+    };
+    let artifacts = snapshot["artifacts"]
+        .as_array()
+        .context("missing artifact bindings")?;
+    ensure!(!artifacts.is_empty(), "empty artifact bindings");
+    for row in artifacts {
+        verify(row)?;
+    }
+    let mut total = 0u64;
+    if let Some(shards) = snapshot.get("dependency_manifests") {
+        for shard in shards.as_array().context("invalid dependency manifests")? {
+            let path = ctx.path(string(shard, "path")?)?;
+            let size = path.metadata()?.len();
+            total = total.checked_add(size).context("manifest byte overflow")?;
+            ensure!(
+                size <= 256 * 1024 && total <= 16 * 1024 * 1024,
+                "oversized dependency manifest"
+            );
+            let bytes = ctx.read(&path)?;
+            ensure!(
+                crate::fs::digest(&bytes) == string(shard, "sha256")?,
+                "stale dependency manifest"
+            );
+            let rows: Vec<Value> = serde_json::from_slice(&bytes)?;
+            ensure!(!rows.is_empty(), "empty dependency manifest");
+            for row in &rows {
+                verify(row)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
     let p = ctx.json(POLICY)?;
     let owner = ctx
@@ -232,6 +289,9 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
                 let record = ctx.json(ctx.verify(binding)?)?;
                 v["comparison_coverage"] = record["coverage"].clone();
                 v["object_coverage"] = record["object_coverage"].clone();
+                if let Some(lines) = record.get("source_line_coverage") {
+                    v["source_line_coverage"] = lines.clone();
+                }
                 v["verification_route"] = record["verification_route"].clone();
                 v["reference_fidelity"] = record["reference_fidelity"].clone();
                 v["local_background_repairs"] = record["local_background_repairs"].clone();
@@ -266,20 +326,118 @@ pub fn status(ctx: &Context, r: &Value) -> Result<Value> {
     if owner_matches && ep.is_file() && sp.is_file() {
         let e = ctx.json(&ep)?;
         let state = ctx.json(&sp)?;
-        v["runtime_consumed_current_evidence"] = json!(
-            e["task_id"] == p["task_id"]
-                && e["phase"] == "checked"
-                && e["attempt"].as_u64().is_some_and(|n| n > 0)
-                && state["attempt"] == e["attempt"]
-                && state["policy_digest"] == crate::fs::sha_file(&ctx.path(POLICY)?)?
-                && state["snapshot_digest"] == crate::fs::sha_file(&ep)?
-        );
+        let consumed = e["task_id"] == p["task_id"]
+            && matches!(e["phase"].as_str(), Some("checked" | "blocked"))
+            && e["attempt"].as_u64().is_some_and(|n| n > 0)
+            && state["attempt"] == e["attempt"]
+            && state["policy_digest"] == crate::fs::sha_file(&ctx.path(POLICY)?)?
+            && state["snapshot_digest"] == crate::fs::sha_file(&ep)?;
+        if consumed {
+            match current_bindings(ctx, &e) {
+                Ok(()) => v["runtime_consumed_current_evidence"] = json!(true),
+                Err(error) => v["stale_evidence"] = json!(format!("{error:#}")),
+            }
+        }
         v["attempt"] = e["attempt"].clone();
         v["flat_attempts"] = state["flat_attempts"].clone();
         v["warned"] = state["warned"].clone();
+        if v["runtime_consumed_current_evidence"] == true {
+            v["completion_gap_attempts"] =
+                json!(state["completion_gap_attempts"].as_u64().unwrap_or(0));
+            v["completion_blocked"] = json!(state["completion_blocked"] == true);
+            if state["completion_blocked"] == true {
+                v["handoff"] = json!({"code":"evidence_stalled","automatic_retry_allowed":false,
+                    "next":"Preserve artifacts and history. Report the concrete blocker; resume only with a different repair plan or new external evidence. Equivalent completion claims do not clear this handoff."});
+            }
+        }
     }
     Ok(v)
 }
+/// Publish the page admission failure as an incomplete owner attempt. This
+/// does not produce a deck, a visual score, or a passing whole-deck check.
+pub fn record_blocked(ctx: &Context) -> Result<Value> {
+    let _lock = lock(ctx)?;
+    let policy = ctx.json(POLICY)?;
+    let owner = ctx
+        .continuation_owner
+        .as_deref()
+        .context("host coordinator identity required")?;
+    ensure!(
+        policy["owner_agent"] == owner,
+        "only the continuation owner may record a blocker"
+    );
+    let gate = crate::page_gate::check(ctx)?;
+    ensure!(
+        crate::page_gate::identity(owner)
+            == crate::page_gate::identity(string(&gate, "coordinator_session")?),
+        "page plan belongs to another coordinator"
+    );
+    let pages = gate["pages"]
+        .as_array()
+        .context("active page plan required")?;
+    ensure!(
+        pages.iter().any(|p| p["work_stage"] == "blocked")
+            && pages
+                .iter()
+                .all(|p| p["work_stage"] == "blocked" || p["work_stage"] == "complete"),
+        "every unfinished page needs a bound independent blocker"
+    );
+    let mut artifacts = vec![gate["plan"].clone()];
+    for page in pages {
+        for key in ["candidate", "review_binding"] {
+            artifacts.push(page[key].clone());
+        }
+        let verdict = ctx.json(ctx.verify(&page["review_binding"])?)?;
+        if let Some(bindings) = verdict["evidence"].as_array() {
+            // Independent reviews may attach descriptive fields to a binding;
+            // the continuation observer accepts only the path and content hash.
+            artifacts.extend(
+                bindings
+                    .iter()
+                    .map(|b| json!({"path":b["path"],"sha256":b["sha256"]})),
+            );
+        }
+    }
+    artifacts.sort_by_key(Value::to_string);
+    artifacts.dedup();
+    for binding in &artifacts {
+        ctx.verify(binding)?;
+    }
+    let ep = string(&policy, "evidence_file")?;
+    let previous = ctx.json(ep)?;
+    ensure!(
+        previous["task_id"] == policy["task_id"],
+        "evidence belongs to another task"
+    );
+    let old = previous["attempt"].as_u64().context("invalid attempt")?;
+    let mut payload = json!({"schema_version":1,"task_id":policy["task_id"],"attempt":old,"phase":"blocked",
+        "scope":previous.get("scope").cloned().unwrap_or_else(||json!([])),
+        "artifacts":artifacts,"checks":[{"id":"package","status":"fail"},
+        {"id":"copy","status":"unknown"},{"id":"artwork","status":"unknown"},{"id":"readability","status":"unknown"}]});
+    if previous != payload {
+        payload["attempt"] = json!(old.checked_add(1).context("attempt overflow")?);
+        ensure!(
+            serde_json::to_vec_pretty(&payload)?.len() <= 256 * 1024,
+            "blocked evidence exceeds the continuation observer record limit"
+        );
+        if old > 0 {
+            let archive = format!(
+                ".octos/pptx-blocker-history/{old}-{}.json",
+                ctx.binding(ep)?["sha256"]
+                    .as_str()
+                    .context("missing digest")?
+            );
+            if !ctx.path(&archive)?.exists() {
+                ctx.write_json(&archive, &previous)?;
+            }
+        }
+        ctx.replace_json(ep, &payload)?;
+    }
+    Ok(
+        json!({"evidence":ctx.binding(ep)?,"attempt":payload["attempt"],"outcome":"blocked","quality_approved":false,"reason":"Native page admission prevents final packaging; final deck checks remain outstanding."}),
+    )
+}
+
 pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     let _lock = lock(ctx)?;
     let policy = ctx.json(POLICY)?;
@@ -289,6 +447,10 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
             "this runtime ({owner}) does not own the continuation policy; inspect evidence_status and preserve existing history"
         );
     }
+    ensure!(
+        !crate::review_routes::per_page(ctx)?,
+        "per_page delivery records the compiled assembly with evidence_assembled"
+    );
     let cp = ctx.path(string(r, "cycle")?)?;
     let (cycle, spec) = crate::review::bound_cycle(ctx, &cp)?;
     let pages: Vec<_> = spec.pages.iter().map(|p| p.id.clone()).collect();
@@ -425,6 +587,21 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     // Fresh native measurements are authoritative. A model-authored pass,
     // dismissed finding or edited inspection report cannot replace them.
     let independent = crate::review_routes::authorized(ctx, &policy, &review, &ctx.binding(&cp)?)?;
+    let lines = cycle["source_lines"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let line_scope =
+        crate::source_lines::current_scope(ctx, &spec, lines, &old["source_line_scope"])?;
+    let line_reviewer = !lines.is_empty()
+        && crate::review_routes::independent_line_reviewer(
+            ctx,
+            &policy,
+            &review,
+            &ctx.binding(&cp)?,
+            independent,
+        )?;
+    let line_coverage = crate::source_lines::coverage(lines, &review, line_reviewer)?;
     let (repair_contract, local_repairs) = crate::fidelity::repair_contract(
         ctx,
         &cycle,
@@ -450,6 +627,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     );
     if review["attestation"].is_object() {
         artifacts.push(review["attestation"].clone());
+        artifacts.extend(crate::review_merge::dependencies(ctx, &review)?);
     }
     let qa_digest = crate::fs::digest(&serde_json::to_vec(&native_qa)?);
     let qa_path = format!(".octos/pptx-native-qa-records/{qa_digest}.json");
@@ -573,18 +751,20 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         let diff_unknown = if visual {
             comparison_coverage.unknown + object_coverage.unknown + fidelity.unknown
         } else if d == "copy" {
-            object_coverage.summary["symbol_unknown"]
-                .as_u64()
-                .unwrap_or(0) as usize
+            line_coverage["unknown"].as_u64().unwrap_or(0) as usize
+                + object_coverage.summary["symbol_unknown"]
+                    .as_u64()
+                    .unwrap_or(0) as usize
         } else {
             0
         };
         let diff_defects = if visual {
             comparison_coverage.defects + object_coverage.defects + fidelity.defects
         } else if d == "copy" {
-            object_coverage.summary["symbol_defects"]
-                .as_u64()
-                .unwrap_or(0) as usize
+            line_coverage["defects"].as_u64().unwrap_or(0) as usize
+                + object_coverage.summary["symbol_defects"]
+                    .as_u64()
+                    .unwrap_or(0) as usize
         } else {
             0
         };
@@ -653,7 +833,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
     }
     // Keep the kernel's generic Snapshot wire schema unchanged. Detailed PPTX
     // evidence is a bound immutable artifact, not a new kernel-level field.
-    let comparison_record = json!({"local_background_repairs":local_repairs,"reference_fidelity":fidelity.summary,"object_coverage":object_coverage.summary,"object_reviews":object_coverage.reviews,"coverage":comparison_coverage.summary,
+    let comparison_record = json!({"source_line_coverage":line_coverage,"local_background_repairs":local_repairs,"reference_fidelity":fidelity.summary,"object_coverage":object_coverage.summary,"object_reviews":object_coverage.reviews,"coverage":comparison_coverage.summary,
         "reviews":comparison_coverage.reviews,"required_pages":comparison_coverage.required_pages,
         "verification_route":{"plan":verification_plan,"independent_visual_acceptances":accepted_measurements,
         "attestation":review["attestation"],"native_status_unchanged":true,"feedback":verification_feedback}});
@@ -676,7 +856,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         .as_u64()
         .unwrap_or(0)
         .max(previous["attempt"].as_u64().unwrap_or(0));
-    let attempt = if old["key"] == key {
+    let attempt = if old["key"] == key && previous["phase"] != "blocked" {
         n
     } else {
         n.checked_add(1)
@@ -702,7 +882,7 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         } else {
             &native_qa["contract"]
         };
-    ctx.replace_json(BOOK,&json!({"task_id":policy["task_id"],"pages":pages,"attempt":attempt,"key":key,"findings":findings,"verification_plan":verification_plan,"qa_contract":retained_contract,"native_qa":qa_summary,"scope_change_reason":scope_reason,"comparison_reviews":comparison_coverage.reviews,"comparison_required_pages":comparison_coverage.required_pages,"object_reviews":object_coverage.reviews}))?;
+    ctx.replace_json(BOOK,&json!({"source_line_scope":line_scope,"task_id":policy["task_id"],"pages":pages,"attempt":attempt,"key":key,"findings":findings,"verification_plan":verification_plan,"qa_contract":retained_contract,"native_qa":qa_summary,"scope_change_reason":scope_reason,"comparison_reviews":comparison_coverage.reviews,"comparison_required_pages":comparison_coverage.required_pages,"object_reviews":object_coverage.reviews}))?;
     ctx.replace_json(ep, &payload)?;
     let check_feedback = crate::check_feedback::summarize(
         &json!(checks),
@@ -711,6 +891,6 @@ pub fn record(ctx: &Context, r: &Value) -> Result<Value> {
         &comparison_coverage.summary,
     );
     Ok(
-        json!({"evidence":ctx.binding(ep)?,"attempt":attempt,"checks":checks,"check_feedback":check_feedback,"verification_feedback":verification_feedback,"reference_fidelity":fidelity.summary,"native_qa":qa_summary,"comparison_coverage":comparison_coverage.summary,"object_coverage":object_coverage.summary,"previous_record":previous_record,"visual_quality_verified_by_tool":false,"review_provenance":"Fresh deterministic native QA plus human/model review of bound renders; model judgments cannot override machine failures"}),
+        json!({"source_line_coverage":line_coverage,"evidence":ctx.binding(ep)?,"attempt":attempt,"checks":checks,"check_feedback":check_feedback,"verification_feedback":verification_feedback,"reference_fidelity":fidelity.summary,"native_qa":qa_summary,"comparison_coverage":comparison_coverage.summary,"object_coverage":object_coverage.summary,"previous_record":previous_record,"visual_quality_verified_by_tool":false,"review_provenance":"Fresh deterministic native QA plus human/model review of bound renders; model judgments cannot override machine failures"}),
     )
 }

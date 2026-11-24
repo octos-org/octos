@@ -1,11 +1,13 @@
 //! A bounded native tool surface. Model judgment stays with the calling agent.
 use anyhow::Context as _;
 pub mod artwork_contact;
+mod assembly_evidence;
 pub mod authoring;
 pub mod check_feedback;
 pub mod comparison_review;
 pub mod composite_ink;
 pub mod deck;
+mod editable_copy;
 pub mod evidence;
 pub mod feedback;
 pub mod fidelity;
@@ -17,15 +19,35 @@ pub mod intent_evidence;
 pub mod label_diff;
 pub mod object_review;
 pub mod ocr;
+mod ocr_placement;
 pub mod operations;
+mod page_assembly;
+mod page_assignments;
+mod page_canvas;
+pub mod page_dispatch;
+pub mod page_gate;
+mod page_render_refresh;
+mod page_snapshot;
+mod page_source_lines;
+mod page_verdict;
 pub mod placement;
 pub mod qa;
 pub mod raster_overlap;
+mod region_comparison;
 pub mod region_layout;
 pub mod relations;
+mod renderer_probe;
+mod repair_commands;
+mod repair_gate;
+mod repair_text;
 pub mod review;
+pub mod review_merge;
 pub mod review_reuse;
 pub mod review_routes;
+pub mod source_artwork;
+mod source_copy_review;
+mod source_detail_review;
+mod source_lines;
 pub mod spec;
 pub mod typography;
 pub mod visual_diff;
@@ -35,7 +57,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-pub const ENGINE_REV: &str = "581ffb43217be6aa9850b23eea38473ded6043fd";
+pub const ENGINE_REV: &str = "a812160f5bb3575d6a9db4ce7db5264b080f5ce9";
 pub struct Context {
     pub root: PathBuf,
     pub continuation_owner: Option<String>,
@@ -57,30 +79,68 @@ impl Context {
             .unwrap_or("help")
         {
             "help" if request["topic"].as_str().is_some() => match request["topic"].as_str().context("lib::execute: missing required value")? {
+                "assembly_review_submit" | "evidence_assembled" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/assembled-delivery.md")})),
+                "review_preview" => Ok(json!({"action":"review_preview","required":["input","output"],
+                    "example":{"action":"review_preview","input":"final/rendered/slide-001.png","output":"review/views/slide-001.png"},
+                    "description":"Source-bound whole-page PNG at up to 1024 px on the long edge, within the host image reader's 5 MiB limit. Open the returned view and use native crop on the original for finer detail.","quality_approved":false})),
+                "evidence_blocked" => Ok(json!({"action":"evidence_blocked","required":[],"owner":"page and continuation coordinator","purpose":"Record a blocked attempt after the native page gate verifies that every unresolved page has a bound blocker. Retains independent review evidence and leaves final deck quality unapproved."})),
                 "evidence_record" => Ok(json!({"action":"evidence_record","required":["cycle"],"optional":["review","comparisons","scope_change_reason"],
                     "example":{"action":"evidence_record","cycle":"attempt/cycle.json","review":"review/bound.json"},
                     "requirements":["Maker owns the frozen policy; delivery files must match the reviewed candidate.","Use independent review_submit output; omit review only to record genuinely incomplete machine-only evidence.","Rust increments a checked attempt; never invent or edit the counter.","Before the first completed check attempt=0 pending is expected, not a defect.","On the next tool turn, evidence_status confirms host consumption."],"quality_approved":false})),
-                "review" | "finding_register" | "review_pack" | "review_submit" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
-                _=>bail!("Unknown help topic. Use evidence_record or review (finding_register/review_pack/review_submit). Omit topic for the full operation list."),
+                "review" | "finding_register" | "review_pack" | "review_submit" | "review_merge" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/review-lifecycle.md"),"quality_approved":false})),
+                "patch" => Ok(json!({"topic":"patch","supports_output_page":true,
+                    "output_page":"Optional page ID; all edits must target that page, and output contains one page object instead of a full spec.",
+                    "page_scoped_assets":"Page output verifies only that page's assets; all page source JSON is bound and structurally validated. Image bindings are in the emitted page, not sources. Compare their hashes to the frozen image inventory; the final full build verifies every page's assets.",
+                    "response_fields":["output_kind","page_id","page","sources","changes"],"quality_approved":false})),
+                "batch" => Ok(json!({"topic":"batch","supports_guarded_text_edits":true,
+                    "page_repair_commands":repair_commands::COMMANDS,
+                    "guarded_text_edits":"Optional boolean; rejects text.set and requires a specific text.find match for text.replace.",
+                    "quality_approved":false})),
+                "page_review_submit" | "page_repair_decide" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/page-verdict.md"),"quality_approved":false})),
+                "page_progress" => Ok(json!({"topic":"page_progress","output":page_assembly::progress::OUTPUT,"usage":"The coordinator can refresh the single rolling editable PPTX from current signed page verdicts. Each per_page reviewer submission already triggers publication. An empty set removes the working copy. Use page_assemble for final delivery.","quality_approved":false})),
+                "page_assemble" => Ok(json!({"topic":"page_assemble","required":["output"],"optional":["repair_review"],"example":{"action":"page_assemble","output":"final.pptx"},
+                    "documentation":"Assemble the actual accepted one-slide PPTX artifacts in active plan order with source formatting. Reuse the same .pptx path after a review-only revision. Use a fresh path for a changed plan or externally edited destination. The response includes a canonical receipt. With verification_mode per_page, use evidence_assembled with that receipt and qa; final reviews and renders belong to each page before compilation. Existing final renders remain usable while the reviewed deck bytes match. After a failing independent final verdict, pass repair_review={path,sha256} to replace the exact previously reviewed output and previews with newly approved pages. Use stage_repair_render:true when the approved renderer is deployed separately. Independently review the repaired package.","quality_approved":false})),
+                "source_copy_review" => Ok(json!({"topic":"source_copy_review","documentation":include_str!("../references/source-copy-review.md")})),
+                "page_gate" => Ok(json!({"topic":"page_gate","documentation":include_str!("../references/page-first.md"),"quality_approved":false})),
+                "page_dispatch" | "page_assignments" => Ok(json!({"topic":request["topic"],"documentation":include_str!("../references/page-dispatch.md"),"quality_approved":false})),
+                "page_publish" => Ok(json!({"required":["page","cycle"],"optional":["artifact","render_receipt","receipts"],"quality_approved":false,
+                    "reviewer_render_refresh":{"refresh_render_only":true,"required":["page","candidate_id","render_receipt"],"scope":"Assigned v2 reviewer only. Binds a different verified preview to the identical editable PPTX. A changed candidate requires a new verdict."},
+                    "next":"Publish the existing one-page native cycle as its declared maker; preserve post-build edits with artifact, native render_receipt and receipt-chain paths. A cycle can publish directly with publish_candidate=true. Publication requests independent review; it never awards acceptance."})),
+                _=>bail!("Unknown help topic. Use page_gate, evidence_record, review (finding_register/review_pack/review_submit/review_merge), patch or batch. Omit topic for the full operation list."),
             },
             "help" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,
-                "actions":["operations","review_view","finding_register","doctor","build","cycle","render","inspect","review_pack","review_submit","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_status"],
+                "actions":["source_lines","source_copy_review","operations","review_view","review_preview","finding_register","doctor","page_gate","page_progress","page_assignments","page_dispatch","page_publish","page_review_submit","page_repair_decide","page_assemble","assembly_review_submit","evidence_assembled","build","cycle","render","inspect","review_pack","review_submit","review_merge","qa_check","qa_help","fit","layout_search","layout_region","patch","split_text","represent_symbol","batch","commands","image_info","ocr","raster_overlap","compare","compare_cycle","crop","geometry","evidence_init","evidence_retarget","evidence_record","evidence_blocked","evidence_status"],
                 "units":"spec geometry: canvas pixels; font: points; DeckCraft commands: points",
                 "quality_approved":false,"fit":fit::usage(),"layout_search":placement::usage(),"layout_region":region_layout::usage(),"instructions":"Read the bundled pptx skill and rust-runtime reference for schemas."}),
             ),
             "doctor" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"engine_revision":ENGINE_REV,"runtime":"rust","ocr":ocr::capabilities(),"bundled_fonts":env!("OCTOS_PPTX_BUNDLED_FONTS")=="true","python_required":false,"libreoffice_required":false,"node_required":false,
+                "renderer_probe": if request["check_renderer"] == true {renderer_probe::check(self, &request)?} else {json!({"requested":false,"request":{"action":"doctor","check_renderer":true}})},
+                "page_first_gate":{"supported":true,"plan_path":page_gate::PLAN,"active":self.path(page_gate::PLAN)?.exists(),"dispatch_coverage_check":true,"peer_resolution":true,"review_submission":true,"freeze_inputs":true,"artifact_assembly":true,"per_page_delivery":true,"source_copy_review":true,"assignment_templates":true,"progress_output":page_assembly::progress::OUTPUT},
                 "continuation":{"host_identity_present":self.continuation_owner.is_some(),"host_identity":self.continuation_owner,"observer_consumption_verified":false,
                     "next":"Under Octos, require host_identity_present before evidence_init; omit owner_agent. After a checked cycle, require evidence_status.runtime_consumed_current_evidence on a subsequent tool turn. Identity injection alone does not verify the observer."},"quality_approved":false}),
             ),
+            "source_lines" => source_lines::intake(self,&request),
             "build" | "cycle" => deck::build(self, &request),
+            "page_gate" => page_gate::check_scope(self, request.get("only_page").map(|v| v.as_str().context("only_page must name a page")).transpose()?),
+            "page_progress" => page_assembly::progress::reconcile(self, &request),
+            "page_assemble" => page_assembly::assemble(self, &request),
+            "source_copy_review" => source_copy_review::review(self, &request),
+            "page_assignments" => page_assignments::prepare(self, &request),
+            "page_dispatch" => page_dispatch::check(self, &request),
+            "page_publish" if request["refresh_render_only"] == true => page_render_refresh::refresh(self, &request),
+            "page_publish" => page_gate::publish(self, &request),
+            "page_review_submit" => page_verdict::submit(self, &request),
+            "page_repair_decide" => repair_gate::decide(self, &request),
             "render" => deck::render(self, &request),
             "inspect" => review::inspect(self, &request),
             "review_pack" => feedback::create(self, &request),
             "review_view" => operations::review_view(self, &request),
+            "review_preview" => review::review_preview(self, &request),
             "operations" => operations::run(self, &request),
             "review_submit" => object_review::submit(self, &request),
+            "review_merge" => review_merge::merge(self, &request),
             "finding_register" => finding_guard::register(self, &request),
             "qa_check" => qa::check(self, &request),
             "qa_help" => Ok(json!({"algorithm":qa::ALGORITHM,
@@ -141,6 +201,9 @@ impl Context {
             })().map_err(|e: anyhow::Error| anyhow::anyhow!("{e:#}\nUsage: {}", geometry::usage())),
             "evidence_init" => evidence::init(self, &request),
             "evidence_retarget" => evidence::retarget(self, &request),
+            "assembly_review_submit" => assembly_evidence::submit(self, &request),
+            "evidence_assembled" => assembly_evidence::record(self, &request),
+            "evidence_blocked" => evidence::record_blocked(self),
             "evidence_record" => evidence::record(self, &request),
             "evidence_status" => evidence::status(self, &request),
             other => bail!("unknown action {other}"),

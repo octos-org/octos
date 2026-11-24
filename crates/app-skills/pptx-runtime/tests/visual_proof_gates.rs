@@ -99,3 +99,25 @@ fn independent_route_preserves_unknowns_and_rejects_self_approval_and_native_fai
             .is_err()
     );
 }
+
+#[test]
+fn strict_feedback_identifies_the_measurement_blocker() {
+    let qa = json!({"findings":[{"id":"line-1","status":"unknown"}]});
+    let report = octos_pptx::review_routes::feedback(
+        &qa,
+        &json!({}),
+        &Default::default(),
+        &json!({"mode":"strict"}),
+    );
+    assert_eq!(
+        report["remaining"][0]["next_action"],
+        "measurement_or_contract_blocker"
+    );
+    assert_eq!(report["accepted_count"], 0);
+    assert!(
+        report["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("Strict verification has no measurement_reviews")
+    );
+}

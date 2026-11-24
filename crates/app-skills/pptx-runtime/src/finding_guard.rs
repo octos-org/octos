@@ -185,7 +185,7 @@ pub fn register(ctx: &Context, request: &Value) -> Result<Value> {
         let mut views = serde_json::Map::new();
         for (role, source) in sources {
             let image = ctx.verify(&source)?;
-            let (sw, sh) = image::image_dimensions(&image)?;
+            let (sw, sh) = crate::review::image_dimensions(&image)?;
             let b = [
                 area[0] * sw as f64 / w as f64,
                 area[1] * sh as f64 / h as f64,
