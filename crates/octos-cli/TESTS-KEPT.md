@@ -452,6 +452,13 @@ Creation admission also retains these persistence regressions (T-0323):
 | 2 | `goal_tool::declared_inputs_tests::should_offer_task_inputs_to_the_planner_and_carry_them_onto_the_task` | `goal_plan` tells the keeper what declaring a task input does, and a declared input reaches the planned task. |
 | 5 | `goal_tool::declared_inputs_tests::should_reject_plan_when_a_tasks_inputs_are_malformed` | A plan with a malformed `inputs` (not a list, no path, unknown field) is rejected naming the task, instead of planning a task that silently lacks them. |
 
+## Agent/peer profile-scoped delivery (#2081, UPCR-2026-R8C3A1D2E)
+
+| Cat. | Exact test | Guard |
+|---|---|---|
+| 3 | `api::ui_protocol_transport::tests::should_drop_cross_profile_agent_and_peer_frames_when_connection_scopes_another_profile` | A profile-scoped connection never replays nor live-receives another profile's `agent/updated`, `peer/staged` or `peer/closed` on a shared session key, while its own profile's frames still arrive on both paths (#2081). |
+| 3 | `api::ui_protocol_transport::tests::should_deliver_agent_and_peer_frames_to_an_unscoped_connection` | The unauthenticated/stdio boundary is preserved: an unpinned connection receives every profile's agent/peer frames on replay and live, so the routed-header deployment mode cannot starve its own producer (#2081). |
+
 ## /app deprecation (RFC #3262, step 1)
 
 | Cat. | Exact test | Guard |
