@@ -244,8 +244,18 @@ async fn revoke_after_snapshot_cannot_admit_revoked_generation() {
     let (_generation, lease) =
         bound.expect("shared snapshot fence serializes admission before revoke");
     drop(lease);
-    fs2::FileExt::try_lock_exclusive(&lock_probe)
-        .expect("bind must release its snapshot fence after admission");
+    // Test-only timing, not a production gap: the fence is dropped
+    // synchronously in the bind future, but task-frame teardown (closing
+    // the lock file) can lag the JoinHandle on a current-thread runtime —
+    // intermittent WouldBlock on ARM64 (#3326). Poll with a deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while let Err(error) = fs2::FileExt::try_lock_exclusive(&lock_probe) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bind must release its snapshot fence after admission: {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     fs2::FileExt::unlock(&lock_probe).unwrap();
     let revoke_store = octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path());
     assert!(revoke_store.revoke_token("fence-token").unwrap());
