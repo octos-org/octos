@@ -479,16 +479,64 @@ fn octoscode_legacy_spec() -> ProductSpec {
     )
 }
 
+/// deploy.ps1's default RemoteRoot\bin on Windows hosts. The remote deploy
+/// drops `octos.exe` here; a fresh PATH never contains it, so doctor must
+/// still find the install and point the operator at the exact directory.
+const DEPLOY_DEFAULT_BIN_DIR: &str = r"C:\octos\bin";
+
+/// Candidate install directories for the octos binary, in priority order:
+/// `OCTOS_PREFIX` (install.ps1's custom prefix), the user's `~/.octos/bin`
+/// from HOME (or USERPROFILE when HOME is absent), and — on Windows only —
+/// USERPROFILE's independent install.ps1 default followed by deploy.ps1's
+/// default `C:\octos\bin`. Windows scans both HOME and USERPROFILE because a
+/// Unix tool may override HOME, while install.ps1's `$HOME` comes from
+/// USERPROFILE. Pure helper so the fresh-PATH / custom-prefix / deploy-root
+/// cases are testable without touching the process env.
+fn install_candidate_dirs_with(
+    home: Option<&std::ffi::OsStr>,
+    userprofile: Option<&std::ffi::OsStr>,
+    prefix: Option<&std::ffi::OsStr>,
+    is_windows: bool,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(prefix) = prefix.filter(|p| !p.is_empty()) {
+        dirs.push(PathBuf::from(prefix));
+    }
+    if is_windows {
+        for root in [home, userprofile]
+            .into_iter()
+            .flatten()
+            .filter(|p| !p.is_empty())
+        {
+            let dir = PathBuf::from(root).join(".octos").join("bin");
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        let deploy_dir = PathBuf::from(DEPLOY_DEFAULT_BIN_DIR);
+        if !dirs.contains(&deploy_dir) {
+            dirs.push(deploy_dir);
+        }
+    } else if let Some(home) = home.or(userprofile).filter(|p| !p.is_empty()) {
+        dirs.push(PathBuf::from(home).join(".octos").join("bin"));
+    }
+    dirs
+}
+
 /// `locate()` scans PATH + Homebrew/cargo/`~/.local/bin`, but octoscode's
 /// auto-installer drops `octos` into `~/.octos/bin`, off both — add it (deduped
-/// by canonical path).
+/// by canonical path). #1483B: Windows fresh-PATH hosts need the independent
+/// USERPROFILE candidate and the deploy.ps1 default root, or doctor reports
+/// "none found" on a correctly installed host.
 fn locate_with_octos_bin(spec: &ProductSpec) -> LocatedBinaries {
     let mut located = locate(spec);
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = Path::new(&home)
-            .join(".octos")
-            .join("bin")
-            .join(spec.binary_file_name());
+    for dir in install_candidate_dirs_with(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+        std::env::var_os("OCTOS_PREFIX").as_deref(),
+        cfg!(windows),
+    ) {
+        let candidate = dir.join(spec.binary_file_name());
         if candidate.is_file() {
             let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
             let already = located
@@ -2114,5 +2162,99 @@ fn channels_check(config: &crate::config::Config) -> Check {
                 ),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1483B — a fresh Windows PATH (no HOME, only USERPROFILE) must still
+    /// yield the install.ps1 default dir, and the deploy.ps1 default root is
+    /// scanned only on Windows.
+    #[test]
+    fn should_cover_fresh_windows_path_and_deploy_root_in_install_candidates() {
+        let up = std::ffi::OsStr::new(r"C:\Users\alice");
+        let dirs = install_candidate_dirs_with(None, Some(up), None, true);
+        let expected = PathBuf::from(up).join(".octos").join("bin");
+        assert!(
+            dirs.contains(&expected),
+            "USERPROFILE fallback locates install.ps1's default: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&PathBuf::from(r"C:\octos\bin")),
+            "deploy.ps1's default RemoteRoot\\bin is scanned on Windows"
+        );
+        // Windows install.ps1 resolves $HOME from USERPROFILE, even when a
+        // Unix tool has exported a different HOME: scan both independently.
+        let divergent = install_candidate_dirs_with(
+            Some(std::ffi::OsStr::new(r"D:\msys\home\alice")),
+            Some(up),
+            Some(std::ffi::OsStr::new(r"D:\tools\octos")),
+            true,
+        );
+        assert_eq!(
+            divergent,
+            vec![
+                PathBuf::from(r"D:\tools\octos"),
+                PathBuf::from(r"D:\msys\home\alice")
+                    .join(".octos")
+                    .join("bin"),
+                expected.clone(),
+                PathBuf::from(r"C:\octos\bin"),
+            ]
+        );
+        let same_home = install_candidate_dirs_with(Some(up), Some(up), None, true);
+        assert_eq!(
+            same_home,
+            vec![expected.clone(), PathBuf::from(r"C:\octos\bin")]
+        );
+        let empty_home =
+            install_candidate_dirs_with(Some(std::ffi::OsStr::new("")), Some(up), None, true);
+        assert_eq!(empty_home, vec![expected, PathBuf::from(r"C:\octos\bin")]);
+        // Non-Windows never scans the deploy root.
+        let unix_dirs = install_candidate_dirs_with(
+            Some(std::ffi::OsStr::new("/home/alice")),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(unix_dirs, vec![PathBuf::from("/home/alice/.octos/bin")]);
+        // A custom OCTOS_PREFIX (install.ps1 -Prefix) is scanned FIRST.
+        let custom = install_candidate_dirs_with(
+            None,
+            Some(up),
+            Some(std::ffi::OsStr::new(r"D:\tools\octos")),
+            true,
+        );
+        assert_eq!(custom[0], PathBuf::from(r"D:\tools\octos"));
+        // Empty env values are ignored rather than producing relative dirs.
+        let empty = install_candidate_dirs_with(
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("")),
+            true,
+        );
+        assert_eq!(empty, vec![PathBuf::from(r"C:\octos\bin")]);
+    }
+
+    /// #1483B — on a fresh PATH (binary only in the install dir), the doctor
+    /// locator must FIND the install off-PATH instead of reporting "none
+    /// found"; the on-PATH check then points at the exact directory to add.
+    #[test]
+    fn should_locate_an_off_path_install_and_point_at_its_directory() {
+        let located = octos_diagnostics::LocatedBinaries {
+            on_path: vec![],
+            off_path: vec![PathBuf::from(r"C:\octos\bin\octos.exe")],
+        };
+        let rows = install_rows(&located);
+        assert_eq!(rows.len(), 1, "the install is enumerated, not 'none found'");
+        assert!(rows[0].contains("off PATH"), "{rows:?}");
+        let check = installs_check("octos", &located);
+        assert_ne!(
+            check.status,
+            octos_diagnostics::CheckStatus::Warn,
+            "a single located install is not a warning"
+        );
     }
 }
