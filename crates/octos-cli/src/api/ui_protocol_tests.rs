@@ -361,6 +361,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             json!({ "session_id": ada_session }),
         ),
         features,
+        None,
         Some("grace"),
     )
     .await
@@ -373,6 +374,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             json!({ "session_id": grace_session }),
         ),
         features,
+        None,
         Some("ada"),
     )
     .await
