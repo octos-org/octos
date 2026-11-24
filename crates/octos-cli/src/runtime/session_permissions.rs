@@ -381,6 +381,48 @@ pub fn permission_record_path(
         .join(format!("{topic}.json"))
 }
 
+/// Preserve the durable path identity while allowing long but legal session IDs
+/// on Windows. The verbatim path is used only for filesystem I/O, never for
+/// record identity or path comparisons.
+#[cfg(windows)]
+fn permission_io_path(path: &Path) -> PathBuf {
+    use std::{ffi::OsString, path::Component, path::Prefix};
+
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) => {
+            let mut verbatim = OsString::from(r"\\?\");
+            verbatim.push(path.as_os_str());
+            PathBuf::from(verbatim)
+        }
+        Prefix::UNC(server, share) => {
+            let mut verbatim = OsString::from(r"\\?\UNC\");
+            verbatim.push(server);
+            verbatim.push(r"\");
+            verbatim.push(share);
+            for component in components {
+                if let Component::Normal(part) = component {
+                    verbatim.push(r"\");
+                    verbatim.push(part);
+                }
+            }
+            PathBuf::from(verbatim)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(not(windows))]
+fn permission_io_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn read_record(
     data_dir: &Path,
     profile_id: Option<&str>,
@@ -388,7 +430,7 @@ fn read_record(
 ) -> Result<Option<StoredSessionPermissionProfile>, SessionPermissionError> {
     let session_id = canonical_session_identity(session_id);
     let path = permission_record_path(data_dir, profile_id, &session_id);
-    let contents = match std::fs::read_to_string(&path) {
+    let contents = match std::fs::read_to_string(permission_io_path(&path)) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -452,10 +494,11 @@ pub fn persist_session_permission(
         let parent = path
             .parent()
             .ok_or_else(|| SessionPermissionError::invalid("permission record has no parent"))?;
-        std::fs::create_dir_all(parent).map_err(|error| {
+        let io_parent = permission_io_path(parent);
+        std::fs::create_dir_all(&io_parent).map_err(|error| {
             SessionPermissionError::io(format!("create {}: {error}", parent.display()))
         })?;
-        let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        let mut file = tempfile::NamedTempFile::new_in(&io_parent).map_err(|error| {
             SessionPermissionError::io(format!(
                 "create temporary record in {}: {error}",
                 parent.display()
@@ -474,12 +517,12 @@ pub fn persist_session_permission(
             .map_err(|error| {
                 SessionPermissionError::io(format!("write {}: {error}", path.display()))
             })?;
-        file.persist(&path).map_err(|error| {
+        file.persist(permission_io_path(&path)).map_err(|error| {
             SessionPermissionError::io(format!("replace {}: {error}", path.display()))
         })?;
         #[cfg(unix)]
         {
-            let directory = std::fs::File::open(parent).map_err(|error| {
+            let directory = std::fs::File::open(&io_parent).map_err(|error| {
                 SessionPermissionError::io(format!("open {} for fsync: {error}", parent.display()))
             })?;
             directory.sync_all().map_err(|error| {
@@ -511,7 +554,7 @@ pub fn clear_session_permission(
     session_id: &SessionKey,
 ) -> Result<(), SessionPermissionError> {
     let path = permission_record_path(data_dir, profile_id, session_id);
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(permission_io_path(&path)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -544,7 +587,7 @@ pub fn clear_session_permission_scope(
         })?
         .to_path_buf();
     let result = (|| {
-        let entries = match std::fs::read_dir(&base_dir) {
+        let entries = match std::fs::read_dir(permission_io_path(&base_dir)) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
