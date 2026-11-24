@@ -6,6 +6,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use octos_core::SessionKey;
@@ -103,22 +104,74 @@ pub fn claim_raw_session(
     };
     let body = serde_json::to_vec(&record)
         .map_err(|error| RawSessionOwnershipError::Invalid(error.to_string()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RawSessionOwnershipError::Invalid("owner marker name is invalid".into()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RawSessionOwnershipError::Invalid(error.to_string()))?
+        .as_nanos();
+    let temp = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(&temp)
     {
         Ok(mut file) => {
             if let Err(error) = file.write_all(&body).and_then(|_| file.sync_all()) {
                 drop(file);
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&temp);
                 return Err(RawSessionOwnershipError::Invalid(error.to_string()));
             }
+        }
+        Err(error) => return Err(RawSessionOwnershipError::Invalid(error.to_string())),
+    }
+    match std::fs::hard_link(&temp, &path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&temp);
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_marker(data_dir, profile_id, session_id)
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                read_marker(data_dir, profile_id, session_id)
+            } else {
+                Err(RawSessionOwnershipError::Invalid(error.to_string()))
+            }
         }
-        Err(error) => Err(RawSessionOwnershipError::Invalid(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_retry_a_claim_after_a_crash_left_only_a_stale_temp_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path();
+        let session_id = SessionKey("raw-session".into());
+        let storage_id = raw_storage_identity(&session_id);
+        let marker = marker_path(data_dir, &storage_id);
+        let parent = marker.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let stale_temp = parent.join(format!(
+            ".{}.tmp-999999-stale",
+            marker.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::write(&stale_temp, "partial owner record").unwrap();
+
+        claim_raw_session(data_dir, "profile-a", &session_id, false).unwrap();
+
+        assert_eq!(
+            authorize_raw_session(data_dir, "profile-a", &session_id),
+            Ok(())
+        );
+        assert_eq!(
+            claim_raw_session(data_dir, "profile-b", &session_id, false),
+            Err(RawSessionOwnershipError::WrongOwner("profile-a".to_owned()))
+        );
+        assert!(stale_temp.is_file(), "the stale temp file is left inert");
     }
 }
