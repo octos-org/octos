@@ -95,8 +95,9 @@ fn refresh(ctx: &Context, plan: &Value) -> Result<Value> {
 
     let pages = approved_slides(ctx, plan)?;
     let page_ids: Vec<_> = pages.iter().map(|p| &p["page_id"]).collect();
+    let relative_output = output.strip_prefix(&ctx.root)?.to_string_lossy();
     let status = |hash: &Value| {
-        json!({"output": if hash.is_null() { Value::Null } else { json!({"path":OUTPUT,"sha256":hash}) },
+        json!({"output": if hash.is_null() { Value::Null } else { json!({"path":relative_output,"sha256":hash}) },
         "pages":page_ids,"total_pages":plan["pages"].as_array().unwrap().len(),"quality_approved":false})
     };
     let inputs = json!({"engine_revision":crate::ENGINE_REV,"pages":pages});

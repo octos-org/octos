@@ -57,7 +57,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-pub const ENGINE_REV: &str = "2c97539d8a29a597dc01fb8743ecc970329ffef0";
+pub const ENGINE_REV: &str = "a812160f5bb3575d6a9db4ce7db5264b080f5ce9";
 pub struct Context {
     pub root: PathBuf,
     pub continuation_owner: Option<String>,

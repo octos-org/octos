@@ -785,10 +785,8 @@ fn separately_rendered_candidate_keeps_the_source_the_maker_built() {
     assert_eq!(gate(&ctx)["pages"][0]["candidate_current"], true);
     let candidate = ctx.json("alpha-candidate.json").unwrap();
     assert!(
-        candidate["source"]["path"]
-            .as_str()
-            .unwrap()
-            .starts_with(".octos/page-sources/")
+        std::path::Path::new(candidate["source"]["path"].as_str().unwrap())
+            .starts_with(".octos/page-sources")
     );
     assert_eq!(
         ctx.json(ctx.verify(&candidate["source"]).unwrap()).unwrap()["copy"]["label"],
@@ -813,7 +811,7 @@ fn frozen_publication_survives_draft_edits_and_still_detects_snapshot_changes() 
         .unwrap();
     let published = &result["page_publication"]["handoff"];
     let source = published["source"]["path"].as_str().unwrap();
-    assert!(source.starts_with(".octos/page-sources/"));
+    assert!(std::path::Path::new(source).starts_with(".octos/page-sources"));
     assert_eq!(
         result["peer_review_handoff"]["candidate_id"],
         published["candidate_id"]
@@ -1612,7 +1610,7 @@ fn run_twenty_pages(per_page: bool) {
                     let published = maker.execute(json!({"action":"page_publish","page":id,"cycle":format!("{id}-build/cycle.json")})).unwrap();
                     made["peer_review_handoff"] = published["handoff"].clone();
                     let source = published["handoff"]["source"]["path"].as_str().unwrap();
-                    assert!(source.starts_with(".octos/page-sources/"));
+                    assert!(std::path::Path::new(source).starts_with(".octos/page-sources"));
                     let path = format!("{id}.json");
                     let mut next_draft = maker.json(&path).unwrap();
                     next_draft["pages"][0]["notes"] = json!("A private draft for a future revision");
