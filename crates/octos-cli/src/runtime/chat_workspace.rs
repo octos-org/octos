@@ -115,6 +115,10 @@ fn canonical_dir(path: &Path) -> PathBuf {
     octos_core::canonicalize_lossy(path)
 }
 
+fn registered_path(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 fn root_identity(path: &Path) -> std::io::Result<String> {
     let metadata = std::fs::metadata(path)?;
     #[cfg(unix)]
@@ -129,13 +133,14 @@ fn root_identity(path: &Path) -> std::io::Result<String> {
 }
 
 fn unresolved_marker_path(root: &Path) -> std::io::Result<PathBuf> {
-    Ok(root.join(".octos-root-identity"))
+    Ok(registered_path(root).join(".octos-root-identity"))
 }
 
 fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
-    let marker = unresolved_marker_path(root)?;
-    let current = root_identity(root)?;
-    let expected = layout_read().server_root_identities.get(root).cloned();
+    let root = registered_path(root);
+    let marker = unresolved_marker_path(&root)?;
+    let current = root_identity(&root)?;
+    let expected = layout_read().server_root_identities.get(&root).cloned();
     if expected.as_deref() != Some(current.as_str()) {
         return Err(std::io::Error::other(format!(
             "server chats root {} changed identity before becoming populated",
@@ -143,7 +148,7 @@ fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
         )));
     }
     let mut layout = layout_write();
-    layout.healable_server_roots.remove(root);
+    layout.healable_server_roots.remove(&root);
     layout
         .unresolved_server_roots
         .insert(marker.clone(), root.to_path_buf());
@@ -321,7 +326,7 @@ pub(crate) fn configure_server_root(
     profile_data_dirs: &[PathBuf],
     workspace_roots: &[PathBuf],
 ) -> std::io::Result<PathBuf> {
-    let root = canonical_dir(&data_dir.join(CHAT_WORKSPACES_DIR));
+    let root = registered_path(&canonical_dir(&data_dir.join(CHAT_WORKSPACES_DIR)));
     validate_server_root(&root, profile_data_dirs, workspace_roots)?;
     migrate_server_root(data_dir, profile_data_dirs, &root)?;
     private_dir(&root, true)?;
@@ -385,7 +390,7 @@ pub(crate) fn install_missing_root_healer() {
 fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> {
     // The registered path is the lookup key; `resolved` only describes the
     // object currently found there.
-    let folder = folder.to_path_buf();
+    let folder = registered_path(folder);
     if std::fs::symlink_metadata(&folder)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
@@ -425,9 +430,9 @@ fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> 
 }
 
 fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool, String> {
-    // The registered path is the lookup key; canonicalizing here would resolve
-    // a symlink replacement before the ownership map can identify it.
-    let folder = folder.to_path_buf();
+    // The registered path is the lookup key; normalizing strips a trailing
+    // separator without resolving a symlink replacement.
+    let folder = registered_path(folder);
     let marker_root = layout_read().unresolved_server_roots.get(&folder).cloned();
     if let Some(root) = marker_root {
         let expected = layout_read().server_root_identities.get(&root).cloned();
