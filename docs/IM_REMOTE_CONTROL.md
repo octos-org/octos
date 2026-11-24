@@ -210,6 +210,7 @@ SessionTurnService（从 OUP handlers 抽取的内部服务，新增）
   - bridge 处理完（turn 已落盘，或已在 chat 里回复），才从下一个 offset 再拉；Telegram 正是靠这次请求得知前面的 update 已确认。
   - 所以重启、断线、Telegram 重发同一个 update，都只会撞上已有的 turn，什么都不跑。
   - offset 只在 Telegram 那边：它保留未确认的 update 24 小时，过期的由 bridge 的 TTL 拒绝。
+  - 只有处理完一批之后的那一次拉取带 offset，用来确认这一批；其余拉取（上一次为空或失败之后）都从 0 拉，也就是从 Telegram 最早的未确认 update 拉。原因：一周没有 update 之后，Telegram 会随机给下一个 update 编号，可能比旧 offset 小，带着旧 offset 拉会把它没交给 bridge 就确认掉（评审）。最坏情况是确认丢失的那一批再来一次，什么都不会重跑。
   - 拉取失败按 1 秒起翻倍、最多 60 秒退避，然后继续拉。
 - **识别**：
   - chat 类型是 `private` 的才算私聊；

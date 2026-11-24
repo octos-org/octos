@@ -10,6 +10,13 @@
 //! keeps an update it was not told about for 24 hours; the bridge's time to
 //! live refuses anything older than it allows.
 //!
+//! The loop asks from an offset only right after a batch, to tell Telegram
+//! it is done; any other poll, after an empty one or a failure, asks from
+//! Telegram's earliest update it was not told about. After a week with no
+//! updates Telegram numbers the next one at random, possibly below the last
+//! offset, and asking from that offset would confirm it unseen. At worst a
+//! batch whose confirmation was lost comes again, and runs nothing again.
+//!
 //! A reply goes out in pieces Telegram accepts, as HTML when it formats,
 //! the first piece as a reply to the message. A send Telegram did not
 //! answer may still have arrived, so it is not tried again and the bridge
@@ -92,10 +99,12 @@ pub(crate) fn im_message(message: &Message) -> ImMessage {
 
 /// Give `bot`'s messages to `bridge` until aborted.
 pub(crate) async fn poll(bridge: Arc<ServeImBridge>, bot: Arc<TelegramBot>) {
+    // After the last batch, the offset that confirms it; else 0.
     let mut offset = 0;
     let mut backoff = BACKOFF;
     loop {
-        let updates = match bot.api.get_updates(offset, WAIT).await {
+        let asked = std::mem::take(&mut offset);
+        let updates = match bot.api.get_updates(asked, WAIT).await {
             Ok(updates) => updates,
             Err(error) => {
                 warn!(bot = bot.id.bot, %error, "serve.im: Telegram getUpdates failed; asking again");

@@ -72,10 +72,16 @@ impl FakeTelegram {
     }
 
     fn asked_from(&self, offset: i64) -> bool {
+        self.polls().contains(&offset)
+    }
+
+    /// The offset of each `getUpdates`, in order.
+    fn polls(&self) -> Vec<i64> {
         let calls = self.calls.lock().unwrap();
-        calls
-            .iter()
-            .any(|(method, body)| method == "getUpdates" && body["offset"] == offset)
+        let polls = calls.iter().filter(|(method, _)| method == "getUpdates");
+        polls
+            .map(|(_, body)| body["offset"].as_i64().unwrap())
+            .collect()
     }
 }
 
@@ -216,8 +222,8 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     let (fake, url) = FakeTelegram::start().await;
     // The first poll gets no answer; the transport asks again.
     fake.answer_next("getUpdates", StatusCode::BAD_GATEWAY, "Bad Gateway");
-    fake.push(update(1, ME, "private", "hello"));
-    fake.push(update(2, GROUP, "group", "hello all"));
+    fake.push(update(50, ME, "private", "hello"));
+    fake.push(update(51, GROUP, "group", "hello all"));
     let im = start(
         &fx.state,
         &entries(&chat),
@@ -232,11 +238,22 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
         Some(fake.sends()).filter(|s| s.len() == 2)
     })
     .await;
-    assert!(sends.contains(&(ME, "reply: hello".into(), Some(1), true)));
+    assert!(sends.contains(&(ME, "reply: hello".into(), Some(50), true)));
     let refused = "This chat is not linked to octos.".to_owned();
-    assert!(sends.contains(&(GROUP, refused, Some(2), true)));
+    assert!(sends.contains(&(GROUP, refused, Some(51), true)));
     // Both are told done by asking from the offset after them.
-    until("asking from 3", || fake.asked_from(3).then_some(())).await;
+    let polled_since = || {
+        let polls = fake.polls();
+        let told = polls.iter().position(|offset| *offset == 52)?;
+        (polls.len() > told + 1).then_some(())
+    };
+    until("a poll after telling", polled_since).await;
+    // After a quiet week Telegram numbers the next update at random, here
+    // below the last offset: it still reaches the bridge before it is told.
+    fake.push(update(7, ME, "private", "a week later"));
+    let sends = until("the reply", || Some(fake.sends()).filter(|s| s.len() == 3)).await;
+    assert_eq!(sends[2], (ME, "reply: a week later".into(), Some(7), true));
+    until("asking from 8", || fake.asked_from(8).then_some(())).await;
     drop(im);
     drop(fx);
 
@@ -244,8 +261,8 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     // (serve stopped before its next poll), and a new one: only the new one
     // runs, and only it is answered.
     let (fake, url) = FakeTelegram::start().await;
-    fake.push(update(1, ME, "private", "hello"));
-    fake.push(update(3, ME, "private", "again"));
+    fake.push(update(50, ME, "private", "hello"));
+    fake.push(update(52, ME, "private", "again"));
     let fx = restart(dir.path(), llm.clone()).await;
     let im = start(
         &fx.state,
@@ -257,10 +274,11 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     )
     .await;
     let _im = im.unwrap();
-    until("asking from 4", || fake.asked_from(4).then_some(())).await;
+    until("asking from 53", || fake.asked_from(53).then_some(())).await;
     let sends = until("the reply", || Some(fake.sends()).filter(|s| !s.is_empty())).await;
-    assert_eq!(sends, [(ME, "reply: again".into(), Some(3), true)]);
-    assert_eq!(*llm.prompts.lock().unwrap(), ["hello", "again"]);
+    assert_eq!(sends, [(ME, "reply: again".into(), Some(52), true)]);
+    let prompts = llm.prompts.lock().unwrap().clone();
+    assert_eq!(prompts, ["hello", "a week later", "again"]);
 }
 
 #[tokio::test]
