@@ -83,9 +83,10 @@ pub struct SandboxConfig {
     /// (rw) on top of the usual system-ro / tmpfs / cwd binds — so NO host
     /// AF_UNIX socket (`SSH_AUTH_SOCK`, `/var/run/docker.sock`) is ever exposed —
     /// and macOS emits `(allow file-write* (subpath "<repo>/.git"))` alongside the
-    /// cwd grant (viable only under an unrestricted-read profile, since git must
-    /// also READ `<repo>/.git`). Docker, Landlock, and AppContainer ignore it
-    /// (the fleet worktree flow is gated to bwrap / full-read macOS). The default
+    /// cwd grant, plus the matching `file-read*` rule when its reads are
+    /// restricted (git must also READ `<repo>/.git`; only that directory is
+    /// opened, not the checkout beside it). Docker, Landlock, and AppContainer
+    /// ignore it (the fleet worktree flow is gated to bwrap / macOS). The default
     /// (`None`) preserves today's cwd-only-writable behaviour for every config
     /// that never sets it.
     #[serde(default)]
@@ -590,9 +591,8 @@ pub trait Sandbox: Send + Sync {
     /// ([`SandboxConfig::repo_git_write`]) TOGETHER WITH the reads git also needs
     /// — the capability the fleet worktree flow probes at serve boot. bwrap can
     /// (a targeted `--bind <repo>/.git <repo>/.git` plus its read binds); macOS
-    /// can ONLY under an unrestricted-read profile (a restricted-read profile
-    /// would grant the `<repo>/.git` write but deny the `<repo>/.git` READ
-    /// `git commit` needs); Docker, Landlock, AppContainer, and [`NoSandbox`]
+    /// can (a write rule for `<repo>/.git`, and under a restricted-read profile
+    /// the matching read rule); Docker, Landlock, AppContainer, and [`NoSandbox`]
     /// cannot, so the pool falls back to a scratch workspace (no worktree, no
     /// lost deliverable). The pool gate ANDs this with `FsGrant::Host` and a git
     /// controller root. This is the surviving kernel of the parked

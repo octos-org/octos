@@ -409,10 +409,12 @@ fn worktree_admin_dir(checkout: &Path) -> Option<PathBuf> {
 /// worker-planted local-config `filter.*.clean` triggered by `git add`, or a
 /// commit hook, is CONTAINED — never executed host-side with the controller's
 /// network. Hooks are disabled here too (`-c core.hooksPath=/dev/null`, belt) so
-/// even a planted `post-commit` never runs; it deliberately does NOT mask
-/// `GIT_CONFIG_GLOBAL`/`SYSTEM` like [`git_command`], because running the
-/// worker's OWN local-config `filter.*` at its contained grant is exactly the
-/// point (dissolution (b)). The caller does NOT gate on this command's exit
+/// even a planted `post-commit` never runs. The repository's LOCAL config is
+/// left in force: running the worker's OWN local-config `filter.*` at its
+/// contained grant is exactly the point (dissolution (b)). The string itself
+/// does not mask the global/system config either; the fleet worker's command
+/// builder does that in the environment, as the shell tool does for the
+/// agent's own `git` commands. The caller does NOT gate on this command's exit
 /// code (a clean tree, or a worker's own broken filter, exits non-zero without
 /// being an infra error) — the authoritative "did a deliverable land?" check is
 /// [`branch_advanced_past`], read host-side.
@@ -429,8 +431,8 @@ pub fn deliverable_commit_command(message: &str) -> String {
     // `-c core.hooksPath=/dev/null` on BOTH ops (belt): disables ALL git hooks so
     // even a planted `post-commit`/`post-index-change` hook — which `--no-verify`
     // does NOT skip — never runs. This is defense in depth; the commit already
-    // runs INSIDE the worker's sandbox at its (contained) grant. It deliberately
-    // does NOT mask `GIT_CONFIG_GLOBAL`/`SYSTEM`: the worker's OWN local-config
+    // runs INSIDE the worker's sandbox at its (contained) grant. The LOCAL
+    // config is deliberately left in force: the worker's OWN local-config
     // `filter.*` running at its contained grant is the point (dissolution (b)).
     format!(
         "git -c core.hooksPath=/dev/null add -A && if ! git diff --cached --quiet; then \

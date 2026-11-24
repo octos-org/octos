@@ -96,8 +96,8 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
 /// reads git needs, AND run the POSIX sh strings the flow feeds the worker.
 /// Computed at serve boot (mirrors [`fleet_sandbox_is_isolating`]) from the
 /// base sandbox's `supports_repo_git_write()` AND `runs_posix_sh()`: the write
-/// capability is `true` for bwrap and unrestricted-read macOS, `false` for
-/// docker, restricted-read macOS, Landlock, AppContainer, and no sandbox; the
+/// capability is `true` for bwrap and macOS, `false` for docker, Landlock,
+/// AppContainer, and no sandbox; the
 /// sh capability keeps a future full-FS backend that wraps `cmd /C` from
 /// degrading every worktree attempt into empty-branch rejections (#2707 — the
 /// populate/commit commands are POSIX sh, see `octos-core`'s `git_worktree`).
@@ -1634,7 +1634,7 @@ impl ServeCommand {
                             keeper_profile_id: rt.profile_id.clone(),
                             // §5 gate condition 3: only take the worktree flow when
                             // the resolved backend supports full-FS write (bwrap /
-                            // full-read macOS) AND runs the POSIX sh the worker-side
+                            // macOS) AND runs the POSIX sh the worker-side
                             // commands are written in (#2707). Otherwise every task
                             // falls back to a scratch workspace so a non-supporting
                             // backend never loses a deliverable.

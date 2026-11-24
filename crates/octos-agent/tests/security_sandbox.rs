@@ -421,3 +421,157 @@ fn should_reject_path_traversal() {
     assert!(resolve_path(base, "src/../../etc/passwd").is_err());
     assert!(resolve_path(base, "../other-user/secrets").is_err());
 }
+
+// ── Fleet worktree flow under restricted reads ───────────────────────────
+
+/// A directory the DEFAULT read allow-list does not cover (the system temp
+/// directories are on it), so a restricted-read profile really cannot read
+/// what a test puts there — like a repository under a user's home directory.
+fn unlisted_base() -> std::path::PathBuf {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sandbox-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::canonicalize(base).unwrap()
+}
+
+/// Run `git <args>` in `dir` on the host; trimmed stdout.
+fn host_git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The user's repository — one commit, and a file of theirs that is not in it —
+/// with a linked worktree on branch `task` in a separate directory: a fleet
+/// task's checkout beside the user's own.
+struct TaskCheckout {
+    _dir: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    checkout: std::path::PathBuf,
+}
+
+impl TaskCheckout {
+    fn new() -> Self {
+        let dir = tempfile::tempdir_in(unlisted_base()).unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = root.join("repo");
+        let checkout = root.join("work").join("task");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        host_git(&repo, &["init", "-q"]);
+        host_git(&repo, &["config", "user.email", "fleet@test"]);
+        host_git(&repo, &["config", "user.name", "fleet-test"]);
+        host_git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+        host_git(&repo, &["add", "-A"]);
+        host_git(&repo, &["commit", "-q", "-m", "seed"]);
+        std::fs::write(repo.join("notes.txt"), "the user's notes\n").unwrap();
+        host_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        Self {
+            _dir: dir,
+            repo,
+            checkout,
+        }
+    }
+}
+
+/// The macOS backend the way a server builds it for a fleet worker: reads
+/// restricted to an allow-list, plus whatever `repo_git_write` grants.
+fn restricted_read_sandbox(
+    repo_git_write: Option<std::path::PathBuf>,
+) -> Box<dyn octos_agent::Sandbox> {
+    octos_agent::create_sandbox(&octos_agent::SandboxConfig {
+        mode: octos_agent::sandbox::SandboxMode::Macos,
+        read_allow_paths: vec!["/usr".into()],
+        repo_git_write,
+        ..Default::default()
+    })
+}
+
+/// Run `cmd` in `cwd` under `sandbox`: (exit code, stdout, stderr). Git is
+/// kept away from the user's own configuration, as the fleet worker keeps it.
+fn run_under(sandbox: &dyn octos_agent::Sandbox, cmd: &str, cwd: &Path) -> (i32, String, String) {
+    let mut command = sandbox.wrap_command(cmd, cwd);
+    let output = command
+        .as_std_mut()
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("the sandboxed command runs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn should_commit_in_a_linked_worktree_when_reads_are_restricted_and_the_git_dir_is_granted() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let task = TaskCheckout::new();
+    let sandbox = restricted_read_sandbox(Some(task.repo.join(".git")));
+
+    assert!(
+        sandbox.supports_repo_git_write(),
+        "a restricted-read profile can run the worktree flow",
+    );
+    let (code, _, stderr) = run_under(
+        sandbox.as_ref(),
+        "echo patched > seed.txt && git add -A && git commit -q -m patch",
+        &task.checkout,
+    );
+
+    assert_eq!(code, 0, "the commit must succeed: {stderr}");
+    assert_eq!(host_git(&task.repo, &["show", "task:seed.txt"]), "patched");
+}
+
+#[test]
+fn should_read_only_the_git_dir_of_the_users_repository_when_it_is_granted() {
+    if skip_without_sandbox() {
+        return;
+    }
+    let task = TaskCheckout::new();
+    let notes = task.repo.join("notes.txt");
+    let head = task.repo.join(".git").join("HEAD");
+    let cat = |file: &Path| format!("cat '{}'", file.display());
+
+    // Without the grant, nothing of the user's repository can be read.
+    let plain = restricted_read_sandbox(None);
+    let (code, _, _) = run_under(plain.as_ref(), &cat(&notes), &task.checkout);
+    if code == 0 {
+        eprintln!("SKIP: the build directory is on the default read allow-list");
+        return;
+    }
+    let (code, _, stderr) = run_under(plain.as_ref(), &cat(&head), &task.checkout);
+    assert_ne!(code, 0, "no grant, no read of the git dir");
+    assert_permission_denied(&stderr, "reading the git dir without the grant");
+
+    // With it, the git dir can be read — and the user's own files still cannot.
+    let granted = restricted_read_sandbox(Some(task.repo.join(".git")));
+    let (code, stdout, stderr) = run_under(granted.as_ref(), &cat(&head), &task.checkout);
+    assert_eq!(code, 0, "the granted git dir is readable: {stderr}");
+    assert!(stdout.contains("refs/heads/"), "got: {stdout}");
+    let (code, stdout, stderr) = run_under(granted.as_ref(), &cat(&notes), &task.checkout);
+    assert_ne!(code, 0, "the grant is for the git dir only, got: {stdout}");
+    assert_permission_denied(&stderr, "reading the user's own file");
+}
