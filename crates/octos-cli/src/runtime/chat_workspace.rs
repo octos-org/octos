@@ -1063,12 +1063,12 @@ mod server_root_tests {
     }
 
     async fn run_hidden_command(root: &Path, command: &str) -> Option<std::process::Output> {
-        // Other tests share this process-global list. Drop only stale fixture
-        // roots outside this test's TempDir; a missing root under this fixture
-        // is the case under test and must reach the resolver.
-        let reserved = reserved_folders();
+        // Other tests share this process-global list. Drop only stale roots
+        // outside this TempDir, as given or resolved (macOS: /var -> /private/var);
+        // a missing root under it is the case under test and must reach the resolver.
+        let (reserved, real) = (reserved_folders(), root.canonicalize().unwrap());
         for folder in reserved.folders() {
-            if !folder.exists() && !folder.starts_with(root) {
+            if !folder.exists() && !folder.starts_with(root) && !folder.starts_with(&real) {
                 reserved.remove(&folder);
             }
         }
