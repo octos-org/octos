@@ -263,9 +263,16 @@ fn hidden_folder_rules(
         .collect();
     for registered in hidden.folders() {
         let real = match std::fs::canonicalize(&registered) {
-            Ok(real) => real,
+            Ok(real) => {
+                hidden.resolve_existing_folder(&registered, &real).ok()?;
+                real
+            }
             Err(_) => match hidden.resolve_missing_folder(&registered, &command_roots) {
-                Ok(true) => std::fs::canonicalize(&registered).ok()?,
+                Ok(true) => {
+                    let real = std::fs::canonicalize(&registered).ok()?;
+                    hidden.resolve_existing_folder(&registered, &real).ok()?;
+                    real
+                }
                 Ok(false) => continue,
                 Err(_) => return None,
             },

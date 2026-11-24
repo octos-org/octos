@@ -447,6 +447,11 @@ pub struct SessionScope {
 pub type MissingHiddenFolderHandler =
     std::sync::Arc<dyn Fn(&Path, &[PathBuf]) -> Result<bool, String> + Send + Sync>;
 
+/// Owner callback for a registered hidden folder that resolves. The second
+/// argument is the canonical path. An error keeps the command fail-closed.
+pub type ExistingHiddenFolderHandler =
+    std::sync::Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
+
 /// Folders a scope keeps out of every zone. Clones share one list, so a
 /// folder added later reaches every scope already built with it
 /// (UPCR-2026-R1EFC56A3: a profile started after a session's scope was built
@@ -455,6 +460,7 @@ pub type MissingHiddenFolderHandler =
 pub struct HiddenFolders {
     folders: std::sync::Arc<std::sync::RwLock<Vec<PathBuf>>>,
     missing_handler: std::sync::Arc<std::sync::RwLock<Option<MissingHiddenFolderHandler>>>,
+    existing_handler: std::sync::Arc<std::sync::RwLock<Option<ExistingHiddenFolderHandler>>>,
 }
 
 impl std::fmt::Debug for HiddenFolders {
@@ -500,12 +506,33 @@ impl HiddenFolders {
             .unwrap_or_else(|e| e.into_inner()) = Some(handler);
     }
 
+    /// Install the handler consulted after a hidden folder resolves.
+    pub fn on_existing_folder(&self, handler: ExistingHiddenFolderHandler) {
+        *self
+            .existing_handler
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+
     /// Remove the missing-folder owner, returning to strict fail-closed.
     pub fn clear_missing_folder_handler(&self) {
         *self
             .missing_handler
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Resolve an existing hidden folder through the registered owner, if any.
+    pub fn resolve_existing_folder(&self, folder: &Path, canonical: &Path) -> Result<(), String> {
+        let handler = self
+            .existing_handler
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match handler {
+            Some(handler) => handler(folder, canonical),
+            None => Ok(()),
+        }
     }
 
     /// Resolve a missing hidden folder through the registered owner, if any.

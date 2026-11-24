@@ -61,17 +61,38 @@ fn hidden_mounts(
         .collect();
     for registered in hidden.folders() {
         let folder = match std::fs::canonicalize(&registered) {
-            Ok(folder) => folder,
-            Err(error) => match hidden.resolve_missing_folder(&registered, &command_roots) {
-                Ok(true) => std::fs::canonicalize(&registered).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "hidden folder {} was restored but still cannot resolve: {error}",
+            Ok(folder) => {
+                hidden
+                    .resolve_existing_folder(&registered, &folder)
+                    .map_err(|reason| {
+                        std::io::Error::other(format!(
+                            "hidden folder {} failed ownership validation: {reason}",
                             registered.display()
-                        ),
-                    )
-                })?,
+                        ))
+                    })?;
+                folder
+            }
+            Err(error) => match hidden.resolve_missing_folder(&registered, &command_roots) {
+                Ok(true) => {
+                    let folder = std::fs::canonicalize(&registered).map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "hidden folder {} was restored but still cannot resolve: {error}",
+                                registered.display()
+                            ),
+                        )
+                    })?;
+                    hidden
+                        .resolve_existing_folder(&registered, &folder)
+                        .map_err(|reason| {
+                            std::io::Error::other(format!(
+                                "hidden folder {} failed ownership validation after restore: {reason}",
+                                registered.display()
+                            ))
+                        })?;
+                    folder
+                }
                 Ok(false) => continue,
                 Err(reason) => {
                     return Err(std::io::Error::other(format!(

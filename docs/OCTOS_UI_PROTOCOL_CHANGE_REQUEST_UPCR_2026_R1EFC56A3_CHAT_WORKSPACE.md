@@ -97,9 +97,12 @@ A connection that does not request it sees byte-identical replies.
     AppContainer cannot hide a folder inside one they grant, so there a
     command whose working folder (or a configured read path) holds one
     refuses to run. If a registered folder is missing when a command is
-    wrapped, only the server-level root may be repaired, and only when this
-    command's workspace/read roots cannot reach inside it; it is recreated
-    privately and hidden. A legacy root always keeps the command refused
+    wrapped, only a server-level root known to be empty may be repaired, and
+    only when this command's workspace/read roots cannot reach it; it is
+    recreated privately and hidden. Once the root can hold a chat, its
+    directory identity is recorded and validated on every command wrap, so a
+    renamed or replaced root keeps commands refused until the original
+    directory is restored. A legacy root always keeps the command refused
     because the folder may have been renamed into the command's reach. Restore
     it, or have an operator verify deletion and unregister it with the repair
     flow. Without a sandbox (`sandbox.enabled = false`,

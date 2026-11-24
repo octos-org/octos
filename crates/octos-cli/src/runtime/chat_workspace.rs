@@ -134,12 +134,16 @@ fn unresolved_marker_path(root: &Path) -> std::io::Result<PathBuf> {
 
 fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
     let marker = unresolved_marker_path(root)?;
-    let identity = root_identity(root)?;
+    let current = root_identity(root)?;
+    let expected = layout_read().server_root_identities.get(root).cloned();
+    if expected.as_deref() != Some(current.as_str()) {
+        return Err(std::io::Error::other(format!(
+            "server chats root {} changed identity before becoming populated",
+            root.display()
+        )));
+    }
     let mut layout = layout_write();
     layout.healable_server_roots.remove(root);
-    layout
-        .server_root_identities
-        .insert(root.to_path_buf(), identity);
     layout
         .unresolved_server_roots
         .insert(marker.clone(), root.to_path_buf());
@@ -373,6 +377,40 @@ pub(crate) fn install_missing_root_healer() {
     reserved_folders().on_missing_folder(Arc::new(move |folder, command_roots| {
         heal_missing_folder(folder, command_roots)
     }));
+    reserved_folders().on_existing_folder(Arc::new(|folder, resolved| {
+        verify_existing_folder(folder, resolved)
+    }));
+}
+
+fn verify_existing_folder(folder: &Path, resolved: &Path) -> Result<(), String> {
+    let folder = canonical_dir(folder);
+    if layout_read().unresolved_server_roots.contains_key(&folder) {
+        return Err(format!(
+            "server chats identity marker {} must stay absent",
+            folder.display()
+        ));
+    }
+    let populated = layout_read()
+        .unresolved_server_roots
+        .values()
+        .any(|root| root == &folder);
+    if !populated {
+        return Ok(());
+    }
+    let expected = layout_read().server_root_identities.get(&folder).cloned();
+    let current = root_identity(resolved).map_err(|error| {
+        format!(
+            "server chats root {} cannot be identified: {error}",
+            folder.display()
+        )
+    })?;
+    if expected.as_deref() != Some(current.as_str()) {
+        return Err(format!(
+            "server chats root {} was replaced instead of restored",
+            folder.display()
+        ));
+    }
+    Ok(())
 }
 
 fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool, String> {
@@ -660,14 +698,13 @@ fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> 
     }
     if let Some(root) = server_profile_root(profile_id) {
         let server_root = server_root().expect("server_profile_root implies server_root");
-        let mut layout = layout_write();
-        layout
+        // Once a profile can create a chat here, disappearance no longer proves
+        // the root was empty. Validate and pin the populated identity before
+        // caching this profile's mapping.
+        track_populated_server_root(&server_root)?;
+        layout_write()
             .profile_server_roots
             .insert(profile_dir, root.clone());
-        drop(layout);
-        // Once a profile can create a chat here, disappearance no longer proves
-        // the root was empty; every later wrap verifies the populated identity.
-        track_populated_server_root(&server_root)?;
         return Ok(root);
     }
     if cfg!(test) {
@@ -1049,7 +1086,10 @@ mod server_root_tests {
         // is the case under test and must reach the resolver.
         let reserved = reserved_folders();
         for folder in reserved.folders() {
-            if !folder.exists() && !folder.starts_with(root) {
+            let identity_marker = folder
+                .file_name()
+                .is_some_and(|name| name == ".octos-root-identity");
+            if !folder.exists() && !folder.starts_with(root) && !identity_marker {
                 reserved.remove(&folder);
             }
         }
@@ -1203,18 +1243,55 @@ mod server_root_tests {
         assert!(reserved_folders().folders().contains(&marker));
 
         std::fs::create_dir_all(&server_root).unwrap();
-        let Some(output) =
-            run_hidden_command(temp.path(), &format!("cat \"{}\"", moved_secret.display())).await
-        else {
-            return;
-        };
+        let other_profile = temp.path().join("profiles/other/data");
+        std::fs::create_dir_all(&other_profile).unwrap();
+        let identity_error = create(
+            &other_profile,
+            "other",
+            &SessionKey::with_profile("other", "api", "replacement"),
+        )
+        .expect_err("a replacement directory must not be blessed for another profile");
         assert!(
-            !output.status.success(),
-            "status={:?} stdout={} stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            identity_error.to_string().contains("changed identity"),
+            "{identity_error}"
         );
+        assert!(
+            !layout_read()
+                .profile_server_roots
+                .contains_key(&canonical_dir(&other_profile))
+        );
+
+        let command_marker = unrelated.join("ran");
+        std::fs::create_dir_all(&marker).unwrap();
+        if let Some(output) = run_hidden_command(
+            &unrelated,
+            &format!("printf ran > \"{}\"", command_marker.display()),
+        )
+        .await
+        {
+            assert!(
+                !output.status.success(),
+                "status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::remove_dir_all(&marker).unwrap();
+        if let Some(output) = run_hidden_command(
+            &unrelated,
+            &format!("printf ran > \"{}\"", command_marker.display()),
+        )
+        .await
+        {
+            assert!(
+                !output.status.success(),
+                "status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         std::fs::remove_dir_all(&server_root).unwrap();
 
         std::fs::rename(&moved_root, &server_root).unwrap();
@@ -1225,6 +1302,20 @@ mod server_root_tests {
         );
         assert!(reserved_folders().folders().contains(&marker));
         assert!(reserved_folders().folders().contains(&server_root));
+        if let Some(output) = run_hidden_command(
+            &unrelated,
+            &format!("printf ran > \"{}\"", command_marker.display()),
+        )
+        .await
+        {
+            assert!(
+                output.status.success(),
+                "status={:?} stdout={} stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[tokio::test]

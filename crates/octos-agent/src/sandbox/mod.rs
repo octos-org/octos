@@ -1216,13 +1216,31 @@ impl HiddenFolderGuard {
         let mut resolved = Vec::with_capacity(hidden.len());
         for registered in hidden {
             match std::fs::canonicalize(&registered) {
-                Ok(folder) => resolved.push(folder),
+                Ok(folder) => {
+                    if self
+                        .hidden
+                        .resolve_existing_folder(&registered, &folder)
+                        .is_err()
+                    {
+                        return true;
+                    }
+                    resolved.push(folder);
+                }
                 Err(_) => match self
                     .hidden
                     .resolve_missing_folder(&registered, &command_roots)
                 {
                     Ok(true) => match std::fs::canonicalize(&registered) {
-                        Ok(folder) => resolved.push(folder),
+                        Ok(folder) => {
+                            if self
+                                .hidden
+                                .resolve_existing_folder(&registered, &folder)
+                                .is_err()
+                            {
+                                return true;
+                            }
+                            resolved.push(folder);
+                        }
                         Err(_) => return true,
                     },
                     Ok(false) => {}
@@ -1833,6 +1851,42 @@ mod tests {
         std::fs::rename(&hidden_path, temp.path().join("renamed")).unwrap();
         let hidden = octos_core::HiddenFolders::default();
         hidden.add(hidden_path).unwrap();
+        let guard = HiddenFolderGuard {
+            inner: Box::new(bwrap::BwrapSandbox {
+                allow_network: false,
+                workspace_write: true,
+                deliverable_root: None,
+                repo_git_write: None,
+                read_only_view: None,
+                hidden_folders: None,
+            }),
+            hidden,
+            read_allow_paths: Vec::new(),
+        };
+        let output = guard
+            .wrap_command("echo must-not-run", &cwd)
+            .output()
+            .await
+            .expect("refusal command runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains("Refusing to run"), "{stderr}");
+        assert!(!stderr.contains("must-not-run"), "{stderr}");
+    }
+
+    #[tokio::test]
+    async fn should_refuse_when_an_existing_hidden_folder_fails_owner_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let hidden_path = temp.path().join("hidden");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&hidden_path).unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(hidden_path.clone()).unwrap();
+        hidden.on_existing_folder(std::sync::Arc::new(move |folder, _resolved| {
+            assert_eq!(folder, hidden_path);
+            Err("owner rejected the replacement".to_owned())
+        }));
         let guard = HiddenFolderGuard {
             inner: Box::new(bwrap::BwrapSandbox {
                 allow_network: false,
