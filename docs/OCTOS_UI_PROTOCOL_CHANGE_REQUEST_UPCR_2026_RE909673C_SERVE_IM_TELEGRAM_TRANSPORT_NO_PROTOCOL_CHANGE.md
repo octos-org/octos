@@ -1,7 +1,7 @@
 # UPCR-2026-RE909673C — Telegram transport for `serve.im` (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3365
 
 ## Decision record
 
