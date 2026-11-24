@@ -13,8 +13,10 @@ pub(crate) fn check(ctx: &crate::Context, request: &Value) -> Result<Value> {
     let picture = image::RgbImage::from_pixel(117, 65, image::Rgb(color));
     let mut png = Cursor::new(Vec::new());
     picture.write_to(&mut png, image::ImageFormat::Png)?;
-    let mut doc = Presentation::default();
-    doc.slide_size = model::Size::new(160., 90.);
+    let mut doc = Presentation {
+        slide_size: model::Size::new(160., 90.),
+        ..Default::default()
+    };
     let media = doc
         .add_media("probe", "image/png", png.into_inner())
         .context("could not allocate probe picture")?;

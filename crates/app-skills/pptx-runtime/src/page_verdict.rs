@@ -346,10 +346,10 @@ fn validate(ctx: &Context, plan: &Value, verdict: &mut Value) -> Result<()> {
         && ["critical_defects", "open_required_findings"]
             .iter()
             .all(|k| verdict[k].as_array().is_some_and(|v| v.is_empty()));
-    if rejected_without_finding || verdict.get("disposition").is_some() {
-        if disposition(verdict).is_none() {
-            errors.push("a disposition requires a rejected verdict, peer role (reviewer, arbiter or tool_maintainer), reason and resume_when; otherwise list actionable findings".to_owned());
-        }
+    if (rejected_without_finding || verdict.get("disposition").is_some())
+        && disposition(verdict).is_none()
+    {
+        errors.push("a disposition requires a rejected verdict, peer role (reviewer, arbiter or tool_maintainer), reason and resume_when; otherwise list actionable findings".to_owned());
     }
     if let Err(err) = verify_scores(plan, verdict) {
         errors.push(err.to_string());

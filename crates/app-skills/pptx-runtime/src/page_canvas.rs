@@ -17,10 +17,10 @@ pub(crate) fn freeze(ctx: &Context, roster: &Value) -> Result<Option<Canvas>> {
     let row = &roster["pages"][0];
     if let Some(path) = row["spec"].as_str() {
         let file = ctx.path(path)?;
-        if file.is_file() {
-            if let Some(value) = ctx.json(file)?.get("canvas") {
-                return validated(value).map(Some);
-            }
+        if file.is_file()
+            && let Some(value) = ctx.json(file)?.get("canvas")
+        {
+            return validated(value).map(Some);
         }
     }
     let reference = &row["reference"];

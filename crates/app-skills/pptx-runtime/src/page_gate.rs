@@ -227,24 +227,23 @@ fn resolved_build(ctx: &Context, candidate: &Value, id: &str) -> Result<(Value, 
     ctx.verify(&current)?;
     for binding in array(candidate, "receipts")? {
         let path = ctx.verify(binding)?;
-        if let Ok(receipt) = ctx.json(path) {
-            if receipt["input"].is_object()
-                && receipt["output"].is_object()
-                && receipt["input"]["sha256"] == current["sha256"]
-            {
-                ctx.verify(&receipt["input"])?;
-                ctx.verify(&receipt["output"])?;
-                let output = &receipt["output"];
-                if current["sha256"] != output["sha256"] {
-                    // A native empty batch still reserializes OOXML. It has no
-                    // authoring commands to lose when regenerating the source.
-                    let empty_batch = receipt["commands_sha256"] == crate::fs::digest(b"[]")
-                        && receipt["results"].as_array().is_some_and(Vec::is_empty);
-                    has_postbuild_edits = output["sha256"] != build["editable"]["sha256"]
-                        && (has_postbuild_edits || !empty_batch);
-                }
-                current = output.clone();
+        if let Ok(receipt) = ctx.json(path)
+            && receipt["input"].is_object()
+            && receipt["output"].is_object()
+            && receipt["input"]["sha256"] == current["sha256"]
+        {
+            ctx.verify(&receipt["input"])?;
+            ctx.verify(&receipt["output"])?;
+            let output = &receipt["output"];
+            if current["sha256"] != output["sha256"] {
+                // A native empty batch still reserializes OOXML. It has no
+                // authoring commands to lose when regenerating the source.
+                let empty_batch = receipt["commands_sha256"] == crate::fs::digest(b"[]")
+                    && receipt["results"].as_array().is_some_and(Vec::is_empty);
+                has_postbuild_edits = output["sha256"] != build["editable"]["sha256"]
+                    && (has_postbuild_edits || !empty_batch);
             }
+            current = output.clone();
         }
     }
     ensure!(
@@ -302,9 +301,9 @@ pub(crate) fn validate_candidate(ctx: &Context, row: &Value, candidate: &Value) 
         ctx.json(source)?["id"] == id,
         "candidate source names another page"
     );
-    bindings(ctx, &candidate, "dependencies", false)?;
-    bindings(ctx, &candidate, "receipts", true)?;
-    let (resolved, _) = resolved_build(ctx, &candidate, id)?;
+    bindings(ctx, candidate, "dependencies", false)?;
+    bindings(ctx, candidate, "receipts", true)?;
+    let (resolved, _) = resolved_build(ctx, candidate, id)?;
     crate::editable_copy::check(ctx, row, &candidate["artifact"], &resolved["pages"][0])?;
     if let Some(approved) = row.get("approved_background") {
         ctx.verify(approved)
@@ -674,35 +673,6 @@ fn stable_state(ctx: &Context, binding: &Value, mut state: Value) -> Value {
     state
 }
 
-#[cfg(test)]
-mod snapshot_tests {
-    use super::*;
-
-    #[test]
-    fn assessment_binds_parsed_pointer_bytes_and_rejects_concurrent_republication() {
-        let root = tempfile::tempdir().unwrap();
-        let ctx = Context::new(root.path()).unwrap();
-        ctx.write_json("candidate.json", &json!({"version":"A"}))
-            .unwrap();
-        let (value, binding) =
-            load_candidate(&ctx, &json!({"candidate":"candidate.json"})).unwrap();
-        assert_eq!(value["version"], "A");
-        assert_eq!(binding, ctx.binding("candidate.json").unwrap());
-        ctx.replace_json("candidate.json", &json!({"version":"B"}))
-            .unwrap();
-        let state = stable_state(
-            &ctx,
-            &binding,
-            json!({"ready":true,"candidate_current":true,
-            "review_current":true,"ready_for_review":false,"work_stage":"complete","score":99}),
-        );
-        assert_eq!(state["ready"], false);
-        assert_eq!(state["candidate_current"], false);
-        assert_eq!(state["work_stage"], "make");
-        assert!(state.get("score").is_none());
-    }
-}
-
 pub(crate) fn page_state(ctx: &Context, p: &Value, row: &Value) -> Value {
     let mut state = json!({"id":row["id"],"maker_session":row["maker_session"],
         "candidate":null,"ready":false,"candidate_current":false,
@@ -979,4 +949,33 @@ pub fn require_ready(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn assessment_binds_parsed_pointer_bytes_and_rejects_concurrent_republication() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = Context::new(root.path()).unwrap();
+        ctx.write_json("candidate.json", &json!({"version":"A"}))
+            .unwrap();
+        let (value, binding) =
+            load_candidate(&ctx, &json!({"candidate":"candidate.json"})).unwrap();
+        assert_eq!(value["version"], "A");
+        assert_eq!(binding, ctx.binding("candidate.json").unwrap());
+        ctx.replace_json("candidate.json", &json!({"version":"B"}))
+            .unwrap();
+        let state = stable_state(
+            &ctx,
+            &binding,
+            json!({"ready":true,"candidate_current":true,
+            "review_current":true,"ready_for_review":false,"work_stage":"complete","score":99}),
+        );
+        assert_eq!(state["ready"], false);
+        assert_eq!(state["candidate_current"], false);
+        assert_eq!(state["work_stage"], "make");
+        assert!(state.get("score").is_none());
+    }
 }

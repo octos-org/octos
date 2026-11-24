@@ -142,13 +142,12 @@ pub fn authorized(ctx: &Context, policy: &Value, review: &Value, cycle: &Value) 
         "unknown review receipt schema"
     );
     let reviewer = string(&receipt, "reviewer")?;
-    Ok(["reviewer_agent", "arbiter_agent"].iter().any(|k| {
-        plan[k]
+    Ok(["reviewer_agent", "arbiter_agent"]
+        .iter()
+        .any(|k| plan[k].as_str().is_some_and(|r| same_identity(r, reviewer)))
+        && !policy["owner_agent"]
             .as_str()
-            .is_some_and(|r| same_identity(r, &reviewer))
-    }) && !policy["owner_agent"]
-        .as_str()
-        .is_some_and(|o| same_identity(o, &reviewer)))
+            .is_some_and(|o| same_identity(o, reviewer)))
 }
 
 /// A strict job may use a distinct runtime peer without a preassigned visual arbiter.

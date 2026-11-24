@@ -13,12 +13,11 @@ fn relative_asset(ctx: &Context, asset: &mut Value) -> Result<()> {
 }
 
 fn write_same(ctx: &Context, path: PathBuf, bytes: &[u8]) -> Result<Value> {
-    if !path.exists() {
-        if let Err(error) = ctx.write_new(&path, bytes) {
-            if !path.exists() {
-                return Err(error);
-            }
-        }
+    if !path.exists()
+        && let Err(error) = ctx.write_new(&path, bytes)
+        && !path.exists()
+    {
+        return Err(error);
     }
     let binding = ctx.binding(&path)?;
     ensure!(

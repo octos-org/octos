@@ -603,10 +603,10 @@ pub fn batch(ctx: &Context, r: &Value) -> Result<Value> {
             // The engine resolves reuse paths against the process cwd. Keep
             // this wrapper's workspace-relative path contract without changing
             // the process cwd, which would race concurrent page workers.
-            if matches!(name, "slide.reuse" | "slide.reuseList") {
-                if let Some(path) = params.get("path").and_then(Value::as_str) {
-                    params["path"] = json!(ctx.path(path)?);
-                }
+            if matches!(name, "slide.reuse" | "slide.reuseList")
+                && let Some(path) = params.get("path").and_then(Value::as_str)
+            {
+                params["path"] = json!(ctx.path(path)?);
             }
             if guarded_text_edits {
                 validate_guarded_text_edit(name, &params)?;
