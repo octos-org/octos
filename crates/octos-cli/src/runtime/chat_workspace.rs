@@ -36,8 +36,8 @@ struct ChatWorkspaceLayout {
     healable_server_roots: std::collections::BTreeSet<PathBuf>,
     /// Canonical server root -> identity captured while it existed.
     server_root_identities: std::collections::HashMap<PathBuf, String>,
-    /// Missing marker path -> server root whose original directory identity
-    /// must be restored before commands may run with that root hidden.
+    /// Identity marker path -> populated server root. The marker stays missing
+    /// inside the root, so every command wrap revalidates the root's identity.
     unresolved_server_roots: std::collections::HashMap<PathBuf, PathBuf>,
     /// Canonical profile data dir -> server-level profile root chosen for it.
     /// Keeping this separate from the current server root keeps unit-test
@@ -129,11 +129,24 @@ fn root_identity(path: &Path) -> std::io::Result<String> {
 }
 
 fn unresolved_marker_path(root: &Path) -> std::io::Result<PathBuf> {
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| std::io::Error::other("server chats root name is invalid"))?;
-    Ok(root.with_file_name(format!(".{name}.missing")))
+    Ok(root.join(".octos-root-identity"))
+}
+
+fn track_populated_server_root(root: &Path) -> std::io::Result<()> {
+    let marker = unresolved_marker_path(root)?;
+    let identity = root_identity(root)?;
+    let mut layout = layout_write();
+    layout.healable_server_roots.remove(root);
+    layout
+        .server_root_identities
+        .insert(root.to_path_buf(), identity);
+    layout
+        .unresolved_server_roots
+        .insert(marker.clone(), root.to_path_buf());
+    drop(layout);
+    reserved_folders()
+        .add(marker)
+        .map_err(std::io::Error::other)
 }
 
 fn overlaps_path(left: &Path, right: &Path) -> bool {
@@ -320,6 +333,9 @@ pub(crate) fn configure_server_root(
         layout.healable_server_roots.insert(root.clone());
     }
     drop(layout);
+    if !is_empty {
+        track_populated_server_root(&root)?;
+    }
     Ok(root)
 }
 
@@ -376,8 +392,7 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
                 root.display()
             ));
         }
-        layout_write().unresolved_server_roots.remove(&folder);
-        reserved_folders().remove(&folder);
+        // Keep the marker registered: the next wrap must verify the root again.
         return Ok(false);
     }
     if layout_read().healable_server_roots.contains(&folder) {
@@ -649,9 +664,10 @@ fn creation_root(data_dir: &Path, profile_id: &str) -> std::io::Result<PathBuf> 
         layout
             .profile_server_roots
             .insert(profile_dir, root.clone());
+        drop(layout);
         // Once a profile can create a chat here, disappearance no longer proves
-        // the root was empty; healing would hide a fresh empty replacement.
-        layout.healable_server_roots.remove(&server_root);
+        // the root was empty; every later wrap verifies the populated identity.
+        track_populated_server_root(&server_root)?;
         return Ok(root);
     }
     if cfg!(test) {
@@ -1119,7 +1135,7 @@ mod server_root_tests {
                 .resolve_missing_folder(&marker, std::slice::from_ref(&work))
                 .unwrap()
         );
-        assert!(!reserved_folders().folders().contains(&marker));
+        assert!(reserved_folders().folders().contains(&marker));
     }
 
     #[tokio::test]
@@ -1186,13 +1202,28 @@ mod server_root_tests {
         assert!(reserved_folders().folders().contains(&server_root));
         assert!(reserved_folders().folders().contains(&marker));
 
+        std::fs::create_dir_all(&server_root).unwrap();
+        let Some(output) =
+            run_hidden_command(temp.path(), &format!("cat \"{}\"", moved_secret.display())).await
+        else {
+            return;
+        };
+        assert!(
+            !output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(&server_root).unwrap();
+
         std::fs::rename(&moved_root, &server_root).unwrap();
         assert!(
             !reserved_folders()
                 .resolve_missing_folder(&marker, &[temp.path().to_path_buf()])
                 .unwrap()
         );
-        assert!(!reserved_folders().folders().contains(&marker));
+        assert!(reserved_folders().folders().contains(&marker));
         assert!(reserved_folders().folders().contains(&server_root));
     }
 
