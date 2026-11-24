@@ -1065,10 +1065,14 @@ mod server_root_tests {
     async fn run_hidden_command(root: &Path, command: &str) -> Option<std::process::Output> {
         // Other tests share this process-global list. Drop only stale fixture
         // roots outside this test's TempDir; a missing root under this fixture
-        // is the case under test and must reach the resolver.
+        // is the case under test and must reach the resolver. Registered roots
+        // are canonicalized, so the prefix check must canonicalize too: on
+        // macOS `/var` resolves to `/private/var`, and a raw prefix compare
+        // would drop this fixture's own missing root (T-0669).
+        let canonical_root = canonical_dir(root);
         let reserved = reserved_folders();
         for folder in reserved.folders() {
-            if !folder.exists() && !folder.starts_with(root) {
+            if !folder.exists() && !folder.starts_with(&canonical_root) {
                 reserved.remove(&folder);
             }
         }
