@@ -30,7 +30,7 @@ Promotes work out of the current conversation into a new sovereign peer.
 
 - **Arguments:** `name` and `brief` (required), `worktree` (optional), `token_budget` (optional positive integer, only when the user requests a limit), and `inputs` (optional).
 - **Inputs:** `inputs` lists the files the peer needs to begin — paths as the peer would read them, or `{path, kind, required, sha256}`. They are checked at handoff (a required file that is not in the peer's working directory refuses the handoff) and placed in the peer's **first model request**: text and data whole, images as attachments, plus a manifest of what was delivered and what was left out and why. A file is delivered whole or not at all, and only if the peer's own session may read it. Keep naming the paths in the brief as well.
-- **Behavior:** stages the peer and returns immediately with a pointer to `peers/<slug>/result.md`. **Fire-and-forget** — you do *not* get the result back in this turn. Limited to **4 handoffs per turn**.
+- **Behavior:** stages the peer and returns immediately with a pointer to `peers/<slug>/result.md`. **Fire-and-forget** — you do *not* get the result back in this turn. A turn may hand off as many peers as it needs; there is no count limit.
 
 ### `peer_send_input` — steer a running peer
 
@@ -105,7 +105,7 @@ These are acceptable under the single-user model below; closing them fully would
 ## Rails, authorization & limits
 
 - **Depth-1** — peers cannot `peer_handoff`, `peer_send_input`, or `peer_close` (those tools are not offered on peer sessions), so a peer cannot recursively spawn, inject, or retire peers. Peers *can* `peer_gather` and `peer_list` (read-only, no recursion hazard).
-- **4 handoffs per turn**; fleets bounded to **1–8** peers.
+- **No count limit on `peer_handoff`** — a turn may hand off as many peers as it names, each staged or refused on its own. A `peer/prepare` fleet is bounded to **1–8** peers.
 - **Originator-only injection** — only the session that created a peer may send it input; enforced fail-closed against the peer's `originator` file.
 - **Size caps** — 64 KB for both a brief and an injected message.
 - **Single-user-per-profile threat model** — in serve, the authenticated identity *is* the profile, so a profile is one user's trust domain. The LLM cannot inject across sessions (its caller identity is captured server-side and it cannot open sessions); cross-*user* injection is blocked by profile scoping. The residual case — a user deliberately acting across their own sessions — is treated as the user exercising their own authority, accepted by design. A non-spoofable capability model is deferred until serve gains multi-user identities.

@@ -51,7 +51,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -40321,8 +40321,8 @@ async fn run_standalone_turn(
         // #1801 v3 — LLM-initiated peer staging (`peer_handoff`). Mirrors the
         // per-turn spawn-tool wiring above: the tool is constructed fresh for
         // THIS turn with turn-scoped state baked into its callback (profile
-        // peers root, session workspace root, originating session key, and a
-        // per-turn `AtomicU32` handoff counter). Registered ONLY on this
+        // peers root, session workspace root, originating session key). A
+        // turn's handoffs are not counted or capped. Registered ONLY on this
         // serve/WS path — gateway/chat/ACP have no client that can open
         // sessions, the same verdict as the child stream callback above.
         // Depth-1: a peer session (topic `peer-<slug>`) is skipped entirely,
@@ -40439,7 +40439,6 @@ async fn run_standalone_turn(
                     .iter()
                     .map(|sp| sp.key.clone())
                     .collect(),
-                Arc::new(AtomicU32::new(0)),
                 emit_staged,
             );
             tool_registry.register(octos_agent::PeerHandoffTool::new(stage));

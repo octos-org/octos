@@ -33,7 +33,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
@@ -2904,11 +2903,6 @@ pub(crate) fn cleanup_staged_peer(workspace_root: &Path, slug: &str, dir: &Path)
         .output();
 }
 
-/// #1801 v3: per-turn ceiling on `peer_handoff` staging calls. A runaway
-/// model cannot fan out an unbounded peer fleet in one turn; the 5th call
-/// is rejected with a model-visible error.
-pub(crate) const PEER_HANDOFFS_PER_TURN_MAX: u32 = 4;
-
 /// #1801 v3 depth-1 guard: a peer session (topic `peer-<slug>`) never gets
 /// the `peer_handoff` tool registered at all — peers cannot hand off
 /// recursively, and the tool is not even visible to the model there.
@@ -3021,12 +3015,12 @@ pub(crate) fn resolve_peer_worktree(
 
 /// #1801 v3: build the `peer_handoff` staging callback for ONE turn of the
 /// serve/WS path. Turn-scoped state is baked in at wiring time: the
-/// profile's `peers/` root, the session's workspace root, the ORIGINATING
-/// session key stamped onto the emitted `peer/staged` event, and the
-/// per-turn handoff counter enforcing [`PEER_HANDOFFS_PER_TURN_MAX`].
-/// `emit_staged` abstracts the durable notification send so tests can
-/// observe the event without a live WS connection.
-#[allow(clippy::too_many_arguments)]
+/// profile's `peers/` root, the session's workspace root, and the ORIGINATING
+/// session key stamped onto the emitted `peer/staged` event. A turn may hand
+/// off as many peers as it names: there is no count limit, and each handoff
+/// is staged or refused on its own. `emit_staged` abstracts the durable
+/// notification send so tests can observe the event without a live WS
+/// connection.
 pub(crate) fn build_peer_handoff_callback(
     peers_root: PathBuf,
     workspace_root: PathBuf,
@@ -3039,15 +3033,9 @@ pub(crate) fn build_peer_handoff_callback(
     // is surfaced as a warning note (the peer falls back to the primary
     // model), never a failure.
     available_lanes: Vec<String>,
-    handoffs_this_turn: Arc<AtomicU32>,
     emit_staged: Arc<dyn Fn(PeerStagedEvent) + Send + Sync>,
 ) -> octos_agent::PeerHandoffCallback {
     Arc::new(move |request: octos_agent::PeerHandoffRequest| {
-        if handoffs_this_turn.fetch_add(1, Ordering::SeqCst) >= PEER_HANDOFFS_PER_TURN_MAX {
-            return Err(format!(
-                "peer handoff limit reached for this turn ({PEER_HANDOFFS_PER_TURN_MAX})"
-            ));
-        }
         // Peers are named: the slug is derived from the (required, validated)
         // name and must be unique — `stage_peer` rejects a duplicate rather
         // than auto-suffixing. `seed` is unused on the named path.
@@ -4884,5 +4872,47 @@ mod reopen_fork_tests {
         // A duplicate explicit name is refused and changes nothing.
         let err = fork_staged_peer(&peers, "analyst", MASTER, Some("cache-reviewer")).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use octos_agent::Tool as _;
+
+    #[tokio::test]
+    async fn should_stage_every_peer_a_turn_hands_off_however_many() {
+        let root = tempfile::tempdir().unwrap();
+        let peers = root.path().join("peers");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let staged: Arc<std::sync::Mutex<Vec<PeerStagedEvent>>> = Arc::default();
+        let seen = staged.clone();
+        // One turn's tool, as the serve path wires it.
+        let tool = octos_agent::PeerHandoffTool::new(build_peer_handoff_callback(
+            peers.clone(),
+            workspace,
+            SessionKey("web:tester#master".to_owned()),
+            "dev".to_owned(),
+            None,
+            Vec::new(),
+            Arc::new(move |event| seen.lock().unwrap().push(event)),
+        ));
+
+        for page in 1..=6 {
+            let args = serde_json::json!({
+                "name": format!("page-{page}"),
+                "brief": "review this page against its data",
+                "worktree": false,
+            });
+            let result = tool.execute(&args).await.unwrap();
+            assert!(result.success, "handoff {page}: {}", result.output);
+        }
+
+        let staged = staged.lock().unwrap();
+        assert_eq!(staged.len(), 6, "one `peer/staged` per handoff");
+        for event in staged.iter() {
+            assert!(peers.join(&event.slug).join("brief.md").is_file());
+        }
     }
 }
