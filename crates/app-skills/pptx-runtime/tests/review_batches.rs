@@ -19,7 +19,9 @@ fn whole_page_view_binds_pixels_and_fits_the_reader() {
     let result = ctx.execute(request.clone()).unwrap();
     assert_eq!(result["input"], ctx.binding(&input).unwrap());
     assert_eq!(result["dimensions"], json!([1024, 512]));
-    assert_eq!(result["model_media"], json!(["qa/view.png"]));
+    let output = ctx.binding("qa/view.png").unwrap();
+    assert_eq!(result["preview"], output);
+    assert_eq!(result["model_media"], json!([output["path"]]));
     assert_eq!(result["quality_approved"], false);
     let file = ctx.verify(&result["preview"]).unwrap();
     assert!(std::fs::metadata(&file).unwrap().len() <= 5 * 1024 * 1024);
