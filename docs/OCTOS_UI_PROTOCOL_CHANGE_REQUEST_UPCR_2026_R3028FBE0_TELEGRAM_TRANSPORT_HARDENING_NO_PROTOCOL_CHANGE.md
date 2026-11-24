@@ -1,7 +1,7 @@
 # UPCR-2026-R3028FBE0 — Telegram transport hardening (no protocol change)
 
 Status: proposed
-PR: TBD
+PR: #3366
 
 ## Decision record
 
