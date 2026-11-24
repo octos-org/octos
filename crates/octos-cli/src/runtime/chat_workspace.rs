@@ -495,14 +495,24 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
 }
 
 #[cfg(all(test, feature = "api"))]
+static HIDDEN_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, feature = "api"))]
 pub(crate) struct HiddenFixtureGuard {
     root: PathBuf,
+    // Layout, reserved folders and root identities are process-global. One
+    // fixture at a time prevents another async test from populating or moving
+    // this fixture's root between wrapping and execution.
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(all(test, feature = "api"))]
 pub(crate) fn hidden_fixture_guard(root: &Path) -> HiddenFixtureGuard {
     HiddenFixtureGuard {
         root: canonical_dir(root),
+        _lock: HIDDEN_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
     }
 }
 
