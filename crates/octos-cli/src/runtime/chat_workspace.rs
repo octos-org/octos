@@ -334,10 +334,10 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
     if layout_read().healable_server_roots.contains(&folder) {
         if command_roots
             .iter()
-            .any(|root| canonical_dir(root).starts_with(&folder))
+            .any(|root| overlaps_path(&folder, &canonical_dir(root)))
         {
             return Err(format!(
-                "server chats root {} is inside a workspace/read root available to this command",
+                "server chats root {} overlaps a workspace/read root available to this command",
                 folder.display()
             ));
         }
@@ -983,18 +983,17 @@ mod server_root_tests {
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
         install_missing_root_healer();
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
         std::fs::remove_dir_all(&server_root).unwrap();
         assert!(
             reserved_folders()
-                .resolve_missing_folder(&server_root, &[temp.path().to_path_buf()])
+                .resolve_missing_folder(&server_root, std::slice::from_ref(&work))
                 .unwrap()
         );
-        let marker = temp.path().join("ran");
-        let Some(output) = run_hidden_command(
-            temp.path(),
-            &format!("printf healed > \"{}\"", marker.display()),
-        )
-        .await
+        let marker = work.join("ran");
+        let Some(output) =
+            run_hidden_command(&work, &format!("printf healed > \"{}\"", marker.display())).await
         else {
             return;
         };
@@ -1017,7 +1016,7 @@ mod server_root_tests {
         assert!(chat.root.starts_with(&server_root));
         std::fs::write(chat.root.join("secret.txt"), "server-secret").unwrap();
         let output = run_hidden_command(
-            temp.path(),
+            &work,
             &format!("cat \"{}\"", chat.root.join("secret.txt").display()),
         )
         .await
@@ -1039,8 +1038,36 @@ mod server_root_tests {
             error.contains(server_root.to_string_lossy().as_ref()),
             "{error}"
         );
-        assert!(error.contains("inside a workspace/read root"), "{error}");
+        assert!(error.contains("overlaps a workspace/read root"), "{error}");
         assert!(!server_root.exists());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_renamed_server_root_inside_command_roots() {
+        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let (temp, _hidden) = tempdir_with_hidden_guard();
+        let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
+        install_missing_root_healer();
+        let chat_root = server_root.join("a-chat");
+        std::fs::create_dir_all(&chat_root).unwrap();
+        let secret = chat_root.join("secret.txt");
+        std::fs::write(&secret, "server-secret").unwrap();
+        let moved_root = temp.path().join("renamed-server-chats");
+        let moved_secret = moved_root.join("a-chat/secret.txt");
+        std::fs::rename(&server_root, &moved_root).unwrap();
+
+        let error = reserved_folders()
+            .resolve_missing_folder(&server_root, &[temp.path().to_path_buf()])
+            .expect_err("a renamed server root must not self-heal");
+
+        assert!(
+            error.contains(server_root.to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert!(error.contains("overlaps a workspace/read root"), "{error}");
+        assert!(!server_root.exists());
+        assert!(moved_secret.is_file());
+        assert!(reserved_folders().folders().contains(&server_root));
     }
 
     #[tokio::test]
