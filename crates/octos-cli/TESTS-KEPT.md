@@ -456,8 +456,9 @@ Creation admission also retains these persistence regressions (T-0323):
 
 | Cat. | Exact test | Guard |
 |---|---|---|
-| 4 | `autonomy::agent_orchestrator::tests::should_settle_a_live_charge_additively_into_the_existing_ledger_row` | A live turn charge settles into the durable goal-ledger row as an additive delta, so spend survives a writer whose in-memory base lags the row; a goal with no row is skipped, not fabricated (#2083). |
+| 4 | `autonomy::agent_orchestrator::tests::should_settle_a_live_charge_additively_into_the_existing_ledger_row` | A live turn charge settles against a stable counter base, so spend survives a writer whose in-memory base lags the row; a row-less first charge creates the row from that base instead of losing the delta. |
 | 4 | `autonomy::agent_orchestrator::tests::should_settle_an_autonomous_turn_charge_additively_into_the_ledger` | The autonomous `record_goal_turn` accountant settles the turn's spend additively into the durable row when handed the profile data dir, so a continuation charged on a stale restored base is not dropped by the next absolute transition sync; a `None` dir skips the durable settle while the in-memory charge still lands (#2083). |
+| 4 | `autonomy::agent_orchestrator::tests::should_count_a_live_charge_once_in_either_snapshot_and_charge_order` | Driving the production transition sync and additive offload in both commit orders counts one five-token/five-second turn exactly once; snapshot-first regressed from 25 to 30 before the fix. |
 | 3 | `autonomy::agent_orchestrator::tests::should_evict_only_dead_tombstones_when_the_cap_is_reached` | The cleared-goal tombstone cap evicts only entries whose turn is provably dead (in-flight marker gone); when every parked turn is still alive the map grows past the cap rather than dropping a legitimate late charge (#2084). |
 
 ## Peer handoffs of one turn (UPCR-2026-R9EE04597)

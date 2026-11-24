@@ -3345,15 +3345,10 @@ impl InProcessAgentOrchestrator {
     /// Charge a completed turn's tokens to the session's goal.
     ///
     /// #1982 — returns the goal snapshot ONLY when the goal is TERMINAL
-    /// (`complete`/`blocked`) after the charge. A goal completed/blocked
-    /// mid-turn had its ledger goals-row frozen at the pre-completion total by
-    /// the mid-turn transition, and this post-turn charge persists only to the
-    /// supervisor store — so the durable ledger under-counts the goal's true
-    /// final cost and no later transition re-syncs it. The caller (which holds
-    /// the profile data dir) reconciles the ledger via
-    /// [`Self::reconcile_terminal_goal_ledger`]. Non-terminal goals return
-    /// `None`: their next transition re-syncs the ledger, so a per-turn ledger
-    /// write would be wasteful.
+    /// (`complete`/`blocked`) after the charge. The additive offload owns the
+    /// turn's token/time delta in either case; the terminal caller additionally
+    /// syncs the post-transition metadata and stable counter base through
+    /// [`Self::reconcile_terminal_goal_ledger`], without appending a decision.
     /// #2066 round 2 (codex R1c) — `expected_goal_id` is the goal identity
     /// the continuation was DISPATCHED under (`QueuedMasterContinuation::
     /// goal_id`, threaded through both autonomous accountant call sites).
@@ -3415,17 +3410,21 @@ impl InProcessAgentOrchestrator {
         // goal_update / status change) from an inert re-read.
         let prior_revision = goal.revision;
         let wrap_up = record_goal_turn_internal(goal, tokens_consumed, elapsed_seconds, now);
+        if ledger_data_dir.is_some() {
+            goal.ledger_additive_tokens =
+                goal.ledger_additive_tokens.saturating_add(tokens_consumed);
+            goal.ledger_additive_time_seconds = goal
+                .ledger_additive_time_seconds
+                .saturating_add(elapsed_seconds);
+        }
         let goal_snapshot = goal.clone();
         persist_goal_state(&state, session_id, &goal_snapshot, false);
-        // #2083 — settle the TURN'S delta into the durable goal ledger
-        // additively (same base-independence argument as
-        // `charge_goal_tokens_gated`: the absolute transition sync cannot
-        // recover the increment when this process's in-memory base lags the
-        // durable row after a restore). Best-effort, off the caller's
-        // thread, exactly like the post-clear settle above.
+        // The additive writer exclusively owns this turn's token/time delta.
+        // `goal_ledger_row` removes every such delta from the snapshot's
+        // counter base, so terminal/base syncs cannot replay the charge.
         if let Some(profile_dir) = ledger_data_dir {
             Self::offload_goal_charge_delta(
-                goal_snapshot.goal_id.clone(),
+                goal_ledger_row(&goal_snapshot),
                 profile_dir.to_path_buf(),
                 tokens_consumed,
                 elapsed_seconds,
@@ -3501,22 +3500,20 @@ impl InProcessAgentOrchestrator {
         }
     }
 
-    /// #1982 — reconcile the durable goal-ledger `tokens_used` with the live
-    /// total after a goal completed/blocked MID-TURN (see
-    /// [`Self::record_goal_turn`]). `status_changed == false` runs the guarded
-    /// `upsert_goal` (which admits the higher tokens on a complete==complete /
-    /// blocked==blocked row) and appends NO decision row. A no-op when the goal
-    /// has no existing ledger under `ledger_data_dir` — this only corrects an
-    /// under-count, it never creates a ledger for a goal that never had one.
+    /// #1982 — sync terminal metadata and the stable counter base after a
+    /// goal completed/blocked MID-TURN (see [`Self::record_goal_turn`]).
+    /// `status_changed == false` appends NO decision row. The turn's cost is
+    /// settled only by the additive charge, including when these writes commit
+    /// in the opposite order. A missing ledger file remains a no-op here; the
+    /// additive charge itself can create a row when one is needed.
     pub(crate) fn reconcile_terminal_goal_ledger(
         &self,
         decided_by: &SessionKey,
         snapshot: &AutonomyGoalRecord,
         ledger_data_dir: &std::path::Path,
     ) {
-        // No-op if the goal never had a ledger: this only CORRECTS an
-        // under-count, it never creates a fresh ledger for a goal that never
-        // synced one (which would change existing non-peer-goal behavior).
+        // This reconcile remains a metadata/base sync, not a second charge or
+        // an unconditional reason to create a ledger for a non-peer goal.
         let ledger_path = Self::goal_ledger_dir(ledger_data_dir).join(format!(
             "{}.db",
             sanitize_filename_for_ledger(&snapshot.goal_id)
@@ -3524,9 +3521,8 @@ impl InProcessAgentOrchestrator {
         if !ledger_path.is_file() {
             return;
         }
-        // `status_changed == false` → the guarded `upsert_goal` admits the higher
-        // tokens (complete==complete / blocked==blocked passes the guard clauses)
-        // and returns before appending any decision row.
+        // `status_changed == false` syncs the base and returns before the
+        // decision append; counters already settled additively are MAX-preserved.
         self.sync_transition_to_ledger_blocking(
             ledger_data_dir,
             snapshot,
@@ -3914,27 +3910,27 @@ impl InProcessAgentOrchestrator {
                 None
             }
         };
+        if ledger_data_dir.is_some() {
+            goal.ledger_additive_tokens =
+                goal.ledger_additive_tokens.saturating_add(tokens_consumed);
+            goal.ledger_additive_time_seconds = goal
+                .ledger_additive_time_seconds
+                .saturating_add(elapsed_seconds);
+        }
         let snapshot = goal.clone();
         let profile_for_event = snapshot.profile_id.clone();
         // #1966 — persist and enqueue under the SCOPED key: the supervisor
         // group id and any wrap-up continuation must address the same record
         // the map holds, or restart/drain would resolve a different goal.
         persist_goal_state(&state, &key, &snapshot, false);
-        // #2083 — settle the TURN'S delta into the durable goal ledger
-        // additively. The absolute-snapshot `upsert_goal` the transition sync
-        // uses silently DROPS the increment when this process's in-memory base
-        // lags the durable row (supervisor metadata restore can come back
-        // behind the ledger): row `time = 20`, memory restored at `10`, a
-        // turn adds `5` → snapshot `15` admitted and `MAX(20, 15)` stores
-        // `20` when the true total is `25`. An additive write is
-        // base-independent: `row + delta` is correct for ANY lagging base, so
-        // the increment survives every restore-lag window. The dir is the
-        // caller's: the charge above is profile-checked, so the charging
-        // profile's dir IS the goal owner's ledger root. Best-effort, off
-        // the caller's thread, exactly like the post-clear settle.
+        // The additive writer exclusively owns this delta. The base captured
+        // below excludes all deltas handed to that writer, including earlier
+        // turns and verifier calls, so any later transition snapshot commutes
+        // with this offload instead of replaying it. The profile check above
+        // proves the caller's dir is the goal owner's ledger root.
         if let Some(profile_dir) = ledger_data_dir {
             Self::offload_goal_charge_delta(
-                goal_id.clone(),
+                goal_ledger_row(&snapshot),
                 profile_dir.to_path_buf(),
                 tokens_consumed,
                 elapsed_seconds,
@@ -6011,7 +6007,7 @@ impl InProcessAgentOrchestrator {
         );
         // #1957 — sync the transition into the durable ledger using the snapshot
         // we JUST transitioned (no re-fetch → codex #3). Best-effort. The
-        // guarded `upsert_goal` makes this newer state win over a stale
+        // guarded `upsert_goal_counter_base` makes this newer state win over a stale
         // finding-path upsert (codex #2), and a decision is appended only on a
         // real status change (codex #5 — `blocked → blocked` retries add none).
         // Awaited (not detached) so a caller returning implies the ledger row
@@ -6090,24 +6086,15 @@ impl InProcessAgentOrchestrator {
     ///   that path (call sites untouched; this restores the core's behavior
     ///   for them after this branch briefly routed them through the retry).
     ///
-    /// #1973 fix-round — the #1970 monotonic-token clause used to silently
-    /// reject an ADMINISTRATIVE status sync (park/clear) whose snapshot
-    /// carries stale LOWER counters (a peer charge pushed the row ahead of
-    /// the in-memory record), while the decision was appended
-    /// unconditionally: row said `active`, decision said `cleared`. Now: when
-    /// the guarded upsert reports the write was NOT admitted and this is a
-    /// status transition, re-read the row and retry ONCE via a targeted
-    /// status-CAS ([`octos_fleet::GoalLedger::cas_goal_status`]) — the status
-    /// lands with the row's counters untouched (they are authoritative). The
-    /// retry is ORDERING-GATED: it runs only when the snapshot is at least as
-    /// new as the row (`snapshot.updated_at_ms >= row.updated_at_ms`), so an
-    /// OLDER transition's retry can never overwrite a newer status change
-    /// (the fix-round-2 max'd-timestamp re-upsert could: a late `blocked`
-    /// sync forged the row's own T2 and overwrote `cleared`). Complete stays
-    /// terminal on both layers (the gate skips a `complete` row; the CAS
-    /// refuses one). The decision is appended ONLY when the row's status now
-    /// reflects the transition, so the audit trail can never claim a status
-    /// the goals-row rejected.
+    /// #1973 fix-round — when the guarded base upsert is NOT admitted and this
+    /// is a status transition, re-read and retry ONCE via targeted status-CAS
+    /// ([`octos_fleet::GoalLedger::cas_goal_status`]). The retry is
+    /// ORDERING-GATED on `snapshot.updated_at_ms >= row.updated_at_ms`, so an
+    /// older transition cannot overwrite a newer status. Complete stays
+    /// terminal on both layers. Cost columns MAX-merge the stable base, never
+    /// reject the whole snapshot merely because an additive charge landed.
+    /// The decision is appended ONLY when the row's status now reflects the
+    /// transition, so the audit trail cannot contradict the goals row.
     fn sync_transition_to_ledger_blocking(
         &self,
         profile_data_dir: &std::path::Path,
@@ -6139,25 +6126,13 @@ impl InProcessAgentOrchestrator {
             }
         };
         let snapshot_ts = snapshot.updated_at_ms.max(0) as u64;
-        let row = octos_fleet::Goal {
-            goal_id: snapshot.goal_id.clone(),
-            objective: snapshot.objective.clone(),
-            status: snapshot.status.clone(),
-            tokens_used: snapshot.tokens_used,
-            token_budget: snapshot.token_budget,
-            time_used_seconds: snapshot.time_used_seconds,
-            continuations_used: snapshot.continuations_used,
-            revision: 0,
-            created_at_ms: snapshot.created_at_ms.max(0) as u64,
-            updated_at_ms: snapshot_ts,
-        };
-        let admitted = ledger.upsert_goal(&row).unwrap_or(false);
+        let row = goal_ledger_row(snapshot);
+        let admitted = ledger.upsert_goal_counter_base(&row).unwrap_or(false);
         if !admitted && status_changed {
             // Guarded rejection of a genuine status transition. Retry ONCE via
-            // the targeted status-CAS, but ONLY when the rejection was solely
-            // the monotonic-token clause — i.e. this transition is still at
-            // least as new as the row (ordering gate) and the row is not
-            // terminal (complete gate) and actually differs. An older
+            // the targeted status-CAS, but ONLY when this transition is still
+            // at least as new as the row (ordering gate), the row is not
+            // terminal (complete gate), and the status actually differs. An older
             // transition, or one racing a terminal row, is dropped here and
             // the decision gate below keeps the audit trail consistent.
             if let Ok(Some(current)) = ledger.get_goal(&snapshot.goal_id) {
@@ -6273,16 +6248,13 @@ impl InProcessAgentOrchestrator {
     /// normal case: the lag is a whole goal's history). See
     /// [`octos_fleet::GoalLedger::settle_cleared_goal_cost_delta`].
     ///
-    /// #2083 — settle a live (non-cleared) turn charge into the durable
-    /// goal-ledger row as an ADDITIVE delta
-    /// ([`octos_fleet::GoalLedger::charge_goal_counters`]). Complements the
-    /// absolute-snapshot transition sync: the snapshot keeps
-    /// status/objective/budget fresh (guarded, monotonic), while the
-    /// counters' increments land additively so a writer whose in-memory base
-    /// lags the durable row never loses the turn's spend. A later absolute
-    /// upsert that carries the SAME increments is then a no-op rewrite (row
-    /// already holds base+delta), and one whose base LAGS the row is rejected
-    /// by the monotonic clause, leaving the additively-settled value intact.
+    /// Settle a live turn charge through
+    /// [`octos_fleet::GoalLedger::charge_goal_counters`]. `base_snapshot`
+    /// excludes every additive delta accumulated by this goal incarnation;
+    /// both this write and the absolute snapshot MAX-fold that same base.
+    /// Therefore snapshot-first and charge-first both store `MAX(row, base) +
+    /// delta`: the snapshot cannot replay the charge, and a later MAX cannot
+    /// erase it when the durable row started behind the base.
     ///
     /// Idempotency assumption (same as the post-clear settle): per-charge
     /// SINGLE DELIVERY — one offload per accountant charge, no dedupe key.
@@ -6292,12 +6264,13 @@ impl InProcessAgentOrchestrator {
     /// every ledger sync: failures warn, never propagate; one busy-retry
     /// open/settle before dropping (the transient-contention case).
     fn offload_goal_charge_delta(
-        goal_id: String,
+        base_snapshot: octos_fleet::Goal,
         ledger_data_dir: std::path::PathBuf,
         tokens_delta: u64,
         time_delta: u64,
     ) {
         offload_goal_ledger_io(move || {
+            let goal_id = base_snapshot.goal_id.clone();
             let ledger_dir = Self::goal_ledger_dir(&ledger_data_dir);
             if std::fs::create_dir_all(&ledger_dir).is_err() {
                 return;
@@ -6319,20 +6292,12 @@ impl InProcessAgentOrchestrator {
                     }
                 }
             };
-            // No row yet ⇒ the goal never synced a ledger (e.g. its first
-            // charge precedes the first transition sync). The absolute
-            // transition sync remains the row's creator; this write only
-            // settles increments onto an EXISTING row, so `false` is a skip,
-            // not a drop.
-            match ledger.charge_goal_counters(&goal_id, tokens_delta, time_delta, now_ms_u64()) {
+            match ledger.charge_goal_counters(&base_snapshot, tokens_delta, time_delta) {
                 Ok(true) | Ok(false) => {}
                 Err(first_error) => {
-                    if let Err(error) = ledger.charge_goal_counters(
-                        &goal_id,
-                        tokens_delta,
-                        time_delta,
-                        now_ms_u64(),
-                    ) {
+                    if let Err(error) =
+                        ledger.charge_goal_counters(&base_snapshot, tokens_delta, time_delta)
+                    {
                         tracing::warn!(%error, %first_error,
                             goal_id = %goal_id,
                             tokens_delta,
@@ -6374,18 +6339,7 @@ impl InProcessAgentOrchestrator {
                     }
                 }
             };
-            let base = octos_fleet::Goal {
-                goal_id: base_snapshot.goal_id.clone(),
-                objective: base_snapshot.objective.clone(),
-                status: "cleared".to_owned(),
-                tokens_used: base_snapshot.tokens_used,
-                token_budget: base_snapshot.token_budget,
-                time_used_seconds: base_snapshot.time_used_seconds,
-                continuations_used: base_snapshot.continuations_used,
-                revision: 0,
-                created_at_ms: base_snapshot.created_at_ms.max(0) as u64,
-                updated_at_ms: base_snapshot.updated_at_ms.max(0) as u64,
-            };
+            let base = goal_ledger_row(&base_snapshot);
             let _ = ledger.create_goal_if_absent(&base);
             // #2066 round 3 (codex fix 1) — the settle MAX-folds the frozen
             // clear-time base before adding its delta, so a settle that
@@ -6393,9 +6347,9 @@ impl InProcessAgentOrchestrator {
             // lag and a later stamp MAX-merges to the identical total.
             match ledger.settle_cleared_goal_cost_delta(
                 &base_snapshot.goal_id,
-                base_snapshot.tokens_used,
+                base.tokens_used,
                 tokens_delta,
-                base_snapshot.time_used_seconds,
+                base.time_used_seconds,
                 time_delta,
                 now_ms_u64(),
             ) {
@@ -6414,9 +6368,9 @@ impl InProcessAgentOrchestrator {
                     // operational drops.
                     match ledger.settle_cleared_goal_cost_delta(
                         &base_snapshot.goal_id,
-                        base_snapshot.tokens_used,
+                        base.tokens_used,
                         tokens_delta,
-                        base_snapshot.time_used_seconds,
+                        base.time_used_seconds,
                         time_delta,
                         now_ms_u64(),
                     ) {
@@ -6473,18 +6427,7 @@ impl InProcessAgentOrchestrator {
                 return;
             }
         };
-        let row = octos_fleet::Goal {
-            goal_id: snapshot.goal_id.clone(),
-            objective: snapshot.objective.clone(),
-            status: "cleared".to_owned(),
-            tokens_used: snapshot.tokens_used,
-            token_budget: snapshot.token_budget,
-            time_used_seconds: snapshot.time_used_seconds,
-            continuations_used: snapshot.continuations_used,
-            revision: 0,
-            created_at_ms: snapshot.created_at_ms.max(0) as u64,
-            updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
-        };
+        let row = goal_ledger_row(snapshot);
         let stored = match ledger.stamp_goal_cleared(&row) {
             Ok(stored) => stored,
             Err(error) => {
@@ -6799,6 +6742,8 @@ impl InProcessAgentOrchestrator {
                 })
                 .map(|(key, goal)| {
                     goal.tokens_used = goal.tokens_used.saturating_add(cost_tokens);
+                    goal.ledger_additive_tokens =
+                        goal.ledger_additive_tokens.saturating_add(cost_tokens);
                     goal.updated_at_ms = now;
                     let exhausted = goal.status == "active"
                         && goal.token_budget > 0
@@ -6822,20 +6767,9 @@ impl InProcessAgentOrchestrator {
                 if let Some(prompt) = wrap_up_prompt {
                     enqueue_goal_wrap_up(&mut state, &owning_key, &snapshot, prompt, now_system);
                 }
-                // The FRESH snapshot (post-charge, post-flip) feeds the ledger
-                // upsert below, so the goals row finally carries real numbers.
-                octos_fleet::Goal {
-                    goal_id: goal_id.to_owned(),
-                    objective: snapshot.objective.clone(),
-                    status: snapshot.status.clone(),
-                    tokens_used: snapshot.tokens_used,
-                    token_budget: snapshot.token_budget,
-                    time_used_seconds: snapshot.time_used_seconds,
-                    continuations_used: snapshot.continuations_used,
-                    revision: 0, // preserved on conflict by upsert_goal
-                    created_at_ms: snapshot.created_at_ms.max(0) as u64,
-                    updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
-                }
+                // The additive writer owns this finding's cost just like the
+                // other turn charges; the snapshot carries only its base.
+                goal_ledger_row(&snapshot)
             })
             // The state lock drops here — all ledger file I/O below runs
             // unlocked (mirrors `charge_active_goal_tokens`).
@@ -6860,11 +6794,13 @@ impl InProcessAgentOrchestrator {
         let ledger_path = ledger_dir.join(format!("{}.db", sanitize_filename_for_ledger(goal_id)));
         let ledger = octos_fleet::GoalLedger::open(&ledger_path)
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
-        // FK constraint: findings reference goals(goal_id), so we must upsert
-        // the goal row BEFORE appending a finding. #1957 — write the goal's REAL
-        // objective/status/tokens/budget (captured above) so the ledger reflects
-        // the authoritative state, and keep it fresh on every finding.
-        let _ = ledger.upsert_goal(&goal_row);
+        // FK constraint: findings reference goals(goal_id). Refresh metadata
+        // through the base snapshot, then settle the peer cost exactly once
+        // through the additive writer (never through that snapshot's totals).
+        let _ = ledger.upsert_goal_counter_base(&goal_row);
+        ledger
+            .charge_goal_counters(&goal_row, cost_tokens, 0)
+            .map_err(|error| format!("failed to settle peer goal charge: {error}"))?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -6975,18 +6911,7 @@ impl InProcessAgentOrchestrator {
                     goal.fleet_id.as_deref() == Some(fleet_id.as_str())
                         && goal.profile_id == profile_id
                 })
-                .map(|goal| octos_fleet::Goal {
-                    goal_id: goal.goal_id.clone(),
-                    objective: goal.objective.clone(),
-                    status: goal.status.clone(),
-                    tokens_used: goal.tokens_used,
-                    token_budget: goal.token_budget,
-                    time_used_seconds: goal.time_used_seconds,
-                    continuations_used: goal.continuations_used,
-                    revision: 0, // preserved on conflict by upsert_goal
-                    created_at_ms: goal.created_at_ms.max(0) as u64,
-                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
-                })
+                .map(goal_ledger_row)
         };
         let Some(goal_row) = goal_row else {
             tracing::warn!(
@@ -7008,7 +6933,7 @@ impl InProcessAgentOrchestrator {
             return;
         };
         // FK: goals row before findings; task stub before a task-scoped finding.
-        let _ = ledger.upsert_goal(&goal_row);
+        let _ = ledger.upsert_goal_counter_base(&goal_row);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -7096,18 +7021,7 @@ impl InProcessAgentOrchestrator {
                             || key.to_string() == originator_session
                             || key.base_key() == originator_session)
                 })
-                .map(|(_, goal)| octos_fleet::Goal {
-                    goal_id: goal_id.to_owned(),
-                    objective: goal.objective.clone(),
-                    status: goal.status.clone(),
-                    tokens_used: goal.tokens_used,
-                    token_budget: goal.token_budget,
-                    time_used_seconds: goal.time_used_seconds,
-                    continuations_used: goal.continuations_used,
-                    revision: 0,
-                    created_at_ms: goal.created_at_ms.max(0) as u64,
-                    updated_at_ms: goal.updated_at_ms.max(0) as u64,
-                })
+                .map(|(_, goal)| goal_ledger_row(goal))
         };
         let Some(goal_row) = goal_row else {
             return Err(format!(
@@ -7128,7 +7042,7 @@ impl InProcessAgentOrchestrator {
             .map_err(|e| format!("failed to open goal ledger {}: {e}", ledger_path.display()))?;
         // FK constraint: escalations reference goals(goal_id) — upsert the goal
         // row (with REAL fields, #1957) BEFORE appending an escalation.
-        let _ = ledger.upsert_goal(&goal_row);
+        let _ = ledger.upsert_goal_counter_base(&goal_row);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -7506,10 +7420,10 @@ impl InProcessAgentOrchestrator {
     /// regress an administrative transition). `None` ⇒ the goal is gone ⇒ no
     /// row, which is correct behavior rather than an error.
     ///
-    /// Carries BOTH cost dimensions (#2068/#2076): `tokens_used` and
-    /// `time_used_seconds`. This snapshot can be the FIRST writer of a goal
-    /// row (`create_goal_if_absent`), so dropping either one would persist a
-    /// goal that answers half the cost question — the exact gap #2076 closed.
+    /// Carries the counter BASE for BOTH cost dimensions. Additive deltas are
+    /// deliberately excluded because their own writer may still be in flight.
+    /// This snapshot can be the FIRST writer (`create_goal_if_absent`), where
+    /// the same base used by those charges makes either commit order converge.
     fn goal_ledger_row_snapshot(
         &self,
         profile_id: &str,
@@ -7520,18 +7434,7 @@ impl InProcessAgentOrchestrator {
             .goals
             .values()
             .find(|goal| goal.goal_id == goal_id && goal.profile_id == profile_id)
-            .map(|goal| octos_fleet::Goal {
-                goal_id: goal.goal_id.clone(),
-                objective: goal.objective.clone(),
-                status: goal.status.clone(),
-                tokens_used: goal.tokens_used,
-                token_budget: goal.token_budget,
-                time_used_seconds: goal.time_used_seconds,
-                continuations_used: goal.continuations_used,
-                revision: 0,
-                created_at_ms: goal.created_at_ms.max(0) as u64,
-                updated_at_ms: goal.updated_at_ms.max(0) as u64,
-            })
+            .map(goal_ledger_row)
     }
 
     /// #2055 review round 7 (W2) — THE one stash point: assigns the entry's
@@ -10111,6 +10014,8 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 token_budget: request.token_budget.unwrap_or(GOAL_DEFAULT_TOKEN_BUDGET),
                 tokens_used: 0,
                 time_used_seconds: 0,
+                ledger_additive_tokens: 0,
+                ledger_additive_time_seconds: 0,
                 created_at_ms: now,
                 updated_at_ms: now,
                 continuations_used: 0,
@@ -13800,6 +13705,29 @@ fn goal_budget_wrap_up_prompt(goal_id: &str, tokens_used: u64, token_budget: u64
     )
 }
 
+/// Convert a live goal snapshot to the counter BASE shared by the absolute
+/// snapshot writer and the additive charge writer. The public counters include
+/// every charge; the ledger base excludes exactly those deltas already handed
+/// to `charge_goal_counters`, so the two writers never both own an increment.
+fn goal_ledger_row(snapshot: &AutonomyGoalRecord) -> octos_fleet::Goal {
+    octos_fleet::Goal {
+        goal_id: snapshot.goal_id.clone(),
+        objective: snapshot.objective.clone(),
+        status: snapshot.status.clone(),
+        tokens_used: snapshot
+            .tokens_used
+            .saturating_sub(snapshot.ledger_additive_tokens),
+        token_budget: snapshot.token_budget,
+        time_used_seconds: snapshot
+            .time_used_seconds
+            .saturating_sub(snapshot.ledger_additive_time_seconds),
+        continuations_used: snapshot.continuations_used,
+        revision: 0,
+        created_at_ms: snapshot.created_at_ms.max(0) as u64,
+        updated_at_ms: snapshot.updated_at_ms.max(0) as u64,
+    }
+}
+
 fn record_goal_turn_internal(
     goal: &mut AutonomyGoalRecord,
     tokens_consumed: u64,
@@ -16794,6 +16722,26 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
     let Some(goal_id) = supervisor_metadata_str(&group.metadata, "goal_id") else {
         return;
     };
+    let restored_tokens = supervisor_metadata_u64(&group.metadata, "tokens_used").unwrap_or(0);
+    let restored_time = supervisor_metadata_u64(&group.metadata, "time_used_seconds").unwrap_or(0);
+    // A same-process rehydrate can replace the record while its detached
+    // ledger writes are still alive. Preserve ownership only for that exact
+    // incarnation, and never let stale metadata lower its monotonic counters.
+    // A cold restore has no live writes and starts from the restored totals.
+    let (tokens_used, time_used_seconds, ledger_additive_tokens, ledger_additive_time_seconds) =
+        state
+            .goals
+            .get(&session_id)
+            .filter(|previous| previous.goal_id == goal_id)
+            .map(|previous| {
+                (
+                    restored_tokens.max(previous.tokens_used),
+                    restored_time.max(previous.time_used_seconds),
+                    previous.ledger_additive_tokens,
+                    previous.ledger_additive_time_seconds,
+                )
+            })
+            .unwrap_or((restored_tokens, restored_time, 0, 0));
     let goal = AutonomyGoalRecord {
         profile_id: profile_id.to_owned(),
         goal_id: goal_id.to_owned(),
@@ -16806,9 +16754,10 @@ fn restore_goal_from_group(state: &mut AutonomyRuntimeState, group: &SupervisedG
             .to_owned(),
         token_budget: supervisor_metadata_u64(&group.metadata, "token_budget")
             .unwrap_or(GOAL_DEFAULT_TOKEN_BUDGET),
-        tokens_used: supervisor_metadata_u64(&group.metadata, "tokens_used").unwrap_or(0),
-        time_used_seconds: supervisor_metadata_u64(&group.metadata, "time_used_seconds")
-            .unwrap_or(0),
+        tokens_used,
+        time_used_seconds,
+        ledger_additive_tokens,
+        ledger_additive_time_seconds,
         created_at_ms: supervisor_metadata_i64(&group.metadata, "created_at_ms")
             .unwrap_or(group.created_at_ms.try_into().unwrap_or(i64::MAX)),
         updated_at_ms: supervisor_metadata_i64(&group.metadata, "updated_at_ms")
@@ -17138,6 +17087,8 @@ fn persist_goal_cleared(state: &AutonomyRuntimeState, session_id: &SessionKey, p
         token_budget: GOAL_DEFAULT_TOKEN_BUDGET,
         tokens_used: 0,
         time_used_seconds: 0,
+        ledger_additive_tokens: 0,
+        ledger_additive_time_seconds: 0,
         created_at_ms: now,
         updated_at_ms: now,
         continuations_used: 0,
@@ -18370,6 +18321,8 @@ mod tests {
             token_budget: 10_000,
             tokens_used: 0,
             time_used_seconds: 0,
+            ledger_additive_tokens: 0,
+            ledger_additive_time_seconds: 0,
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
             continuations_used: 0,
@@ -18517,12 +18470,15 @@ mod tests {
             .unwrap();
         drop(ledger);
 
-        InProcessAgentOrchestrator::offload_goal_charge_delta(
-            "g1".to_owned(),
-            dir.path().to_path_buf(),
-            5,
-            5,
-        );
+        let base = goal_ledger_row(&AutonomyGoalRecord {
+            tokens_used: 15,
+            time_used_seconds: 15,
+            ledger_additive_tokens: 5,
+            ledger_additive_time_seconds: 5,
+            updated_at_ms: 2_000,
+            ..goal_record("g1")
+        });
+        InProcessAgentOrchestrator::offload_goal_charge_delta(base, dir.path().to_path_buf(), 5, 5);
 
         let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
         let row = ledger.get_goal("g1").unwrap().unwrap();
@@ -18531,22 +18487,24 @@ mod tests {
             "the turn's spend lands additively on the durable row"
         );
         assert_eq!(row.time_used_seconds, 25);
-        assert_eq!(row.status, "active", "a charge never touches status");
+        assert_eq!(row.status, "active", "the counter-base status is preserved");
         drop(ledger);
 
-        // A goal with no row yet is a skip, not a fabrication: row creation
-        // stays with the absolute transition sync.
-        InProcessAgentOrchestrator::offload_goal_charge_delta(
-            "ghost".to_owned(),
-            dir.path().to_path_buf(),
-            5,
-            5,
-        );
+        // The first charge can create the row from the same stable base; no
+        // separate absolute snapshot is required to avoid losing the delta.
+        let base = goal_ledger_row(&AutonomyGoalRecord {
+            tokens_used: 5,
+            time_used_seconds: 5,
+            ledger_additive_tokens: 5,
+            ledger_additive_time_seconds: 5,
+            updated_at_ms: 2_000,
+            ..goal_record("ghost")
+        });
+        InProcessAgentOrchestrator::offload_goal_charge_delta(base, dir.path().to_path_buf(), 5, 5);
         let ghost_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), "ghost");
-        if ghost_path.exists() {
-            let ghost_ledger = octos_fleet::GoalLedger::open(&ghost_path).unwrap();
-            assert!(ghost_ledger.get_goal("ghost").unwrap().is_none());
-        }
+        let ghost_ledger = octos_fleet::GoalLedger::open(&ghost_path).unwrap();
+        let ghost = ghost_ledger.get_goal("ghost").unwrap().unwrap();
+        assert_eq!((ghost.tokens_used, ghost.time_used_seconds), (5, 5));
     }
 
     /// #2083 — the AUTONOMOUS accountant (`record_goal_turn`) settles the
@@ -18601,10 +18559,10 @@ mod tests {
             let row = ledger.get_goal("g1").unwrap().unwrap();
             assert_eq!(
                 row.tokens_used, 25,
-                "row + delta, never MAX(row, stale base + delta) = 20"
+                "MAX(row, stable base) + delta preserves the turn's spend"
             );
             assert_eq!(row.time_used_seconds, 25);
-            assert_eq!(row.status, "active", "a charge never touches status");
+            assert_eq!(row.status, "active", "the counter-base status is preserved");
             drop(ledger);
         }
         {
@@ -18624,6 +18582,83 @@ mod tests {
             let goal = orchestrator.state().goals.get(&key).unwrap().clone();
             assert_eq!(goal.tokens_used, 5, "the in-memory charge still lands");
             assert_eq!(goal.time_used_seconds, 5);
+        }
+    }
+
+    /// A post-charge goal record's counter-base snapshot and its additive
+    /// settle may commit in either order; only the latter owns the delta.
+    #[test]
+    fn should_count_a_live_charge_once_in_either_snapshot_and_charge_order() {
+        for snapshot_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(dir.path(), "g1");
+            std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+            ledger
+                .create_goal(&octos_fleet::Goal {
+                    goal_id: "g1".into(),
+                    objective: "test objective".into(),
+                    status: "active".into(),
+                    tokens_used: 20,
+                    token_budget: 10_000,
+                    time_used_seconds: 20,
+                    continuations_used: 0,
+                    revision: 0,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                })
+                .unwrap();
+            drop(ledger);
+
+            let orchestrator = InProcessAgentOrchestrator::default();
+            let snapshot = AutonomyGoalRecord {
+                tokens_used: 25,
+                time_used_seconds: 25,
+                ledger_additive_tokens: 5,
+                ledger_additive_time_seconds: 5,
+                updated_at_ms: 2_000,
+                ..goal_record("g1")
+            };
+            let key = SessionKey("s1".to_owned());
+            if snapshot_first {
+                orchestrator.sync_transition_to_ledger_blocking(
+                    dir.path(),
+                    &snapshot,
+                    "post-turn token reconcile",
+                    &key,
+                    false,
+                    false,
+                );
+                InProcessAgentOrchestrator::offload_goal_charge_delta(
+                    goal_ledger_row(&snapshot),
+                    dir.path().to_path_buf(),
+                    5,
+                    5,
+                );
+            } else {
+                InProcessAgentOrchestrator::offload_goal_charge_delta(
+                    goal_ledger_row(&snapshot),
+                    dir.path().to_path_buf(),
+                    5,
+                    5,
+                );
+                orchestrator.sync_transition_to_ledger_blocking(
+                    dir.path(),
+                    &snapshot,
+                    "post-turn token reconcile",
+                    &key,
+                    false,
+                    false,
+                );
+            }
+
+            let ledger = octos_fleet::GoalLedger::open(&ledger_path).unwrap();
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(
+                (row.tokens_used, row.time_used_seconds),
+                (25, 25),
+                "snapshot_first={snapshot_first}: the same five-token/five-second charge must land exactly once"
+            );
         }
     }
 }

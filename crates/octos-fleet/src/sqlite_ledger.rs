@@ -848,35 +848,90 @@ impl GoalLedger {
         Ok(admitted > 0)
     }
 
-    /// #2083 — apply a turn's counter DELTAS additively under one Immediate
-    /// transaction, instead of upserting an absolute snapshot that drops the
-    /// increment when the writer's in-memory base lags the durable row.
+    /// Upsert a goal snapshot whose token/time values are a STABLE counter
+    /// base, excluding every delta owned by [`Self::charge_goal_counters`].
+    /// Unlike [`Self::upsert_goal`], this writer MAX-merges both cost columns
+    /// and does not use the incoming token value as a whole-row admission
+    /// gate: a base may legitimately lag charges that already landed, while
+    /// the snapshot's status/objective/budget still need to sync.
     ///
-    /// `upsert_goal` MAX-merges time and admits by tokens; both are wrong for
-    /// a charge whose caller's base may be stale (restore-from-metadata lag).
-    /// This write adds the turn's tokens/time to whatever the row currently
-    /// holds, so the increment survives regardless of the caller's base.
-    /// Status, objective, and budget are NOT touched — the caller is a charge
-    /// path, not a transition. `updated_at_ms` MAX-merges (monotonic clock).
+    /// The caller must use the SAME base for every snapshot and charge that
+    /// can be in flight together. With base `B`, stored value `L`, and delta
+    /// `D`, snapshot and charge then commute by arithmetic:
+    /// `charge(snapshot(L)) = MAX(L, B) + D = snapshot(charge(L))`.
+    fn upsert_goal_counter_base_in_tx(tx: &rusqlite::Transaction<'_>, goal: &Goal) -> Result<bool> {
+        const TAIL: &str = "
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 tokens_used = MAX(goals.tokens_used, excluded.tokens_used),
+                 token_budget = excluded.token_budget,
+                 continuations_used = excluded.continuations_used,
+                 time_used_seconds = MAX(goals.time_used_seconds, excluded.time_used_seconds),
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= goals.updated_at_ms
+               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')
+               AND NOT (goals.status = 'cleared' AND excluded.status <> 'cleared')";
+        let admitted = tx.execute(
+            &format!("{}{TAIL}", Self::GOALS_INSERT_HEAD),
+            Self::goals_insert_params(goal).as_slice(),
+        )?;
+        Ok(admitted > 0)
+    }
+
+    /// Public transaction wrapper for counter-base snapshots. See
+    /// [`Self::upsert_goal_counter_base_in_tx`] for the ownership contract.
+    pub fn upsert_goal_counter_base(&self, goal: &Goal) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::ensure_goals_time_column(&tx)?;
+        let admitted = Self::upsert_goal_counter_base_in_tx(&tx, goal)?;
+        tx.commit()?;
+        Ok(admitted)
+    }
+
+    /// Settle one charge against the same stable counter base used by
+    /// [`Self::upsert_goal_counter_base`], in ONE Immediate transaction.
+    /// MAX-folding the base before adding the delta is required for both
+    /// orders: plain `row + delta` lets a later `MAX(row, base)` erase the
+    /// charge whenever the row lags that base, while an absolute post-charge
+    /// snapshot followed by `row + delta` counts the same charge twice.
     ///
-    /// Returns whether a row was updated (false ⇒ no such goal row; the
-    /// caller is expected to have synced one already).
+    /// The base also lets the charge create a previously absent row; row
+    /// creation no longer has to race a separate absolute snapshot. Returns
+    /// whether the charge update matched the row established above.
     pub fn charge_goal_counters(
         &self,
-        goal_id: &str,
+        base: &Goal,
         tokens_delta: u64,
         time_delta_seconds: u64,
-        updated_at_ms: u64,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         Self::ensure_goals_time_column(&tx)?;
+        // Metadata updates belong to the snapshot writer. The charge only
+        // seeds a missing row, then leaves every existing non-counter field
+        // untouched even when same-millisecond offloads arrive out of order.
+        tx.execute(
+            &format!(
+                "{}\nON CONFLICT(goal_id) DO NOTHING",
+                Self::GOALS_INSERT_HEAD
+            ),
+            Self::goals_insert_params(base).as_slice(),
+        )?;
         let changed = tx.execute(
-            "UPDATE goals SET tokens_used = tokens_used + ?1,
-                 time_used_seconds = time_used_seconds + ?2,
+            "UPDATE goals SET tokens_used = MAX(tokens_used, ?1) + ?2,
+                 time_used_seconds = MAX(time_used_seconds, ?5) + ?6,
                  updated_at_ms = MAX(updated_at_ms, ?3)
              WHERE goal_id = ?4",
-            params![tokens_delta, time_delta_seconds, updated_at_ms, goal_id],
+            params![
+                base.tokens_used,
+                tokens_delta,
+                base.updated_at_ms,
+                base.goal_id,
+                base.time_used_seconds,
+                time_delta_seconds
+            ],
         )?;
         tx.commit()?;
         Ok(changed > 0)
@@ -2440,18 +2495,12 @@ mod tests {
         assert_eq!(goal.revision, 3);
     }
 
-    /// #2083 — the charge path settles a turn's spend as an ADDITIVE delta,
-    /// so a writer whose in-memory base lags the durable row never loses the
-    /// increment (the absolute-snapshot `upsert_goal` stores
-    /// `MAX(row, base + delta)` for time and admits by tokens, silently
-    /// dropping the turn whenever the row is ahead). Independent scopes: the
-    /// lagging-base scenario and the no-row skip.
+    /// #2083 — a lagging in-memory base still settles additively, and a
+    /// row-less first charge uses that same base to create the goals row.
     #[test]
     fn should_settle_charge_deltas_additively_when_the_writers_base_lags_the_row() {
         {
             let (_dir, ledger) = open_ledger();
-            // The durable row is already ahead (20/20) — e.g. synced by a
-            // fresher lifetime before this writer restored at a stale base.
             ledger
                 .create_goal(&Goal {
                     tokens_used: 20,
@@ -2459,35 +2508,40 @@ mod tests {
                     ..goal("g1")
                 })
                 .unwrap();
-            // The lagging writer's turn spent 5 more: the delta lands on the
-            // row as it stands — not on the writer's stale base (which would
-            // store 15), nor by MAX (which would keep 20); the true total is
-            // 25.
-            assert!(ledger.charge_goal_counters("g1", 5, 5, 2_000).unwrap());
+            let base = Goal {
+                tokens_used: 10,
+                time_used_seconds: 10,
+                updated_at_ms: 2_000,
+                ..goal("g1")
+            };
+            assert!(ledger.charge_goal_counters(&base, 5, 5).unwrap());
             let row = ledger.get_goal("g1").unwrap().unwrap();
             assert_eq!(row.tokens_used, 25);
             assert_eq!(row.time_used_seconds, 25);
             assert_eq!(row.updated_at_ms, 2_000);
-            assert_eq!(row.status, "active", "a charge never touches status");
-            assert_eq!(row.objective, "test", "a charge never touches objective");
-            // `updated_at_ms` MAX-merges: an older clock never rewinds it.
-            assert!(ledger.charge_goal_counters("g1", 1, 1, 1_500).unwrap());
+            assert_eq!(row.status, "active");
+            assert_eq!(row.objective, "test");
+            // The stable base stays 10/10 across charges; an older snapshot
+            // clock never rewinds the row's timestamp.
+            let older = Goal {
+                updated_at_ms: 1_500,
+                ..base
+            };
+            assert!(ledger.charge_goal_counters(&older, 1, 1).unwrap());
             let row = ledger.get_goal("g1").unwrap().unwrap();
             assert_eq!(row.tokens_used, 26);
             assert_eq!(row.updated_at_ms, 2_000);
-            // The writer's later absolute transition sync still carries its
-            // stale base: the monotonic admission clause rejects it, leaving
-            // the additively-settled counters intact.
+            // A later base-only snapshot can sync metadata without rejecting
+            // the write or replaying either additive charge.
             assert!(
-                !ledger
-                    .upsert_goal(&Goal {
-                        tokens_used: 15,
-                        time_used_seconds: 15,
+                ledger
+                    .upsert_goal_counter_base(&Goal {
+                        tokens_used: 10,
+                        time_used_seconds: 10,
                         updated_at_ms: 3_000,
                         ..goal("g1")
                     })
-                    .unwrap(),
-                "a snapshot whose token base lags the row must not be admitted"
+                    .unwrap()
             );
             let row = ledger.get_goal("g1").unwrap().unwrap();
             assert_eq!(row.tokens_used, 26);
@@ -2495,11 +2549,48 @@ mod tests {
         }
         {
             let (_dir, ledger) = open_ledger();
-            // No row yet (the goal's first charge preceded its first
-            // transition sync): the charge skips and must NOT create one —
-            // row creation stays with the absolute sync.
-            assert!(!ledger.charge_goal_counters("ghost", 5, 5, 2_000).unwrap());
-            assert!(ledger.get_goal("ghost").unwrap().is_none());
+            let base = Goal {
+                updated_at_ms: 2_000,
+                ..goal("ghost")
+            };
+            assert!(ledger.charge_goal_counters(&base, 5, 5).unwrap());
+            let row = ledger.get_goal("ghost").unwrap().unwrap();
+            assert_eq!((row.tokens_used, row.time_used_seconds), (5, 5));
+        }
+    }
+
+    /// The snapshot and charge writers converge in either commit order, even
+    /// when the durable row starts behind their shared counter base.
+    #[test]
+    fn should_commute_counter_base_snapshots_with_additive_charges() {
+        for snapshot_first in [true, false] {
+            let (_dir, ledger) = open_ledger();
+            ledger
+                .create_goal(&Goal {
+                    tokens_used: 10,
+                    time_used_seconds: 10,
+                    ..goal("g1")
+                })
+                .unwrap();
+            let base = Goal {
+                tokens_used: 20,
+                time_used_seconds: 20,
+                updated_at_ms: 2_000,
+                ..goal("g1")
+            };
+            if snapshot_first {
+                ledger.upsert_goal_counter_base(&base).unwrap();
+                ledger.charge_goal_counters(&base, 5, 5).unwrap();
+            } else {
+                ledger.charge_goal_counters(&base, 5, 5).unwrap();
+                ledger.upsert_goal_counter_base(&base).unwrap();
+            }
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(
+                (row.tokens_used, row.time_used_seconds),
+                (25, 25),
+                "snapshot_first={snapshot_first}"
+            );
         }
     }
 
