@@ -848,6 +848,95 @@ impl GoalLedger {
         Ok(admitted > 0)
     }
 
+    /// Upsert a goal snapshot whose token/time values are a STABLE counter
+    /// base, excluding every delta owned by [`Self::charge_goal_counters`].
+    /// Unlike [`Self::upsert_goal`], this writer MAX-merges both cost columns
+    /// and does not use the incoming token value as a whole-row admission
+    /// gate: a base may legitimately lag charges that already landed, while
+    /// the snapshot's status/objective/budget still need to sync.
+    ///
+    /// The caller must use the SAME base for every snapshot and charge that
+    /// can be in flight together. With base `B`, stored value `L`, and delta
+    /// `D`, snapshot and charge then commute by arithmetic:
+    /// `charge(snapshot(L)) = MAX(L, B) + D = snapshot(charge(L))`.
+    fn upsert_goal_counter_base_in_tx(tx: &rusqlite::Transaction<'_>, goal: &Goal) -> Result<bool> {
+        const TAIL: &str = "
+             ON CONFLICT(goal_id) DO UPDATE SET
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 tokens_used = MAX(goals.tokens_used, excluded.tokens_used),
+                 token_budget = excluded.token_budget,
+                 continuations_used = excluded.continuations_used,
+                 time_used_seconds = MAX(goals.time_used_seconds, excluded.time_used_seconds),
+                 updated_at_ms = excluded.updated_at_ms
+             WHERE excluded.updated_at_ms >= goals.updated_at_ms
+               AND NOT (goals.status = 'complete' AND excluded.status <> 'complete')
+               AND NOT (goals.status = 'cleared' AND excluded.status <> 'cleared')";
+        let admitted = tx.execute(
+            &format!("{}{TAIL}", Self::GOALS_INSERT_HEAD),
+            Self::goals_insert_params(goal).as_slice(),
+        )?;
+        Ok(admitted > 0)
+    }
+
+    /// Public transaction wrapper for counter-base snapshots. See
+    /// [`Self::upsert_goal_counter_base_in_tx`] for the ownership contract.
+    pub fn upsert_goal_counter_base(&self, goal: &Goal) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::ensure_goals_time_column(&tx)?;
+        let admitted = Self::upsert_goal_counter_base_in_tx(&tx, goal)?;
+        tx.commit()?;
+        Ok(admitted)
+    }
+
+    /// Settle one charge against the same stable counter base used by
+    /// [`Self::upsert_goal_counter_base`], in ONE Immediate transaction.
+    /// MAX-folding the base before adding the delta is required for both
+    /// orders: plain `row + delta` lets a later `MAX(row, base)` erase the
+    /// charge whenever the row lags that base, while an absolute post-charge
+    /// snapshot followed by `row + delta` counts the same charge twice.
+    ///
+    /// The base also lets the charge create a previously absent row, including
+    /// its initial metadata timestamp. For an EXISTING row, `updated_at_ms`
+    /// belongs exclusively to the metadata snapshot writer: a later charge
+    /// must never make an earlier queued snapshot fail the admission guard.
+    /// Returns whether the charge update matched the row established above.
+    pub fn charge_goal_counters(
+        &self,
+        base: &Goal,
+        tokens_delta: u64,
+        time_delta_seconds: u64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::ensure_goals_time_column(&tx)?;
+        // Metadata updates (including updated_at_ms) belong to the snapshot
+        // writer. The charge only seeds a missing row, then leaves every
+        // existing non-counter field untouched, even out of order.
+        tx.execute(
+            &format!(
+                "{}\nON CONFLICT(goal_id) DO NOTHING",
+                Self::GOALS_INSERT_HEAD
+            ),
+            Self::goals_insert_params(base).as_slice(),
+        )?;
+        let changed = tx.execute(
+            "UPDATE goals SET tokens_used = MAX(tokens_used, ?1) + ?2,
+                 time_used_seconds = MAX(time_used_seconds, ?3) + ?4
+             WHERE goal_id = ?5",
+            params![
+                base.tokens_used,
+                tokens_delta,
+                base.time_used_seconds,
+                time_delta_seconds,
+                base.goal_id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     /// #2055 review round 2 — create a goals row only when none exists yet
     /// (`INSERT … ON CONFLICT(goal_id) DO NOTHING`), the goals-side twin of
     /// [`Self::create_task_if_absent`].
@@ -2404,6 +2493,163 @@ mod tests {
         assert_eq!(goal.tokens_used, 7, "the surviving fields are unchanged");
         assert_eq!(goal.continuations_used, 2);
         assert_eq!(goal.revision, 3);
+    }
+
+    /// #2083 — a lagging in-memory base still settles additively, and a
+    /// row-less first charge uses that same base to create the goals row.
+    #[test]
+    fn should_settle_charge_deltas_additively_when_the_writers_base_lags_the_row() {
+        {
+            let (_dir, ledger) = open_ledger();
+            ledger
+                .create_goal(&Goal {
+                    tokens_used: 20,
+                    time_used_seconds: 20,
+                    ..goal("g1")
+                })
+                .unwrap();
+            let base = Goal {
+                tokens_used: 10,
+                time_used_seconds: 10,
+                updated_at_ms: 2_000,
+                ..goal("g1")
+            };
+            assert!(ledger.charge_goal_counters(&base, 5, 5).unwrap());
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(row.tokens_used, 25);
+            assert_eq!(row.time_used_seconds, 25);
+            assert_eq!(row.updated_at_ms, 1_000);
+            assert_eq!(row.status, "active");
+            assert_eq!(row.objective, "test");
+            // The stable base stays 10/10 across charges; neither a newer nor
+            // an older charge timestamp advances the existing row's metadata clock.
+            let older = Goal {
+                updated_at_ms: 1_500,
+                ..base
+            };
+            assert!(ledger.charge_goal_counters(&older, 1, 1).unwrap());
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(row.tokens_used, 26);
+            assert_eq!(row.updated_at_ms, 1_000);
+            // A later base-only snapshot can sync metadata without rejecting
+            // the write or replaying either additive charge.
+            assert!(
+                ledger
+                    .upsert_goal_counter_base(&Goal {
+                        tokens_used: 10,
+                        time_used_seconds: 10,
+                        updated_at_ms: 3_000,
+                        ..goal("g1")
+                    })
+                    .unwrap()
+            );
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(row.tokens_used, 26);
+            assert_eq!(row.time_used_seconds, 26);
+            assert_eq!(
+                row.updated_at_ms, 3_000,
+                "only the metadata snapshot advances the existing row's clock"
+            );
+        }
+        {
+            let (_dir, ledger) = open_ledger();
+            let base = Goal {
+                updated_at_ms: 2_000,
+                ..goal("ghost")
+            };
+            assert!(ledger.charge_goal_counters(&base, 5, 5).unwrap());
+            let row = ledger.get_goal("ghost").unwrap().unwrap();
+            assert_eq!((row.tokens_used, row.time_used_seconds), (5, 5));
+            assert_eq!(
+                row.updated_at_ms, 2_000,
+                "insert-if-absent still initializes the metadata timestamp from the base"
+            );
+        }
+    }
+
+    /// The snapshot and charge writers converge in either commit order, even
+    /// when the durable row starts behind their shared counter base.
+    #[test]
+    fn should_commute_counter_base_snapshots_with_additive_charges() {
+        for snapshot_first in [true, false] {
+            let (_dir, ledger) = open_ledger();
+            ledger
+                .create_goal(&Goal {
+                    tokens_used: 10,
+                    time_used_seconds: 10,
+                    ..goal("g1")
+                })
+                .unwrap();
+            let base = Goal {
+                tokens_used: 20,
+                time_used_seconds: 20,
+                updated_at_ms: 2_000,
+                ..goal("g1")
+            };
+            if snapshot_first {
+                ledger.upsert_goal_counter_base(&base).unwrap();
+                ledger.charge_goal_counters(&base, 5, 5).unwrap();
+            } else {
+                ledger.charge_goal_counters(&base, 5, 5).unwrap();
+                ledger.upsert_goal_counter_base(&base).unwrap();
+            }
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(
+                (row.tokens_used, row.time_used_seconds),
+                (25, 25),
+                "snapshot_first={snapshot_first}"
+            );
+        }
+    }
+
+    /// A charge's timestamp must not outrun a queued metadata snapshot and
+    /// defeat its admission, regardless of which writer commits first.
+    #[test]
+    fn should_keep_charge_timestamps_out_of_snapshot_metadata_ordering() {
+        for snapshot_first in [false, true] {
+            let (_dir, ledger) = open_ledger();
+            ledger
+                .create_goal(&Goal {
+                    tokens_used: 20,
+                    time_used_seconds: 20,
+                    token_budget: 100,
+                    updated_at_ms: 100,
+                    ..goal("g1")
+                })
+                .unwrap();
+            let budget_snapshot = Goal {
+                tokens_used: 20,
+                time_used_seconds: 20,
+                token_budget: 200,
+                updated_at_ms: 101,
+                ..goal("g1")
+            };
+            let charge_base = Goal {
+                tokens_used: 20,
+                time_used_seconds: 20,
+                token_budget: 200,
+                updated_at_ms: 102,
+                ..goal("g1")
+            };
+            if snapshot_first {
+                ledger.upsert_goal_counter_base(&budget_snapshot).unwrap();
+                ledger.charge_goal_counters(&charge_base, 5, 5).unwrap();
+            } else {
+                ledger.charge_goal_counters(&charge_base, 5, 5).unwrap();
+                ledger.upsert_goal_counter_base(&budget_snapshot).unwrap();
+            }
+            let row = ledger.get_goal("g1").unwrap().unwrap();
+            assert_eq!(
+                (
+                    row.token_budget,
+                    row.updated_at_ms,
+                    row.tokens_used,
+                    row.time_used_seconds,
+                ),
+                (200, 101, 25, 25),
+                "snapshot_first={snapshot_first}: charge must not reject or outdate the budget snapshot"
+            );
+        }
     }
 
     #[test]

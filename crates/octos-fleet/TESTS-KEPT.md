@@ -6,7 +6,7 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 
 ## T-0584 second round: same-chain merges and shared setup
 
-Current retained inventory: **82 lib tests** (first round 91 → second round 82). Only the retained tests were audited; no first-round deletion is restored. Nine duplicate scenarios were merged only after moving all of their assertions into the surviving chain:
+Current retained inventory: **85 lib tests** (first round 91 → second round 82; #2083 added one charge-delta regression, and the snapshot/charge race fixes added commutation and metadata-ordering regressions). Only the retained tests were audited; no first-round deletion is restored. Nine duplicate scenarios were merged only after moving all of their assertions into the surviving chain:
 
 | Absorbed scenario(s) | Surviving test | Assertions retained |
 |---|---|---|
@@ -103,6 +103,9 @@ Wrong owner/attempt/generation, healthy vs stale lease, exact cap/overflow, gran
 | `sqlite_ledger::digest_integration_tests::should_never_leave_terminal_rows_unranked_when_creation_races_migration` | 4 | Creation/migration races cannot leave terminal work outside deterministic ranking. |
 | `sqlite_ledger::digest_integration_tests::cas_goal_status_is_defeated_by_an_intervening_same_status_write` | 4 | CAS detects intervening writes even when they use the same status value. |
 | `sqlite_ledger::tests::list_decisions_round_trips_per_goal_in_order` | 4 | Decision history round-trips in order and remains goal-scoped. |
+| `sqlite_ledger::tests::should_settle_charge_deltas_additively_when_the_writers_base_lags_the_row` | 4 | A turn charge settles against a stable counter base when the writer's in-memory base lags the row; later base snapshots do not replay deltas, and a row-less first charge creates the row from its base. |
+| `sqlite_ledger::tests::should_commute_counter_base_snapshots_with_additive_charges` | 4 | Counter-base snapshots and additive charges converge to one exact total in both commit orders, including a durable row that starts behind the shared base. |
+| `sqlite_ledger::tests::should_keep_charge_timestamps_out_of_snapshot_metadata_ordering` | 4 | A t102 charge cannot advance the existing row's metadata clock and reject a queued t101 budget 100→200 snapshot; both commit orders preserve budget 200, timestamp 101 and exact counters. |
 | `sqlite_ledger::tests::should_default_time_used_seconds_when_deserializing_a_pre_2068_goal` | 4 | Pre-#2068 rows retain safe time-accounting defaults after upgrade. |
 | `digest::tests::watermark_streams_all_findings_under_constant_budget` | 4 | Streaming a full finding log stays within bounded memory. |
 | `digest::tests::the_budget_is_enforced_and_every_cut_is_declared` | 3 | Digest cuts honor budget and declare every omission. |

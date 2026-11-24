@@ -151,6 +151,14 @@ pub(crate) struct AutonomyGoalRecord {
     pub(crate) token_budget: u64,
     pub(crate) tokens_used: u64,
     pub(crate) time_used_seconds: u64,
+    /// Token/time deltas owned by the additive goal-ledger writer. Ledger
+    /// snapshots subtract these transient totals so they carry only the
+    /// stable counter base, never replay a charge that can commit separately.
+    /// Both reset to zero on a cold restore, where old detached writes cannot
+    /// survive; same-incarnation rehydration preserves them because those
+    /// writes can still be in flight in this process.
+    pub(crate) ledger_additive_tokens: u64,
+    pub(crate) ledger_additive_time_seconds: u64,
     pub(crate) created_at_ms: i64,
     pub(crate) updated_at_ms: i64,
     /// #979 / M15-C2 — number of goal continuation turns this goal has
