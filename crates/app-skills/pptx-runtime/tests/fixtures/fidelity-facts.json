@@ -1,0 +1,8 @@
+{
+  "comparison_reliable": true,
+  "layout_relation": "preserved",
+  "reference_interference": "absent",
+  "current_interference": "absent",
+  "interference_change": "equivalent",
+  "basis": "Synthetic original/current pixel comparison"
+}
