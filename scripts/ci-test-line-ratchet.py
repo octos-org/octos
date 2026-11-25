@@ -13,9 +13,13 @@ APPROVED (shu 2026-11-19 ruling: approving the current head IS approving
 its test growth — one maintainer action instead of two). See MAINTAINERS;
 the shared agent account never counts, approvals on stale heads do not
 count, and a later CHANGES_REQUESTED/DISMISSED supersedes an earlier
-approval. The baseline is the merge-base of the event base and head refs,
-so a PR behind main is not credited with deleting main's newer tests.
-Push to main only reports the numbers.
+approval. shu 2026-11-25 caps the review path: growth above
+REVIEW_CAP lines is exempt ONLY by the maintainer-applied label, never
+by a review — an approved PR with too many tests must be shrunk, or
+explicitly label-exempted by a maintainer's own choice. The baseline is
+the merge-base of the event base and head refs, so a PR behind main is
+not credited with deleting main's newer tests. Push to main only
+reports the numbers.
 
 `--self-test` runs offline cases in temporary git repositories.
 """
@@ -35,6 +39,9 @@ from pathlib import Path
 
 LABEL = "test-growth-approved"
 MAINTAINERS = frozenset({"alan0x", "BH3GEI", "ymote"})
+# shu 2026-11-25: a maintainer's APPROVED review exempts at most this many
+# net test lines; beyond it only the maintainer-applied label exempts.
+REVIEW_CAP = 150
 
 RUST_TEST = re.compile(r"^\s*#\[(tokio::test|test|rstest|test_case|async_std::test|sqlx::test)\b")
 JS_TEST = re.compile(r"^\s*(it|test)(\.(each|skip|only)\b[^(]*)?\(")
@@ -264,6 +271,21 @@ def run(args: argparse.Namespace) -> int:
             print(f"{LABEL} applied by maintainer {who}: growth exempt, green")
             return 0
         print(f"exemption check (label): {who}")
+        if delta > REVIEW_CAP:
+            # shu 2026-11-25: an approval only covers up to REVIEW_CAP net
+            # test lines; larger growth needs the maintainer-applied label.
+            print(f"::error::net test-line growth +{delta} lines exceeds the per-PR limit of {REVIEW_CAP}:")
+            for row in growth_detail(base, head):
+                print(row)
+            print(
+                f"Shrink this PR's tests to +{REVIEW_CAP} lines or fewer: merge "
+                f"duplicate cases (table-driven tests), or delete redundant old "
+                f"tests to offset the new ones. A maintainer's APPROVED review "
+                f"no longer exempts above {REVIEW_CAP} lines — only a maintainer "
+                f"({', '.join(sorted(MAINTAINERS))}) applying `{LABEL}` can, and "
+                f"that is their own call to make."
+            )
+            return 1
         approved, who = review_approved(args.repo_slug, args.pr, args.reviews_json)
         if approved:
             print(f"review exemption: {who}: growth exempt, green")
@@ -280,8 +302,8 @@ def run(args: argparse.Namespace) -> int:
     print(
         f"If it truly cannot be offset, state why in the PR and ask a "
         f"maintainer ({', '.join(sorted(MAINTAINERS))}) to either approve the "
-        f"current head (an APPROVED review IS the test-growth approval), or "
-        f"apply `{LABEL}`."
+        f"current head (an APPROVED review IS the test-growth approval, up to "
+        f"{REVIEW_CAP} lines), or apply `{LABEL}`."
     )
     return 1
 
@@ -290,15 +312,17 @@ def git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
-def fixture_repo(root: Path, growth: int) -> Path:
+def fixture_repo(root: Path, growth: int, pad: int = 0) -> Path:
     repo = root / "fixture"
     (repo / "crates/demo/src").mkdir(parents=True)
     (repo / "crates/demo").joinpath("Cargo.toml").write_text("[package]\nname = \"demo\"\n")
     lib = repo / "crates/demo/src/lib.rs"
 
-    def source(cases: int) -> str:
+    def source(cases: int, padding: int = 0) -> str:
         body = "".join(f"#[test]\nfn case_{i}() {{}}\n" for i in range(cases))
-        return f"pub fn f() {{}}\n\n#[cfg(test)]\nmod tests {{\n{body}}}\n"
+        # One-line comments inside the module so odd deltas are exact.
+        extra = "".join("// pad\n" for _ in range(padding))
+        return f"pub fn f() {{}}\n\n#[cfg(test)]\nmod tests {{\n{body}{extra}}}\n"
 
     lib.write_text(source(3))
     git(repo, "init", "-q")
@@ -310,8 +334,8 @@ def fixture_repo(root: Path, growth: int) -> Path:
     base_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
     ).stdout.strip()
-    if growth != 0:
-        lib.write_text(source(3 + growth))
+    if growth != 0 or pad != 0:
+        lib.write_text(source(3 + growth, pad))
         git(repo, "add", ".")
         git(repo, "commit", "-qm", "change")
     head_sha = subprocess.run(
@@ -525,6 +549,39 @@ def self_test(repo_root: Path) -> None:
                        "--events-json", str(label_only), "--reviews-json", str(no_reviews),
                        expect=0)
         assert "ymote" in out, out
+
+        # shu 2026-11-25 cap: an APPROVED review exempts at most 150 net
+        # lines; beyond it, only the maintainer-applied label exempts.
+        repo, base, head = fixture_repo(root / "cap-150-approve", 75)
+        fixture = reviews_fixture(root / "cap150.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": head})
+        out = run_case("cap-150-approve", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events),
+                       "--reviews-json", fixture, expect=0)
+        assert "delta = +150" in out and "alan0x approved the current head" in out, out
+
+        repo, base, head = fixture_repo(root / "cap-151-approve", 75, pad=1)
+        fixture = reviews_fixture(root / "cap151.json", head,
+            {"user": {"login": "alan0x"}, "state": "APPROVED", "commit_id": head})
+        out = run_case("cap-151-approve", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos", "--events-json", str(no_events),
+                       "--reviews-json", fixture, expect=1)
+        assert "delta = +151" in out and "per-PR limit of 150" in out, out
+        assert "table-driven" in out and "APPROVED review" in out, out
+
+        repo, base, head = fixture_repo(root / "cap-151-label", 75, pad=1)
+        out = run_case("cap-151-label", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos",
+                       "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+                       expect=0)
+        assert "delta = +151" in out and "alan0x" in out, out
+
+        repo, base, head = fixture_repo(root / "cap-151-bot-label", 75, pad=1)
+        out = run_case("cap-151-bot-label", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos",
+                       "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+                       expect=1)
+        assert "delta = +151" in out and "not a maintainer" in out, out
 
     workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text()
     check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
