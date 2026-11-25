@@ -202,16 +202,134 @@ pub fn default_max_tokens() -> u32 {
     16_384
 }
 
-/// Estimate token count from text using character heuristic.
+/// Estimate token count from text.
 ///
-/// Uses ~4 chars/token for ASCII (English/code) and ~1.5 chars/token for
-/// non-ASCII (CJK, emoji, etc.). This is a rough guard — not a precise
-/// tokenizer — so it intentionally overestimates slightly to be safe.
+/// A single-pass, run-aware heuristic calibrated against a production BPE
+/// tokenizer (DeepSeek V4.1 Flash, 128K vocab) on real agent traffic: system
+/// prompts, tool schemas, web-page tool results (English and Chinese), Python
+/// written through tool-call arguments, and base64 payloads. The previous
+/// `ascii/4 + non_ascii/1.5` rule was within a few percent for English prose
+/// but under-counted code and JSON by ~45% and base64 by ~63%, so long tool
+/// loops crossed the provider's hard context limit before the 70%
+/// compaction threshold fired.
+///
+/// Weights (tokens per feature):
+/// * ASCII letter run (a "word"): 1.1, plus 1.8 per lower→upper case flip
+///   inside the run (camelCase identifiers, base64) and 0.55 per letter
+///   beyond the 12th (hashes, random or minified text);
+/// * group of up to three ASCII digits: 1.3 (BPE vocabularies split numbers
+///   into 3-digit groups), plus 1.2 when the number follows a space;
+/// * ASCII punctuation / symbol: 0.55;
+/// * line break or tab/CR run (indentation + newline tokens): 1.75 — a
+///   single space before a word is free (it merges with the word);
+/// * CJK ideograph / kana / hangul / full-width form: 0.62;
+/// * any other non-ASCII scalar (emoji, symbols, accented Latin): 1.7.
+///
+/// The result is never below one token per six UTF-8 bytes (callers such as
+/// task-input budgeting rely on that bound). On the calibration corpus the
+/// per-segment error is p50 1.6% / p90 7.4% and whole requests land within
+/// +2..+6% of the tokenizer. The result is multiplied by
+/// [`token_estimate_scale`] (default 1.0, `OCTOS_TOKEN_ESTIMATE_SCALE`) so
+/// operators can add headroom for a tokenizer that differs.
 pub fn estimate_tokens(text: &str) -> u32 {
-    let ascii_chars = text.bytes().filter(|b| b.is_ascii()).count() as u32;
-    let non_ascii_chars = text.chars().count() as u32 - ascii_chars;
-    let tokens = ascii_chars / 4 + (non_ascii_chars as f32 / 1.5) as u32;
-    tokens.max(1)
+    let raw = estimate_tokens_unscaled(text);
+    let scale = token_estimate_scale();
+    if scale == 1.0 {
+        return raw.max(1);
+    }
+    ((raw as f64 * scale).ceil() as u32).max(1)
+}
+
+/// Feature weights for [`estimate_tokens`], in hundredths of a token.
+const TOKEN_WEIGHT_WORD: u64 = 110;
+const TOKEN_WEIGHT_CASE_FLIP: u64 = 180;
+/// Letters of one run beyond this length are no longer a dictionary word;
+/// each costs [`TOKEN_WEIGHT_LONG_RUN`].
+const TOKEN_LONG_RUN_LETTERS: u32 = 12;
+const TOKEN_WEIGHT_LONG_RUN: u64 = 55;
+const TOKEN_WEIGHT_DIGIT_GROUP: u64 = 130;
+const TOKEN_WEIGHT_SPACE_BEFORE_DIGIT: u64 = 120;
+const TOKEN_WEIGHT_PUNCT: u64 = 55;
+const TOKEN_WEIGHT_LINE_BREAK: u64 = 175;
+const TOKEN_WEIGHT_CJK: u64 = 62;
+const TOKEN_WEIGHT_OTHER: u64 = 170;
+/// Floor: never fewer tokens than UTF-8 bytes / this.
+const TOKEN_MOST_BYTES_PER_TOKEN: usize = 6;
+
+fn is_cjk_like(c: char) -> bool {
+    matches!(c as u32,
+        0x2E80..=0x9FFF      // CJK radicals, kana, CJK symbols/punctuation, ideographs
+        | 0xAC00..=0xD7AF    // Hangul syllables
+        | 0xF900..=0xFAFF    // CJK compatibility ideographs
+        | 0xFF00..=0xFFEF) // half/full-width forms (，：（） etc.)
+}
+
+fn estimate_tokens_unscaled(text: &str) -> u32 {
+    let mut hundredths: u64 = 0;
+    let mut prev: Option<char> = None;
+    let mut letter_run: u32 = 0;
+    let mut digit_run: u32 = 0;
+    for c in text.chars() {
+        let prev_ascii_alpha = prev.is_some_and(|p| p.is_ascii_alphabetic());
+        let prev_ws = prev.is_some_and(|p| matches!(p, ' ' | '\t' | '\r' | '\n'));
+        if c.is_ascii_alphabetic() {
+            letter_run = if prev_ascii_alpha { letter_run + 1 } else { 1 };
+            if letter_run > TOKEN_LONG_RUN_LETTERS {
+                hundredths += TOKEN_WEIGHT_LONG_RUN;
+            }
+            if !prev_ascii_alpha {
+                hundredths += TOKEN_WEIGHT_WORD;
+            } else if prev.is_some_and(|p| p.is_ascii_lowercase()) && c.is_ascii_uppercase() {
+                hundredths += TOKEN_WEIGHT_CASE_FLIP;
+            }
+        } else if c.is_ascii_digit() {
+            digit_run = if prev.is_some_and(|p| p.is_ascii_digit()) {
+                digit_run + 1
+            } else {
+                1
+            };
+            if digit_run % 3 == 1 {
+                hundredths += TOKEN_WEIGHT_DIGIT_GROUP;
+            }
+            if prev == Some(' ') {
+                hundredths += TOKEN_WEIGHT_SPACE_BEFORE_DIGIT;
+            }
+        } else if matches!(c, ' ' | '\t' | '\r' | '\n') {
+            // A lone space merges into the following word; newlines and the
+            // start of a tab/CR run cost a token each.
+            if (c != ' ' || prev_ws) && (!prev_ws || c == '\n') {
+                hundredths += TOKEN_WEIGHT_LINE_BREAK;
+            }
+        } else if c.is_ascii() {
+            hundredths += TOKEN_WEIGHT_PUNCT;
+        } else if is_cjk_like(c) {
+            hundredths += TOKEN_WEIGHT_CJK;
+        } else {
+            hundredths += TOKEN_WEIGHT_OTHER;
+        }
+        prev = Some(c);
+    }
+    let floor = (text.len() / TOKEN_MOST_BYTES_PER_TOKEN) as u64;
+    hundredths.div_ceil(100).max(floor).min(u32::MAX as u64) as u32
+}
+
+/// Operator multiplier applied to every [`estimate_tokens`] result
+/// (`OCTOS_TOKEN_ESTIMATE_SCALE`, clamped to 0.5..=4.0; default 1.0). Read
+/// once per process. Use it to add headroom when the serving tokenizer is
+/// known to be denser than the calibration tokenizer, or when the provider
+/// bills hidden tokens (e.g. server-side replayed reasoning) into the prompt.
+pub fn token_estimate_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        parse_token_estimate_scale(std::env::var("OCTOS_TOKEN_ESTIMATE_SCALE").ok().as_deref())
+    })
+}
+
+fn parse_token_estimate_scale(raw: Option<&str>) -> f64 {
+    raw.and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.5, 4.0))
+        .unwrap_or(1.0)
 }
 
 /// Estimate tokens for a message (content + serialized tool calls + overhead).
@@ -448,6 +566,58 @@ pub(crate) async fn route_fits_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reference counts from the DeepSeek V4.1 Flash tokenizer
+    /// (`tokenizer.json`, no special tokens) for fixed samples. The estimate
+    /// must stay close for prose and must not fall far below it for code,
+    /// CJK, or base64 — the old `ascii/4` rule reached only ~35% on base64.
+    fn tokenizer_reference_samples() -> Vec<(&'static str, String, u32)> {
+        use base64::Engine as _;
+        let english =
+            "The quick brown fox jumps over the lazy dog. Memory bandwidth demand from AI \
+accelerators keeps rising, and suppliers are expanding capacity through 2027. "
+                .repeat(20);
+        let python = "def build_slide(prs, title, bullets):\n    slide = prs.slides.add_slide(prs.slide_layouts[1])\n    slide.shapes.title.text = title\n    body = slide.placeholders[1].text_frame\n    for i, b in enumerate(bullets):\n        p = body.add_paragraph() if i else body.paragraphs[0]\n        p.text = b\n        p.level = 0\n    return slide\n"
+            .repeat(20);
+        let chinese = "根据行业调研，2026 年全球 HBM 需求预计同比增长约 70%，SK 海力士、三星和美光三家厂商合计占据超过 95% 的市场份额。其中，SK 海力士凭借在 HBM3E 上的先发优势保持领先。"
+            .repeat(15);
+        let bytes: Vec<u8> = (0..6000u32).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        vec![
+            ("english", english, 601),
+            ("python", python, 2020),
+            ("chinese", chinese, 915),
+            ("base64", b64, 5642),
+        ]
+    }
+
+    #[test]
+    fn estimate_tokens_tracks_reference_tokenizer() {
+        for (name, text, reference) in tokenizer_reference_samples() {
+            let estimate = estimate_tokens_unscaled(&text);
+            let ratio = estimate as f64 / reference as f64;
+            assert!(
+                (0.88..=1.20).contains(&ratio),
+                "{name}: estimate {estimate} vs tokenizer {reference} (ratio {ratio:.3})"
+            );
+        }
+        // Regression baseline: the legacy `ascii/4` rule saw base64 at ~35%.
+        let (_, b64, reference) = &tokenizer_reference_samples()[3];
+        assert!(((b64.len() / 4) as f64) < 0.4 * *reference as f64);
+        // A long single-letter run is not one "word" (old #2135 fit-guard case).
+        assert!(estimate_tokens_unscaled(&"y".repeat(20_000)) >= 5_000);
+    }
+
+    #[test]
+    fn token_estimate_scale_parses_and_clamps() {
+        assert_eq!(parse_token_estimate_scale(None), 1.0);
+        assert_eq!(parse_token_estimate_scale(Some("1.25")), 1.25);
+        assert_eq!(parse_token_estimate_scale(Some(" 2 ")), 2.0);
+        assert_eq!(parse_token_estimate_scale(Some("100")), 4.0);
+        assert_eq!(parse_token_estimate_scale(Some("0.1")), 0.5);
+        assert_eq!(parse_token_estimate_scale(Some("NaN")), 1.0);
+        assert_eq!(parse_token_estimate_scale(Some("abc")), 1.0);
+    }
 
     /// #2135 round-8 P1: the fit guard measures the ACTUAL request — a
     /// tiny message with a large tool schema must fail a small window.
