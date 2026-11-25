@@ -449,7 +449,88 @@ fn heal_missing_folder(folder: &Path, command_roots: &[PathBuf]) -> Result<bool,
 }
 
 #[cfg(all(test, feature = "api"))]
-static HIDDEN_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod fixture_lock {
+    use std::{sync::Condvar, thread::ThreadId};
+
+    /// One process-wide lock for every test that touches the process-global
+    /// hidden-folder registration (`reserved_folders` and the chat layout).
+    /// Reentrant on the holding thread so a test that serializes its whole
+    /// body can still create nested fixture guards; distinct tests serialize
+    /// (T-0677: the separate std and tokio locks let a ui test wrap a command
+    /// while a server-root test had replaced its own root, so the wrap
+    /// validated a changed foreign root and refused).
+    ///
+    /// These tests run on `#[tokio::test]`'s current-thread runtime, so all
+    /// acquisitions of one test happen on one OS thread; a multi-thread test
+    /// flavor would move a task between threads and must not be used here.
+    pub struct FixtureLock {
+        state: std::sync::Mutex<(Option<ThreadId>, usize)>,
+        released: Condvar,
+    }
+
+    pub struct FixtureGuard(&'static FixtureLock);
+
+    impl FixtureLock {
+        pub const fn new() -> Self {
+            Self {
+                state: std::sync::Mutex::new((None, 0)),
+                released: Condvar::new(),
+            }
+        }
+
+        pub fn acquire(&'static self) -> FixtureGuard {
+            let current = std::thread::current().id();
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            loop {
+                match *state {
+                    (None, _) => {
+                        *state = (Some(current), 1);
+                        return FixtureGuard(self);
+                    }
+                    (Some(owner), depth) if owner == current => {
+                        *state = (Some(owner), depth + 1);
+                        return FixtureGuard(self);
+                    }
+                    _ => {
+                        state = self
+                            .released
+                            .wait(state)
+                            .unwrap_or_else(|error| error.into_inner());
+                    }
+                }
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let (Some(owner), depth) = *state else {
+                return;
+            };
+            if depth > 1 {
+                *state = (Some(owner), depth - 1);
+            } else {
+                *state = (None, 0);
+                self.released.notify_one();
+            }
+        }
+    }
+
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+static HIDDEN_FIXTURE_LOCK: fixture_lock::FixtureLock = fixture_lock::FixtureLock::new();
+
+/// Serialize a whole test against every other fixture that touches the
+/// process-global hidden-folder registration.
+#[cfg(all(test, feature = "api"))]
+pub(crate) fn hidden_fixture_lock() -> fixture_lock::FixtureGuard {
+    HIDDEN_FIXTURE_LOCK.acquire()
+}
 
 #[cfg(all(test, feature = "api"))]
 pub(crate) struct HiddenFixtureGuard {
@@ -457,16 +538,14 @@ pub(crate) struct HiddenFixtureGuard {
     // Layout, reserved folders and root identities are process-global. One
     // fixture at a time prevents another async test from populating or moving
     // this fixture's root between wrapping and execution.
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: fixture_lock::FixtureGuard,
 }
 
 #[cfg(all(test, feature = "api"))]
 pub(crate) fn hidden_fixture_guard(root: &Path) -> HiddenFixtureGuard {
     HiddenFixtureGuard {
         root: canonical_dir(root),
-        _lock: HIDDEN_FIXTURE_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
+        _lock: hidden_fixture_lock(),
     }
 }
 
@@ -1044,8 +1123,6 @@ pub(crate) fn confine_chat_tools(tools: &mut octos_agent::ToolRegistry) {
 mod server_root_tests {
     use super::*;
 
-    static LAYOUT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// A chat folder and record written the way a pre-upgrade server left
     /// them, so startup registration sees real legacy data (T-0670).
     fn plant_legacy_chat(data_dir: &Path, profile_id: &str, session_id: &SessionKey) -> PathBuf {
@@ -1068,7 +1145,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_route_a_fresh_profile_to_the_server_root_after_every_restart() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let profile_dir = temp.path().join("profiles/fresh/data");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1109,7 +1186,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_not_treat_an_empty_legacy_dir_as_pre_upgrade_data() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let profile_dir = temp.path().join("profiles/empty/data");
         // An older startup created this directory for every profile; it is not
@@ -1202,7 +1279,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_recreate_missing_server_root_before_command() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
         install_missing_root_healer();
@@ -1265,7 +1342,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_refuse_server_root_inside_command_roots() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let server_root = configure_server_root(temp.path(), &[], &[]).unwrap();
         install_missing_root_healer();
@@ -1283,7 +1360,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_refuse_renamed_server_root_inside_command_roots() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let profile_dir = temp.path().join("profiles/live/data");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1414,7 +1491,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_refuse_renamed_legacy_root_without_exposing_it() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let (temp, _hidden) = tempdir_with_hidden_guard();
         let profile_dir = temp.path().join("profiles/live/data");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1457,7 +1534,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_allow_main_profile_data_dir_equal_state_home() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let legacy = temp.path().join(CHATS_DIR).join("old-chat.txt");
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -1476,7 +1553,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_move_pre_release_server_chats_root_on_startup() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let old = temp.path().join(CHATS_DIR).join("profile").join("chat");
         let new = temp.path().join(CHAT_WORKSPACES_DIR).join("profile/chat");
@@ -1493,7 +1570,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_refuse_moving_server_chats_root_containing_profile() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let profile_dir = temp.path().join(CHATS_DIR).join("profiles/custom/data");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1515,7 +1592,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_refuse_moving_server_chats_root_over_existing_data() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let old = temp.path().join(CHATS_DIR).join("old.txt");
         let new = temp.path().join(CHAT_WORKSPACES_DIR).join("new.txt");
@@ -1534,7 +1611,7 @@ mod server_root_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn should_refuse_moving_server_chats_root_through_symlinks() {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let source_case = tempfile::tempdir().unwrap();
         let source_target = tempfile::tempdir().unwrap();
         std::fs::write(source_target.path().join("kept.txt"), "kept").unwrap();
@@ -1582,7 +1659,7 @@ mod server_root_tests {
 
     #[tokio::test]
     async fn should_unreserve_deleted_legacy_profile_root() {
-        let _layout = LAYOUT_TEST_LOCK.lock().await;
+        let _layout = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         let root_dir = temp.path().to_path_buf();
         std::mem::forget(temp);
@@ -1607,7 +1684,7 @@ mod server_root_tests {
     }
 
     async fn new_profile_command_stays_fenced(mode: octos_agent::SandboxMode) {
-        let _guard = LAYOUT_TEST_LOCK.lock().await;
+        let _guard = hidden_fixture_lock();
         let temp = tempfile::tempdir().unwrap();
         // The layout registry and hidden-folder list are process-global. Keep
         // this root alive for the test process so a concurrently running test
