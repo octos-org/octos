@@ -3,7 +3,7 @@
 
 Counts test lines with the exact algorithm of wake/test-lines.py — Rust
 test files (`tests/`, `*_tests.rs`, `*_test.rs`, `test_*.rs`, `tests.rs`)
-plus inline `#[cfg(test)]` modules, JS/TS `*.test.*`/`*.spec.*` and
+plus inline `#[cfg(test)]` / `#[cfg(all(..., test, ...))]` modules, JS/TS `*.test.*`/`*.spec.*` and
 `test_*.py`/`_test.py` — over `git archive` of the base and head refs.
 
 pull_request and merge_group enforce: net growth > 0 fails unless EITHER
@@ -47,6 +47,9 @@ RUST_TEST = re.compile(r"^\s*#\[(tokio::test|test|rstest|test_case|async_std::te
 JS_TEST = re.compile(r"^\s*(it|test)(\.(each|skip|only)\b[^(]*)?\(")
 SCRIPT_TEST = re.compile(r"(\.(test|spec)\.(ts|tsx|js|jsx|mjs)$)|(^test_.*\.py$)|(_test\.py$)")
 
+# `#[cfg(test)]`, or `#[cfg(all(..., test, ...))]`: compiled only for tests. `any(test, ...)` is not test-only.
+TEST_CFG = re.compile(r"^\s*#\[cfg\((test|all\((.*?,)?\s*test\s*[,)].*)\)\]")
+
 
 def rust_test_file(path: str) -> bool:
     parts, base = path.split("/"), os.path.basename(path)
@@ -56,7 +59,7 @@ def rust_test_file(path: str) -> bool:
 def inline_test_lines(lines: list[str]) -> int:
     n, i = 0, 0
     while i < len(lines):
-        if re.match(r"^\s*#\[cfg\(test\)\]", lines[i]):
+        if TEST_CFG.match(lines[i]):
             j = i + 1
             while j < len(lines) and (lines[j].strip().startswith("#[") or not lines[j].strip()):
                 j += 1
@@ -582,6 +585,41 @@ def self_test(repo_root: Path) -> None:
                        "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
                        expect=1)
         assert "delta = +151" in out and "not a maintainer" in out, out
+        # 11-25 wake/test-lines.py parity: #[cfg(all(..., test, ...))] is
+        # test-only; cfg(any(test, ...)) and cfg(feature = "test") are not.
+        def cfg_fixture(root: Path, attr: str) -> tuple[Path, str, str]:
+            repo = root / "fixture"
+            (repo / "crates/demo/src").mkdir(parents=True)
+            (repo / "crates/demo").joinpath("Cargo.toml").write_text("[package]\nname = \"demo\"\n")
+            lib = repo / "crates/demo/src/lib.rs"
+            lib.write_text("pub fn f() {}\n")
+            git(repo, "init", "-q")
+            git(repo, "config", "user.email", "ratchet@example.invalid")
+            git(repo, "config", "user.name", "ratchet self-test")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "base")
+            base_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                                      capture_output=True, text=True).stdout.strip()
+            lib.write_text(
+                f'pub fn f() {{}}\n\n#[cfg({attr})]\nmod tests {{\n'
+                f'#[test]\nfn added() {{}}\n}}\n'
+            )
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "change")
+            head_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                                      capture_output=True, text=True).stdout.strip()
+            git(repo, "remote", "add", "origin", str(repo))
+            return repo, base_sha, head_sha
+
+        for i, attr in enumerate(('all(test, feature = "api")', "all(unix, test)")):
+            repo, b, h = cfg_fixture(root / f"cfgpos-{i}", attr)
+            out = run_case(f"cfgcounted:{attr}", repo, b, h, expect=1)
+            assert "delta = +5" in out and "net test-line growth" in out, out
+        for i, attr in enumerate(('any(test, feature = "x")', 'feature = "test"',
+                     "all(feature = \"test-utils\", unix)")):
+            repo, b, h = cfg_fixture(root / f"cfgneg-{i}", attr)
+            out = run_case(f"cfgnotcounted:{attr}", repo, b, h, expect=0)
+            assert "delta = +0" in out, out
 
     workflow = (repo_root / ".github" / "workflows" / "ci.yml").read_text()
     check = workflow.split("  check:\n", 1)[1].split("  test-octos-agent:\n", 1)[0]
