@@ -1,46 +1,9 @@
-use image::{Rgb, RgbImage};
-use octos_pptx::{Context, fs::sha_file};
+use octos_pptx::Context;
 use serde_json::json;
 mod common;
 
-fn rectangle(im: &mut RgbImage, x: u32, y: u32, w: u32, h: u32) {
-    for px in x..=x + w {
-        for dy in 0..3 {
-            im.put_pixel(px, y + dy, Rgb([30, 60, 45]));
-            im.put_pixel(px, y + h - dy, Rgb([30, 60, 45]));
-        }
-    }
-    for py in y..=y + h {
-        for dx in 0..3 {
-            im.put_pixel(x + dx, py, Rgb([30, 60, 45]));
-            im.put_pixel(x + w - dx, py, Rgb([30, 60, 45]));
-        }
-    }
-}
-
 fn fixture() -> (tempfile::TempDir, Context) {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = Context::new(dir.path()).unwrap();
-    let mut art = RgbImage::from_pixel(640, 360, Rgb([245, 240, 225]));
-    rectangle(&mut art, 40, 40, 360, 160);
-    art.save(ctx.root.join("blank.png")).unwrap();
-    ctx.write_json("deck.json", &json!({"schema_version":1,
-      "canvas":{"width_px":640,"height_px":360,"width_in":12.8,"height_in":7.2},
-      "styles":{"body":{"font":"Inter","size_pt":18}},
-      "pages":[{"id":"sample","background":"blank.png","copy":{"caption":"Example label"},
-      "regions":{"card":{"quad":[[40,40],[400,40],[400,200],[40,200]],"scope":"label","basis":"A model says this is measured"}},
-      "texts":[{"id":"caption","text":"Example label","style":"body","box":[60,60,280,80],"region":"card"}]}]})).unwrap();
-    ctx.execute(json!({"action":"evidence_init","task_id":"visual-proof","owner_agent":"test","stagnant_attempts":3,"deliverables":["final.pptx"]})).unwrap();
-    (dir, ctx)
-}
-fn cycle(ctx: &Context, name: &str) {
-    ctx.execute(json!({"action":"cycle","spec":"deck.json","output":name,"width":640}))
-        .unwrap();
-    std::fs::copy(
-        ctx.root.join(name).join("editable.pptx"),
-        ctx.root.join("final.pptx"),
-    )
-    .unwrap();
+    common::labeled_fixture("visual-proof", "sample", "test")
 }
 #[test]
 fn independent_route_preserves_unknowns_and_rejects_self_approval_and_native_failures() {
@@ -60,7 +23,7 @@ fn independent_route_preserves_unknowns_and_rejects_self_approval_and_native_fai
         )
         .is_err()
     );
-    cycle(&ctx, "route");
+    common::cycle(&ctx, "route");
     let binding = ctx.binding("route/cycle.json").unwrap();
     let spec = serde_json::from_value(ctx.json("route/resolved-spec.json").unwrap()).unwrap();
     let policy = ctx.json(".octos/continuation.json").unwrap();
@@ -109,7 +72,7 @@ fn finding_evidence_and_display_number_must_identify_the_same_slide() {
     extra["id"] = json!("other");
     source["pages"].as_array_mut().unwrap().insert(0, extra);
     ctx.replace_json("deck.json", &source).unwrap();
-    cycle(&ctx, "two-pages");
+    common::cycle(&ctx, "two-pages");
     let c = ctx.json("two-pages/cycle.json").unwrap();
     let spec = serde_json::from_value(ctx.json("two-pages/resolved-spec.json").unwrap()).unwrap();
     let mut f = json!({"id":"local","page_number":2,"page":"sample","box":[45,45,350,130],
@@ -129,13 +92,12 @@ fn finding_evidence_and_display_number_must_identify_the_same_slide() {
 #[test]
 fn should_block_mismatched_reference_even_when_all_differences_are_accepted() {
     let (_dir, ctx) = fixture();
-    let mut other = RgbImage::from_pixel(640, 360, Rgb([245, 240, 225]));
-    rectangle(&mut other, 200, 240, 350, 75);
+    let other = common::bordered(200, 240, 350, 75);
     other.save(ctx.root.join("different.png")).unwrap();
-    let mut spec = ctx.json("deck.json").unwrap();
-    spec["pages"][0]["design"] = json!("different.png");
-    ctx.replace_json("deck.json", &spec).unwrap();
-    cycle(&ctx, "mismatched");
+    common::edit_spec(&ctx, |spec| {
+        spec["pages"][0]["design"] = json!("different.png");
+    });
+    common::cycle(&ctx, "mismatched");
 
     let manifest = ctx.json("mismatched/comparisons/manifest.json").unwrap();
     let page = &manifest["pages"][0];
@@ -146,46 +108,15 @@ fn should_block_mismatched_reference_even_when_all_differences_are_accepted() {
         report["reference_alignment"]["can_use_as_layout_reference"],
         false
     );
-    let ids: Vec<_> = report["regions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|region| region["id"].clone())
-        .collect();
-    let labels: Vec<_> = report["label_evidence"]["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|finding| {
-            json!({"id":finding["id"],"evidence_sha256":finding["evidence"]["sha256"],
-                "classification":"acceptable_difference","reason_code":"intentional_change",
-                "note":"Accept every generated label difference for this negative gate"})
-        })
-        .collect();
-    let regions = if ids.is_empty() {
-        json!([])
-    } else {
-        json!([{"ids":ids,"classification":"acceptable_difference",
-            "note":"Accept every generated region difference for this negative gate"}])
-    };
-    let review = json!({
-        "cycle_sha256":sha_file(&ctx.root.join("mismatched/cycle.json")).unwrap(),
-        "inspected":{"copy":["sample"],"artwork":["sample"],"readability":["sample"]},
-        "findings":[],"object_reviews":common::object_judgments(&ctx,"mismatched"),
-        "comparisons":[{"page":"sample","comparison_key":page["comparison_key"],
-            "inspected":true,"note":"Inspect the mismatched reference and all generated views",
-            "label_findings":labels,"regions":regions}]
-    });
-    ctx.write_json("review.json", &review).unwrap();
-    let recorded = ctx
-        .execute(json!({"action":"evidence_record","cycle":"mismatched/cycle.json","review":"review.json"}))
-        .unwrap();
+
+    let comparisons = common::accept(&ctx, "mismatched/comparisons/manifest.json");
+    let recorded = common::record(&ctx, "mismatched", comparisons, None, json!([]), false).unwrap();
     let coverage = &recorded["comparison_coverage"]["pages"][0];
-    assert_eq!(coverage["status"], "unknown");
-    assert_eq!(coverage["reference_alignment"]["status"], "incompatible");
-    assert_eq!(coverage["defects"], 0);
-    assert_eq!(
-        coverage["unresolved"], 1,
-        "all accepted dispositions must leave only alignment unresolved"
+    assert!(
+        coverage["status"] == "unknown"
+            && coverage["reference_alignment"]["status"] == "incompatible"
+            && coverage["defects"] == 0
+            && coverage["unresolved"] == 1,
+        "only alignment remains unresolved: {coverage}"
     );
 }

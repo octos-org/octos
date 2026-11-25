@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "canvas": {
+    "width_px": 640,
+    "height_px": 360,
+    "width_in": 12.8,
+    "height_in": 7.2
+  },
+  "styles": {
+    "body": { "font": "Inter", "size_pt": 18 }
+  },
+  "pages": [{
+    "background": "blank.png",
+    "copy": { "caption": "Example label" },
+    "regions": {
+      "card": {
+        "quad": [[40, 40], [400, 40], [400, 200], [40, 200]],
+        "scope": "label",
+        "basis": "Independent synthetic card"
+      }
+    },
+    "texts": [{
+      "id": "caption",
+      "text": "Example label",
+      "style": "body",
+      "box": [60, 60, 280, 80],
+      "region": "card"
+    }]
+  }]
+}

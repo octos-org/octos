@@ -70,18 +70,12 @@ fn delivery_retarget_and_source_preview_bindings_preserve_existing_history() {
     ctx.write_json("page.json", &spec["pages"][0]).unwrap();
     spec["pages"] = json!([{"path":"page.json"}]);
     ctx.replace_json("deck.json", &spec).unwrap();
-    ctx.execute(json!({"action":"cycle","spec":"deck.json","output":"a","width":640}))
-        .unwrap();
+    common::cycle(&ctx, "a");
     ctx.execute(json!({"action":"evidence_init","task_id":"same-task","stagnant_attempts":3,"deliverables":["a/editable.pptx"]})).unwrap();
     ctx.execute(json!({"action":"evidence_record","cycle":"a/cycle.json"}))
         .unwrap();
     let before = std::fs::read(root.join(".octos/pptx-evidence-history.json")).unwrap();
-    std::fs::copy(root.join("a/editable.pptx"), root.join("final.pptx")).unwrap();
-    std::fs::copy(
-        root.join("a/rendered/slide-001.png"),
-        root.join("preview.png"),
-    )
-    .unwrap();
+    common::copy(&ctx, "a/rendered/slide-001.png", "preview.png");
     ctx.execute(json!({"action":"evidence_retarget","deliverables":["final.pptx","preview.png","deck.json","page.json"],"reason":"Use stable final names"})).unwrap();
     assert_eq!(
         std::fs::read(root.join(".octos/pptx-evidence-history.json")).unwrap(),
@@ -119,11 +113,7 @@ fn delivery_retarget_and_source_preview_bindings_preserve_existing_history() {
             .is_err(),
         "wrong preview must fail immediately"
     );
-    std::fs::copy(
-        root.join("a/rendered/slide-001.png"),
-        root.join("preview.png"),
-    )
-    .unwrap();
+    common::copy(&ctx, "a/rendered/slide-001.png", "preview.png");
     ctx.replace_json("page.json", &json!({"changed":true}))
         .unwrap();
     assert!(
@@ -149,50 +139,20 @@ fn completed_batch_can_expand_without_replaying_mutated_old_sources() {
         .retain(|t| t["id"] == "a");
     initial["pages"][0]["copy"] = json!({"a":"Repeated label"});
     ctx.replace_json("deck.json", &initial).unwrap();
-    ctx.execute(json!({"action":"cycle","spec":"deck.json","output":"first","width":640}))
-        .unwrap();
+    common::cycle(&ctx, "first");
     ctx.execute(json!({"action":"evidence_init","task_id":"same-task","stagnant_attempts":3,"deliverables":["final.pptx"]})).unwrap();
-    std::fs::copy(
-        dir.path().join("first/editable.pptx"),
-        dir.path().join("final.pptx"),
-    )
-    .unwrap();
-    let comparisons = ctx.json("first/comparisons/manifest.json").unwrap();
-    let page = &comparisons["pages"][0];
-    let report = ctx.json(ctx.verify(&page["report"]).unwrap()).unwrap();
-    let ids: Vec<_> = report["regions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["id"].clone())
-        .collect();
-    let labels:Vec<_>=report["label_evidence"]["findings"].as_array().unwrap().iter().map(|f|
-        json!({"id":f["id"],"evidence_sha256":f["evidence"]["sha256"],"classification":"acceptable_difference",
-            "reason_code":"intentional_change","note":"Fixture reference intentionally omits the added text"})).collect();
-    ctx.write_json("review.json", &json!({"cycle_sha256":sha_file(&dir.path().join("first/cycle.json")).unwrap(),"inspected":{"copy":["overview"],"artwork":["overview"],"readability":["overview"]},"comparisons":[{"page":"overview","comparison_key":page["comparison_key"],"inspected":true,"note":"Synthetic fixture reviewed","label_findings":labels,"regions":[{"ids":ids,"classification":"acceptable_difference","note":"Fixture reference omits the intentionally added native labels"}]}],"findings":[{"id":"label","check":"readability","state":"resolved","note":"Checked original page","evidence":"first/rendered/slide-001.png"}]})).unwrap();
-    // This test covers retained review history, not a repair: the unchanged
-    // synthetic label is an intentional difference, so do not claim it moved.
-    let mut review = ctx.json("review.json").unwrap();
-    review["object_reviews"] = common::object_judgments(&ctx, "first");
-    review["findings"][0]["state"] = json!("dismissed");
-    ctx.replace_json("review.json", &review).unwrap();
-    ctx.execute(
-        json!({"action":"evidence_record","cycle":"first/cycle.json","review":"review.json"}),
-    )
-    .unwrap();
+    let comparisons = common::accept(&ctx, "first/comparisons/manifest.json");
+    // This covers retained history, not a repair: the label is intentionally dismissed.
+    let findings = json!([{"id":"label","check":"readability","state":"dismissed",
+        "note":"Checked original page","evidence":"first/rendered/slide-001.png"}]);
+    common::record(&ctx, "first", comparisons, None, findings, false).unwrap();
     let before = ctx.json(".octos/iteration-evidence.json").unwrap();
     let mut spec = ctx.json("deck.json").unwrap();
     let mut added = spec["pages"][0].clone();
     added["id"] = json!("details");
     spec["pages"].as_array_mut().unwrap().push(added);
     ctx.replace_json("deck.json", &spec).unwrap();
-    ctx.execute(json!({"action":"cycle","spec":"deck.json","output":"second","width":640}))
-        .unwrap();
-    std::fs::copy(
-        dir.path().join("second/editable.pptx"),
-        dir.path().join("final.pptx"),
-    )
-    .unwrap();
+    common::cycle(&ctx, "second");
     let request = json!({"action":"evidence_record","cycle":"second/cycle.json","extend_scope_reason":"Continue the authorized remaining pages"});
     assert!(
         ctx.execute(json!({"action":"evidence_record","cycle":"second/cycle.json"}))
@@ -333,20 +293,13 @@ fn evidence_never_silently_passes_missing_reviews_or_drops_unresolved_findings()
     let e = ctx.execute(rec.clone()).unwrap();
     assert_eq!(e["checks"][1]["status"], "unknown");
     assert_eq!(ctx.execute(rec.clone()).unwrap()["attempt"], e["attempt"]);
-    let review = json!({"cycle_sha256":sha_file(&root.join("a/cycle.json")).unwrap(),"inspected":{"copy":["overview"],"artwork":["overview"],"readability":["overview"]},"findings":[{"id":"defect","page":"overview","box":[0,0,640,360],"check":"readability","state":"open","note":"Synthetic unresolved defect","evidence":"a/rendered/slide-001.png"}]});
-    ctx.write_json("review.json", &review).unwrap();
-    let rec = json!({"action":"evidence_record","cycle":"a/cycle.json","review":"review.json"});
-    assert_eq!(ctx.execute(rec).unwrap()["checks"][3]["status"], "fail");
-    let mut review2 = review.clone();
-    review2["findings"] = json!([]);
-    ctx.write_json("review2.json", &review2).unwrap();
-    assert_eq!(
-        ctx.execute(
-            json!({"action":"evidence_record","cycle":"a/cycle.json","review":"review2.json"})
-        )
-        .unwrap()["checks"][3]["status"],
-        "fail"
-    );
+    let findings = json!([{"id":"defect","page":"overview","box":[0,0,640,360],
+        "check":"readability","state":"open","note":"Synthetic unresolved defect",
+        "evidence":"a/rendered/slide-001.png"}]);
+    let failed = common::record(&ctx, "a", json!([]), None, findings, false).unwrap();
+    assert_eq!(failed["checks"][3]["status"], "fail");
+    let dropped = common::record(&ctx, "a", json!([]), None, json!([]), false).unwrap();
+    assert_eq!(dropped["checks"][3]["status"], "fail");
     assert_eq!(
         ctx.execute(json!({"action":"evidence_status","owner_agent":"peer-1"}))
             .unwrap()["runtime_consumed_current_evidence"],
