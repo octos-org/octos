@@ -3112,58 +3112,82 @@ fn catalog_bootstrap_requires_explicit_capability_and_preserves_ingress_scope() 
     );
 }
 
-/// #2091 — the environment-gated M9 fixture must use the same goal-row
-/// restore observer as production. Seed a real persisted terminal task and an
-/// owed running goal row, then drive the actual fixture: restore must reconcile
-/// that row and the fixture's own registration/settle chain must also land.
-#[tokio::test]
-async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
+/// #2089/#2091 — owed crash window shared by M9 and WS tests: JSONL Completed, goal row still running.
+async fn seed_owed_terminal_goal_task(
+    sessions_root: &Path,
+    session: &SessionKey,
+    ledger: &octos_fleet::GoalLedger,
+    goal_id: &str,
+    call_id: &str,
+) -> String {
+    let persisted = octos_agent::TaskSupervisor::new();
+    let task_path = ui_protocol_task_output::task_state_path(sessions_root, session);
+    persisted.enable_persistence(&task_path).unwrap();
+    let task_id = persisted.register("shell", call_id, Some(&session.0));
+    persisted.mark_running(&task_id);
+    persisted.mark_completed(&task_id, vec![]);
+    drop(persisted);
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    ledger
+        .create_task(&octos_fleet::Task {
+            task_id: task_id.clone(),
+            goal_id: goal_id.into(),
+            title: "owed restore".into(),
+            detail: String::new(),
+            status: "running".into(),
+            assigned_peer: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+        .unwrap();
+    task_id
+}
+
+struct GoalRowFixture {
+    dir: tempfile::TempDir,
+    hidden: crate::runtime::chat_workspace::HiddenFixtureGuard,
+    state: Arc<AppState>,
+    /// Profile data dir; here also the session runtime's root.
+    data_dir: PathBuf,
+    goal_id: String,
+    ledger: octos_fleet::GoalLedger,
+}
+
+/// Shared by the M9 and WS restore tests: guarded tempdir, profile state,
+/// bound goal, and one held ledger connection seeded with its goal row.
+async fn goal_row_fixture(
+    session: &SessionKey,
+    profile_id: &str,
+    objective: &str,
+) -> GoalRowFixture {
     use crate::autonomy::agent_orchestrator::{
         AgentOrchestrator as _, GoalSetRequest, InProcessAgentOrchestrator,
         default_agent_orchestrator,
     };
-
-    let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
-    let profile = "m9-tenant";
-    let (state, _runtime) = state_with_profile_llm(dir.path(), profile, Arc::new(NoopLlm)).await;
-    // Bare session: only the admitted connection/routed profile identifies
-    // the tenant ledger. This catches a fixture-only `_main` fallback.
-    let session = SessionKey::new("api", "m9-goal-row-restore");
+    let (dir, hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
+    let (state, runtime) = state_with_profile_llm(dir.path(), profile_id, Arc::new(NoopLlm)).await;
     default_agent_orchestrator()
         .set_goal(GoalSetRequest {
             session_id: session.clone(),
-            profile_id: profile.to_owned(),
-            objective: "cover M9 restore".to_owned(),
-            status: Some("active".to_owned()),
+            profile_id: profile_id.into(),
+            objective: objective.into(),
+            status: Some("active".into()),
             token_budget: Some(1_000_000),
             transition_actor: None,
         })
         .unwrap();
     let goal_id = default_agent_orchestrator()
-        .active_goal_id(&session, profile)
+        .active_goal_id(session, profile_id)
         .unwrap();
-    let (_, profile_data_dir) = resolve_profile_data_dir(&state, Some(profile)).unwrap();
-    let session_data_dir = state.sessions.as_ref().unwrap().lock().await.data_dir();
-    let task_path = ui_protocol_task_output::task_state_path(&session_data_dir, &session);
-
-    // Persist a terminal task without any goal observer, simulating the lost
-    // delivery the restore reconcile exists to repair.
-    let persisted = octos_agent::TaskSupervisor::new();
-    persisted.enable_persistence(&task_path).unwrap();
-    let restored_id = persisted.register("shell", "m9-existing", Some(&session.0));
-    persisted.mark_running(&restored_id);
-    persisted.mark_completed(&restored_id, vec![]);
-    drop(persisted);
-
-    let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(&profile_data_dir, &goal_id);
+    let ledger_path = InProcessAgentOrchestrator::goal_ledger_path(&runtime.data_dir, &goal_id);
     std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
-    let goal_ledger = octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path).unwrap();
+    let ledger = octos_fleet::GoalLedger::open_with_busy_retry(&ledger_path).unwrap();
     let now = Utc::now().timestamp_millis().max(0) as u64;
-    goal_ledger
+    ledger
         .create_goal(&octos_fleet::Goal {
             goal_id: goal_id.clone(),
-            objective: "cover M9 restore".to_owned(),
-            status: "active".to_owned(),
+            objective: objective.into(),
+            status: "active".into(),
             tokens_used: 0,
             token_budget: 1_000_000,
             time_used_seconds: 0,
@@ -3173,26 +3197,47 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
             updated_at_ms: now,
         })
         .unwrap();
-    goal_ledger
-        .create_task(&octos_fleet::Task {
-            task_id: restored_id.clone(),
-            goal_id: goal_id.clone(),
-            title: "owed restore".to_owned(),
-            detail: String::new(),
-            status: "running".to_owned(),
-            assigned_peer: None,
-            created_at_ms: now,
-            updated_at_ms: now,
-        })
-        .unwrap();
+    GoalRowFixture {
+        dir,
+        hidden,
+        state,
+        data_dir: runtime.data_dir.clone(),
+        goal_id,
+        ledger,
+    }
+}
+
+/// #2091 — the M9 fixture uses production's goal-row observer: driving it must settle the owed row AND its own row.
+#[tokio::test]
+async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
+    let profile = "m9-tenant";
+    // Bare session: the routed profile alone identifies the tenant ledger (no `_main` fallback).
+    let session = SessionKey::new("api", "m9-goal-row-restore");
+    let GoalRowFixture {
+        dir: _dir,
+        hidden: _hidden,
+        state,
+        goal_id,
+        ledger,
+        ..
+    } = goal_row_fixture(&session, profile, "cover M9 restore").await;
+    let session_data_dir = state.sessions.as_ref().unwrap().lock().await.data_dir();
+    let restored_id = seed_owed_terminal_goal_task(
+        &session_data_dir,
+        &session,
+        &ledger,
+        &goal_id,
+        "m9-existing",
+    )
+    .await;
 
     let (ws, _rx) = ws_connection_for_test(32);
-    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let ui_ledger = Arc::new(UiProtocolLedger::new(32));
     let (_interrupt_tx, interrupt_rx) = mpsc::channel(1);
     run_m9_fixture_turn(
         ws,
         state.clone(),
-        ledger,
+        ui_ledger,
         Arc::new(UiProtocolContractStores::default()),
         turn_start_params(&session, &TurnId::new(), "m9 task output fixture"),
         Some(profile),
@@ -3202,20 +3247,20 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
     )
     .await;
 
+    await_goal_task_row(&ledger, &restored_id, "complete").await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let restored = goal_ledger.get_task(&restored_id).unwrap().unwrap();
-        let fixture_settled = goal_ledger
+        let settled = ledger
             .tasks_for_goal(&goal_id)
             .unwrap()
             .iter()
             .any(|task| task.task_id != restored_id && task.status == "failed");
-        if restored.status == "complete" && fixture_settled {
+        if settled {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "goal rows did not settle"
+            "fixture row did not settle"
         );
         tokio::task::yield_now().await;
     }
@@ -3341,4 +3386,109 @@ fn should_seed_a_keepers_folder_only_when_it_agrees_with_the_scope_of_its_sessio
     reseed_fleet_keeper_candidates(&workspaces, &orchestrator, scoped);
     assert_eq!(folder(&live), Some(PathBuf::from("/live")));
     assert_eq!(orchestrator.goal_scope(&live), None);
+}
+
+// ---------------------------------------------------------------------------
+// #2089 item 1 — wiring-presence for the issue's two WS sites (per-turn
+// installer; cached adapter shared by its call sites): real request/turn,
+// real ledger effect; deleting the installer fails the test.
+// ---------------------------------------------------------------------------
+
+async fn await_goal_task_row(
+    ledger: &octos_fleet::GoalLedger,
+    task_id: &str,
+    expected_status: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(row) = ledger.get_task(task_id).expect("read goal task row")
+            && row.status == expected_status
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task {task_id} not {expected_status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Site: `run_standalone_turn`'s per-turn installer (NoopLlm ends right after restore).
+#[tokio::test]
+async fn should_reconcile_owed_goal_rows_when_standalone_turn_runs() {
+    let profile = "goal-ws-standalone";
+    let session = SessionKey::with_profile(profile, "api", "standalone");
+    let GoalRowFixture {
+        dir: _dir,
+        hidden: _hidden,
+        state,
+        data_dir,
+        goal_id,
+        ledger,
+    } = goal_row_fixture(&session, profile, "cover WS goal-row wiring").await;
+    let restored_id = seed_owed_terminal_goal_task(
+        &data_dir,
+        &session,
+        &ledger,
+        &goal_id,
+        "standalone-restored",
+    )
+    .await;
+    let (ws, _rx) = ws_connection_for_test(64);
+    assert!(
+        handle_turn_start(
+            &ws,
+            &state,
+            &Arc::new(UiProtocolLedger::new(64)),
+            &Arc::new(UiProtocolContractStores::default()),
+            &Arc::default(),
+            &Arc::default(),
+            Some(profile),
+            None,
+            ConnectionUiFeatures::default(),
+            "goal-row-start".to_owned(),
+            turn_start_params(&session, &TurnId::new(), "ping"),
+        )
+        .await,
+        "turn start refused"
+    );
+    await_goal_task_row(&ledger, &restored_id, "complete").await;
+}
+
+/// Site: the cached adapter via `skill/action/job/list` (shared by all three cached call sites).
+#[tokio::test]
+async fn should_reconcile_owed_goal_rows_when_cached_supervisor_restores() {
+    let profile = "goal-ws-cached-restore";
+    let session = SessionKey::with_profile(profile, "api", "cached-restore");
+    let GoalRowFixture {
+        dir: _dir,
+        hidden: _hidden,
+        state,
+        data_dir,
+        goal_id,
+        ledger,
+    } = goal_row_fixture(&session, profile, "cover WS goal-row wiring").await;
+    let restored_id =
+        seed_owed_terminal_goal_task(&data_dir, &session, &ledger, &goal_id, "cached-restored")
+            .await;
+    // Pin the wired runtime branch: the fallback also wires observers and
+    // would mask the adapter's deletion.
+    session_runtime_with_effective_permissions(&state, &session, Some(profile))
+        .await
+        .expect("runtime branch precondition");
+    let (ws, mut rx) = ws_connection_for_test(64);
+    RawRpc::new(&state, &ws)
+        .call(
+            APPUI_METHOD_SKILL_ACTION_JOB_LIST,
+            ConnectionUiFeatures::default(),
+            "goal-row-job-list",
+            json!({"profile_id": profile, "session_id": session}),
+        )
+        .await;
+    assert!(
+        ws_reply(&mut rx, "goal-row-job-list")["error"].is_null(),
+        "job/list refused"
+    );
+    await_goal_task_row(&ledger, &restored_id, "complete").await;
 }
