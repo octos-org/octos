@@ -161,23 +161,29 @@ async fn should_keep_new_chats_in_the_server_root_across_real_restarts() {
     std::fs::create_dir(&data).unwrap();
     std::fs::create_dir(&workspace).unwrap();
     let profile_data = install_profile(&data);
-    let legacy_root = profile_data.join("chats");
-    let server_root = data.join("chat-workspaces");
     let port = serve_process::find_free_port();
+    // Compare canonical paths: on macOS the server reports /private/var/...
+    // while the fixture TempDir is spelled /var/... (alan0x review). The
+    // server root exists after the first boot; the profile data dir exists
+    // from install, so canonicalize and join the tail instead.
+    let legacy_root = std::fs::canonicalize(&profile_data).unwrap().join("chats");
 
     let mut roots = Vec::new();
     for (boot, chat_id) in ["chat-a", "chat-b", "chat-c"].iter().enumerate() {
         let server = start(&data, &workspace, port);
+        let server_root =
+            std::fs::canonicalize(data.join("chat-workspaces")).expect("server root exists");
         let mut ws = connect(port).await;
         let root = create_chat(&mut ws, chat_id).await;
         assert!(
-            root.starts_with(server_root.to_string_lossy().as_ref()),
-            "boot {}: chat {} landed outside the server root: {root}",
+            Path::new(&root).starts_with(&server_root),
+            "boot {}: chat {} landed outside the server root {}: {root}",
             boot + 1,
-            chat_id
+            chat_id,
+            server_root.display()
         );
         assert!(
-            !root.starts_with(legacy_root.to_string_lossy().as_ref()),
+            !Path::new(&root).starts_with(&legacy_root),
             "boot {}: chat {} landed in the legacy root: {root}",
             boot + 1,
             chat_id
