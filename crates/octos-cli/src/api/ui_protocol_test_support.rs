@@ -96,7 +96,12 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
 ) -> Arc<crate::runtime::ProfileRuntime> {
     std::fs::create_dir_all(data_dir).expect("profile data dir");
     // These fixtures model profiles that existed at server startup, so they
-    // keep the pre-upgrade per-profile chat root.
+    // keep the pre-upgrade per-profile chat root. Registration now requires
+    // real pre-upgrade data (T-0670), so plant the entry an upgraded profile
+    // would actually have left behind.
+    let legacy_root = data_dir.join("chats");
+    std::fs::create_dir_all(&legacy_root).expect("legacy chats root");
+    std::fs::write(legacy_root.join(".pre-upgrade"), b"").expect("pre-upgrade evidence");
     crate::runtime::chat_workspace::register_existing_profile(data_dir)
         .expect("existing-profile chat root");
     let memory = Arc::new(

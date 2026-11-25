@@ -278,6 +278,13 @@ The file tools resolve every path through the scope:
   migrated. A rollback to an older binary cannot see chats stored under the
   server-level root, but those folders and records remain on disk and become
   visible again after upgrading.
+- "Existing" is decided by real pre-upgrade data, not by the profile record's
+  existence (T-0670): at startup a profile's legacy root counts only when it
+  holds content (an empty directory an older startup created, or no
+  directory, is not evidence). A profile without legacy data creates every
+  chat under the server-level root, including after a restart. A symlink or
+  non-directory entry at the legacy root counts as evidence so the root stays
+  reserved and reads of it fail closed.
 - Pre-release #3326 development instances that used `<server data root>/chats`
   as the server-level root are moved to `<server data root>/chat-workspaces` on
   startup. If that old path is also a startup profile's legacy chats root, it
