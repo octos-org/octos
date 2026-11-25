@@ -612,7 +612,12 @@ impl OpenAIProvider {
                 == ReasoningStyle::EffortAndThinkingToggle
                 && !tools.is_empty();
             let reasoning = if role == "assistant" && deepseek_tool_continuation {
-                m.reasoning_content.as_deref()
+                // DeepSeek rejects a tool-enabled request whose assistant row
+                // lacks the field (HTTP 400 "reasoning_content ... must be
+                // passed back"), and the model legitimately returns an EMPTY
+                // reasoning for some steps, which arrives here as `None`.
+                // Replay it as the empty string it was — not invented text.
+                Some(m.reasoning_content.as_deref().unwrap_or(""))
             } else if role == "assistant" && needs_reasoning_stub {
                 match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
@@ -2001,6 +2006,18 @@ mod tests {
                 value["messages"][0]["reasoning_content"], "retained provider reasoning\n精确保留",
                 "{model}"
             );
+            // A step whose reasoning came back empty is replayed as "" —
+            // omitting the field makes DeepSeek reject the request with 400.
+            let mut silent = msg("Tool step with empty reasoning");
+            silent.role = MessageRole::Assistant;
+            let value = serde_json::to_value(provider.build_request(
+                &[silent, msg("Continue")],
+                &tools,
+                &ChatConfig::default(),
+                false,
+            ))
+            .unwrap();
+            assert_eq!(value["messages"][0]["reasoning_content"], "", "{model}");
         }
     }
 
