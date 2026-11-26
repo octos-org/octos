@@ -50,6 +50,21 @@ fn ensure_profile_runtime_directories(data_dir: &Path) -> Result<()> {
     })
 }
 
+/// The shared, non-chat directories a shell may read from the octos home:
+/// the bundled and platform skill trees, when they exist. The whole home is
+/// deliberately not granted — it holds the chats roots (T-0681).
+fn octos_home_shared_read_grants(octos_home: &Path) -> Vec<String> {
+    [
+        octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR,
+        octos_agent::bootstrap::PLATFORM_SKILLS_DIR,
+    ]
+    .into_iter()
+    .map(|dir| octos_home.join(dir))
+    .filter(|dir| dir.is_dir())
+    .map(|dir| dir.to_string_lossy().into_owned())
+    .collect()
+}
+
 /// Immutable inputs needed to rebuild only a profile's plugin-derived layer.
 /// Long-lived stores, providers, schedulers, and profile services are reused
 /// from the existing [`ProfileRuntime`].
@@ -1323,17 +1338,20 @@ impl ProfileRuntime {
 
         // Step 9: build the base ToolRegistry.
         //
-        // Sandbox config is profile-derived. We augment
-        // `read_allow_paths` with the octos home so the shell sandbox
-        // can read shared skills/configs (mirrors gateway's existing
-        // setup).
+        // Sandbox config is profile-derived. The shell sandbox reads the
+        // shared skill directories, NOT the whole octos home: the home also
+        // holds the chats roots, and a read grant that covers them makes the
+        // non-hiding backends (Landlock, AppContainer) refuse every shell
+        // command (T-0681). Transcripts, profile data and secrets under the
+        // home stay unreadable from the shell; operators may still grant
+        // explicit `sandbox.read_allow_paths`.
         let mut sandbox_config = config.sandbox.clone();
         if super::host_scope::active() {
             super::host_scope::constrain_sandbox(&mut sandbox_config);
         } else if sandbox_config.read_allow_paths.is_empty() {
             sandbox_config
                 .read_allow_paths
-                .push(effective_octos_home.to_string_lossy().into_owned());
+                .extend(octos_home_shared_read_grants(&effective_octos_home));
         }
         let default_sandbox = sandbox_config.clone();
         let sandbox = create_sandbox(&sandbox_config);
@@ -2161,6 +2179,25 @@ async fn backfill_vectors_with_bounded_retry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn should_grant_only_shared_skill_dirs_from_the_octos_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        assert!(super::octos_home_shared_read_grants(home).is_empty());
+        let dirs = "bundled-app-skills chat-workspaces profiles sessions platform-skills";
+        for dir in dirs.split(' ') {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let grants = super::octos_home_shared_read_grants(home);
+        assert!(grants.iter().any(|g| g.ends_with("bundled-app-skills")));
+        assert!(grants.iter().any(|g| g.ends_with("platform-skills")));
+        assert_eq!(
+            grants.len(),
+            2,
+            "chats roots and profile data stay ungranted"
+        );
+    }
+
     use super::*;
     use crate::profiles::{
         GatewaySettings, LlmModelSelectionConfig, LlmProfileConfig, LlmRouteConfig, ProfileConfig,

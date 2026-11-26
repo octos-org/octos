@@ -440,6 +440,7 @@ mod execution_gate_tests {
         let sandbox = crate::sandbox::DockerSandbox {
             config: crate::sandbox::DockerConfig::default(),
             allow_network: false,
+            hidden_folders: None,
         };
         let error = match require_confined_lifecycle_sandbox(Box::new(sandbox)) {
             Ok(_) => panic!("Docker must not satisfy the lifecycle execution gate"),
