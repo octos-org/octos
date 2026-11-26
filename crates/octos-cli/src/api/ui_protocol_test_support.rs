@@ -1302,9 +1302,11 @@ pub(crate) async fn g1_raise_approval(
     panic!("the approval never became pending");
 }
 
-/// Poll `f` until it yields, or panic (test waits; ~1s cap).
+/// Poll `f` until it yields, or panic. 30s: heavily loaded CI runners run
+/// these suites ~5x slower than a dev box, and the IM approval tests chain
+/// several async hops (raise → ledger broadcast → watch task → channel).
 pub(crate) async fn until_some<T>(mut f: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..1000 {
+    for _ in 0..3000 {
         if let Some(done) = f() {
             return done;
         }
