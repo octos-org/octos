@@ -1302,6 +1302,74 @@ pub(crate) async fn g1_raise_approval(
     panic!("the approval never became pending");
 }
 
+/// Poll `f` until it yields, or panic (test waits; ~1s cap).
+pub(crate) async fn until_some<T>(mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..1000 {
+        if let Some(done) = f() {
+            return done;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("it never happened");
+}
+
+/// An IM approval-button press for `nonce`; `decision` is "a" or "d".
+pub(crate) fn im_press(
+    chat: i64,
+    sender: super::super::im_bridge::ImSender,
+    nonce: &str,
+    decision: &str,
+) -> super::super::im_bridge::ImCallback {
+    super::super::im_bridge::ImCallback {
+        chat,
+        sender,
+        callback_id: format!("cb-{nonce}"),
+        message_id: Some(1000),
+        data: format!("imp:{nonce}:{decision}"),
+    }
+}
+
+/// Raise one pending approval on `session` as an external turn of
+/// `owner_connection` would: registered, marked external, broadcast on the
+/// ledger, with the caller's risk on the event. Resolves with the decision.
+pub(crate) fn raise_external_approval(
+    contracts: &Arc<UiProtocolContractStores>,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    owner_connection: u64,
+    tool: &str,
+    risk: &str,
+) -> tokio::task::JoinHandle<ToolApprovalDecision> {
+    let mut event = ApprovalRequestedEvent::generic(
+        session_id.clone(),
+        ApprovalId::new(),
+        turn_id.clone(),
+        tool,
+        "Run command",
+        "ls",
+    );
+    event.risk = Some(risk.to_owned());
+    let rx = contracts.approvals.request_runtime_entry(
+        event.clone(),
+        Some(owner_connection),
+        false,
+        None,
+    );
+    contracts.approvals.mark_external(&event.approval_id);
+    crate::api::host_managed::register_external_prompt(
+        &event.approval_id.0.to_string(),
+        owner_connection,
+    );
+    ledger.append_notification(UiNotification::ApprovalRequested(event));
+    tokio::spawn(async move {
+        match rx.await {
+            Ok(ApprovalDecision::Approve) => ToolApprovalDecision::Approve,
+            _ => ToolApprovalDecision::Deny,
+        }
+    })
+}
+
 /// The approval ids `session/open` lists as pending for `connection`.
 pub(crate) async fn g1_opened_pending(
     state: &Arc<AppState>,

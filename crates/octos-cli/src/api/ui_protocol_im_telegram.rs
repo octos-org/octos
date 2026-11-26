@@ -37,9 +37,9 @@ use std::panic::AssertUnwindSafe;
 use futures::FutureExt;
 use octos_bus::coalesce::{ChunkConfig, split_message};
 use octos_bus::markdown_html::markdown_to_telegram_html;
-use octos_bus::telegram_api::{ApiError, Message, TelegramBotApi};
+use octos_bus::telegram_api::{ApiError, CallbackQuery, Message, TelegramBotApi};
 
-use super::im_bridge::{ImChannel, ImChannelId, ImMessage, ImSender, ServeImBridge};
+use super::im_bridge::{ImCallback, ImChannel, ImChannelId, ImMessage, ImSender, ServeImBridge};
 use super::*;
 
 /// How long one `getUpdates` waits for a message; under the channels' HTTP
@@ -119,6 +119,46 @@ impl ImChannel for TelegramBot {
         self.id.clone()
     }
 
+    fn buttons(&self) -> bool {
+        true
+    }
+
+    /// Approval buttons are short and plain (no HTML): one row, then the
+    /// sent message's id so an answered/expired approval's buttons can be
+    /// edited away.
+    async fn send_buttons(
+        &self,
+        chat: i64,
+        text: &str,
+        reply_to: Option<i64>,
+        buttons: &[(String, String)],
+    ) -> eyre::Result<Option<i64>> {
+        let id = self
+            .api
+            .send_message_keyboard(chat, text, false, reply_to, &[buttons.to_vec()])
+            .await?;
+        Ok(Some(id))
+    }
+
+    async fn edit(&self, chat: i64, message_id: i64, text: &str) -> eyre::Result<()> {
+        self.api
+            .edit_message_text(chat, message_id, text, false)
+            .await?;
+        Ok(())
+    }
+
+    async fn answer_callback(
+        &self,
+        callback_id: &str,
+        text: &str,
+        alert: bool,
+    ) -> eyre::Result<()> {
+        self.api
+            .answer_callback_query(callback_id, Some(text), alert)
+            .await?;
+        Ok(())
+    }
+
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()> {
         self.deliver(chat, text, reply_to, true).await
     }
@@ -153,21 +193,52 @@ pub(crate) fn im_message(message: &Message) -> ImMessage {
     }
 }
 
+/// The bridge's reading of a button press, as the platform tells it. A
+/// press without its callback id cannot be ACKed and without data cannot
+/// name an approval: it is not the bridge's to answer.
+pub(crate) fn im_callback(query: &CallbackQuery) -> Option<ImCallback> {
+    let sender = match &query.from {
+        Some(user) if user.is_bot => ImSender::Bot(user.id),
+        Some(user) => ImSender::Person(user.id),
+        None => return None,
+    };
+    Some(ImCallback {
+        chat: query.message.as_ref().map(|message| message.chat.id)?,
+        sender,
+        callback_id: query.id.clone(),
+        message_id: query.message.as_ref().map(|message| message.message_id),
+        data: query.data.clone()?,
+    })
+}
+
 /// Give `bot`'s messages to `bridge` until aborted.
 pub(crate) async fn poll(bridge: Arc<ServeImBridge>, bot: Arc<TelegramBot>) {
-    poll_with(&bot, |message| {
-        let bridge = bridge.clone();
-        // A turn this starts runs on and replies by itself.
-        async move { drop(bridge.handle(message).await) }
-    })
+    poll_with(
+        &bot,
+        {
+            let bridge = bridge.clone();
+            move |message| {
+                let bridge = bridge.clone();
+                // A turn this starts runs on and replies by itself.
+                async move { drop(bridge.handle(message).await) }
+            }
+        },
+        move |callback| {
+            let bridge = bridge.clone();
+            async move { bridge.handle_callback(callback).await }
+        },
+    )
     .await
 }
 
-/// Give `bot`'s messages to `handle` until aborted.
-pub(crate) async fn poll_with<F, Fut>(bot: &TelegramBot, handle: F)
+/// Give `bot`'s messages to `handle` and its button presses to
+/// `handle_callback` until aborted.
+pub(crate) async fn poll_with<F, Fut, G, Gut>(bot: &TelegramBot, handle: F, handle_callback: G)
 where
     F: Fn(ImMessage) -> Fut,
     Fut: Future<Output = ()>,
+    G: Fn(ImCallback) -> Gut,
+    Gut: Future<Output = ()>,
 {
     // After the last batch, the offset that confirms it; else 0.
     let mut offset = 0;
@@ -192,6 +263,20 @@ where
         };
         backoff = BACKOFF;
         for update in updates {
+            if let Some(query) = &update.callback_query {
+                let Some(callback) = im_callback(query) else {
+                    offset = offset.max(update.update_id + 1);
+                    continue;
+                };
+                let handled = AssertUnwindSafe(async { handle_callback(callback).await });
+                if handled.catch_unwind().await.is_err() {
+                    tracing::error!(
+                        bot = bot.id.bot,
+                        update_id = update.update_id,
+                        "serve.im: handling a Telegram callback panicked; skipped it"
+                    );
+                }
+            }
             if let Some(message) = &update.message {
                 let handled = AssertUnwindSafe(async { handle(im_message(message)).await });
                 if handled.catch_unwind().await.is_err() {

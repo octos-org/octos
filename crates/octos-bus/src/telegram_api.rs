@@ -66,6 +66,21 @@ pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+/// A button press on a message the bot sent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackQuery {
+    /// The platform's id of the press, which `answerCallbackQuery` wants.
+    pub id: String,
+    #[serde(default)]
+    pub message: Option<Message>,
+    #[serde(default)]
+    pub from: Option<User>,
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,8 +130,7 @@ impl TelegramBotApi {
     /// `wait` for one. Asking from an offset confirms every update before
     /// it, so pass an update's id plus one only once done with it.
     pub async fn get_updates(&self, offset: i64, wait: Duration) -> Result<Vec<Update>, ApiError> {
-        let body =
-            json!({ "offset": offset, "timeout": wait.as_secs(), "allowed_updates": ["message"] });
+        let body = json!({ "offset": offset, "timeout": wait.as_secs(), "allowed_updates": ["message", "callback_query"] });
         let Value::Array(updates) = self.call("getUpdates", body).await? else {
             return Err(ApiError::Unanswered(
                 "getUpdates: the result is not a list".into(),
@@ -134,6 +148,23 @@ impl TelegramBotApi {
         html: bool,
         reply_to: Option<i64>,
     ) -> Result<(), ApiError> {
+        self.send_message_keyboard(chat, text, html, reply_to, &[])
+            .await
+            .map(drop)
+    }
+
+    /// [`Self::send_message`] with an inline keyboard (one `(label, callback
+    /// data)` pair per button, one array per row), returning the sent
+    /// message's id so it can be edited later. Telegram caps callback data
+    /// at 64 bytes; the caller's data is far below that.
+    pub async fn send_message_keyboard(
+        &self,
+        chat: i64,
+        text: &str,
+        html: bool,
+        reply_to: Option<i64>,
+        keyboard: &[Vec<(String, String)>],
+    ) -> Result<i64, ApiError> {
         let mut body = json!({ "chat_id": chat, "text": text });
         if html {
             body["parse_mode"] = json!("HTML");
@@ -142,7 +173,58 @@ impl TelegramBotApi {
             body["reply_parameters"] =
                 json!({ "message_id": message_id, "allow_sending_without_reply": true });
         }
-        self.call("sendMessage", body).await.map(drop)
+        if !keyboard.is_empty() {
+            let rows: Vec<Vec<Value>> = keyboard
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|(text, data)| json!({ "text": text, "callback_data": data }))
+                        .collect::<Vec<Value>>()
+                })
+                .collect();
+            body["reply_markup"] = json!({ "inline_keyboard": rows });
+        }
+        let result = self.call("sendMessage", body).await?;
+        result["message_id"]
+            .as_i64()
+            .ok_or_else(|| ApiError::Unanswered("sendMessage: no message id in the answer".into()))
+    }
+
+    /// Edit a message the bot sent, dropping its keyboard (an answered or
+    /// expired approval's buttons must not stay tappable).
+    pub async fn edit_message_text(
+        &self,
+        chat: i64,
+        message_id: i64,
+        text: &str,
+        html: bool,
+    ) -> Result<(), ApiError> {
+        let mut body = json!({
+            "chat_id": chat,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": { "inline_keyboard": [] },
+        });
+        if html {
+            body["parse_mode"] = json!("HTML");
+        }
+        self.call("editMessageText", body).await.map(drop)
+    }
+
+    /// Answer a button press; `alert` shows `text` as a popup instead of a
+    /// toast. An unanswered answer leaves Telegram's spinner running, which
+    /// tells the sender nothing — callers report the server state instead.
+    pub async fn answer_callback_query(
+        &self,
+        callback_id: &str,
+        text: Option<&str>,
+        alert: bool,
+    ) -> Result<(), ApiError> {
+        let mut body = json!({ "callback_query_id": callback_id, "show_alert": alert });
+        if let Some(text) = text {
+            body["text"] = json!(text);
+        }
+        self.call("answerCallbackQuery", body).await.map(drop)
     }
 
     async fn call(&self, method: &str, body: Value) -> Result<Value, ApiError> {
@@ -194,6 +276,7 @@ fn read_update(update: Value) -> Option<Update> {
         Some(Update {
             update_id: update_id?,
             message: None,
+            callback_query: None,
         })
     })
 }

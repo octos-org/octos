@@ -80,9 +80,22 @@ pub(crate) async fn start(
     let mut im = assemble(state, entries, env, owners_dir, holder, channel).await?;
     let bots = bots.into_inner().unwrap_or_else(|p| p.into_inner());
     let polled = im.bridges.iter().cloned().zip(bots);
-    im.pollers = polled
+    let mut pollers: Vec<tokio::task::JoinHandle<()>> = polled
         .map(|(bridge, bot)| tokio::spawn(poll(bridge, bot)))
         .collect();
+    // Projected approvals outlive their buttons: sweep them past the TTL so
+    // the original message is marked expired even without a press.
+    pollers.extend(im.bridges.iter().cloned().map(|bridge| {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                bridge.expire_stale_buttons().await;
+            }
+        })
+    }));
+    im.pollers = pollers;
     Ok(im)
 }
 
@@ -145,7 +158,15 @@ pub(crate) async fn assemble(
         let turns = ExternalTurns::new(state.clone(), ledger.clone(), contract_stores());
         let ttl = Duration::from_secs(entry.ttl_secs);
         let allowed = entry.allowed_senders.clone();
-        let bridge = ServeImBridge::new(turns, channel, allowed, bindings, ttl).map_err(refuse)?;
+        let bridge = ServeImBridge::new(
+            turns,
+            channel,
+            allowed,
+            bindings,
+            ttl,
+            super::im_bridge::APPROVAL_TTL,
+        )
+        .map_err(refuse)?;
         im.bridges.push(bridge);
     }
     Ok(im)

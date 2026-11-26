@@ -195,16 +195,6 @@ fn entries(session: &SessionKey) -> Vec<ServeImChannel> {
     }]
 }
 
-async fn until<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..1000 {
-        if let Some(done) = ready() {
-            return done;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("{what} did not happen");
-}
-
 #[test]
 fn a_telegram_message_reads_as_the_platform_tells_it() {
     let read = |message: Value| {
@@ -274,10 +264,7 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     )
     .await;
     let im = im.unwrap();
-    let sends = until("both replies", || {
-        Some(fake.sends()).filter(|s| s.len() == 2)
-    })
-    .await;
+    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 2)).await;
     assert!(sends.contains(&(ME, "reply: hello".into(), Some(50), true)));
     let refused = "This chat is not linked to octos.".to_owned();
     assert!(sends.contains(&(GROUP, refused, Some(51), true)));
@@ -287,15 +274,15 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
         let told = polls.iter().position(|offset| *offset == 52)?;
         (polls.len() > told + 1).then_some(())
     };
-    until("a poll after telling", polled_since).await;
+    until_some(polled_since).await;
     // After a quiet week Telegram numbers the next update at random, here
     // below the last offset: it still reaches the bridge before it is told.
     // The unlinked group, told once, is not told again.
     fake.push(update(6, GROUP, "group", "hello again"));
     fake.push(update(7, ME, "private", "a week later"));
-    let sends = until("the reply", || Some(fake.sends()).filter(|s| s.len() == 3)).await;
+    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 3)).await;
     assert_eq!(sends[2], (ME, "reply: a week later".into(), Some(7), true));
-    until("asking from 8", || fake.asked_from(8).then_some(())).await;
+    until_some(|| fake.asked_from(8).then_some(())).await;
     drop(im);
     drop(fx);
 
@@ -316,8 +303,8 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     )
     .await;
     let _im = im.unwrap();
-    until("asking from 53", || fake.asked_from(53).then_some(())).await;
-    let sends = until("the reply", || Some(fake.sends()).filter(|s| !s.is_empty())).await;
+    until_some(|| fake.asked_from(53).then_some(())).await;
+    let sends = until_some(|| Some(fake.sends()).filter(|s| !s.is_empty())).await;
     assert_eq!(sends, [(ME, "reply: again".into(), Some(52), true)]);
     let prompts = llm.prompts.lock().unwrap().clone();
     assert_eq!(prompts, ["hello", "a week later", "again"]);
@@ -347,10 +334,7 @@ async fn a_rate_limited_refusal_does_not_hold_up_the_next_stop() {
     )
     .await;
     let _im = im.unwrap();
-    let sends = until("the /stop's answer", || {
-        Some(fake.sends()).filter(|s| s.len() == 2)
-    })
-    .await;
+    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 2)).await;
     let answered: Vec<_> = sends.iter().map(|s| (s.0, s.2)).collect();
     assert_eq!(answered, [(GROUP, Some(70)), (ME, Some(71))]);
 }
@@ -454,19 +438,41 @@ async fn neither_an_unreadable_update_nor_a_panic_holds_up_the_bot_and_it_is_pol
                 assert_ne!(message.text, "panic", "a bug that panics on one message");
             }
         };
-        poll_with(&bot, handle).await
+        poll_with(&bot, handle, |_| async {}).await
     });
-    until("asking from 64", || fake.asked_from(64).then_some(())).await;
+    until_some(|| fake.asked_from(64).then_some(())).await;
     assert_eq!(*seen.lock().unwrap(), ["one", "panic", "two"]);
     let polls = fake.times("getUpdates");
     assert!(polls[1] - polls[0] >= Duration::from_secs(2));
     // The next batch is handled too, and the bot never had two polls.
     fake.push(update(65, ME, "private", "three"));
-    until("asking from 66", || fake.asked_from(66).then_some(())).await;
+    until_some(|| fake.asked_from(66).then_some(())).await;
     assert_eq!(
         seen.lock().unwrap().last().map(String::as_str),
         Some("three")
     );
     assert_eq!(fake.most_polling.load(Ordering::SeqCst), 1);
     poller.abort();
+}
+
+/// T-0690: a button press, the keyboard, the ACK and the invalidating edit.
+#[tokio::test]
+async fn approval_buttons_press_and_edit_through_the_bot_api() {
+    let press = json!({ "update_id": 9, "callback_query": { "id": "cb-9", "from": { "id": ME, "is_bot": false }, "data": "imp:0123456789abcdef:a", "message": { "message_id": 42, "date": 1, "chat": { "id": ME, "type": "private" } } } });
+    let update: Update = serde_json::from_value(press).unwrap();
+    let callback = im_callback(update.callback_query.as_ref().unwrap()).unwrap();
+    let got = (callback.chat, callback.message_id, callback.callback_id.as_str(), callback.data.as_str());
+    assert_eq!(got, (ME, Some(42), "cb-9", "imp:0123456789abcdef:a"));
+
+    let (fake, url) = FakeTelegram::start().await;
+    let bot = TelegramBotApi::new(&url, TOKEN);
+    let keyboard = [vec![("Approve".to_owned(), "imp:x:a".to_owned())]];
+    let id = bot.send_message_keyboard(ME, "Approval", false, None, &keyboard).await.unwrap();
+    bot.answer_callback_query("cb-9", Some("Approved."), false).await.unwrap();
+    bot.edit_message_text(ME, id, "Approved.", false).await.unwrap();
+    let calls = fake.calls.lock().unwrap();
+    let called = |method: &str| &calls.iter().find(|(m, ..)| m == method).unwrap().1;
+    assert_eq!(called("sendMessage")["reply_markup"]["inline_keyboard"][0][0]["callback_data"], json!("imp:x:a"));
+    assert_eq!(called("answerCallbackQuery")["callback_query_id"], json!("cb-9"));
+    assert_eq!(called("editMessageText")["reply_markup"]["inline_keyboard"], json!([]));
 }
