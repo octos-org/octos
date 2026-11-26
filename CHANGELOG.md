@@ -27,7 +27,7 @@ All notable changes to octos will be documented in this file.
 - Native PPTX visual repair preserves image evidence and registered OCR positions through repair and review (#3142, #3344).
 - Telegram/Discord support explicit chat/guild-to-profile routing (#3297); OrcaRouter is available as an OpenAI-compatible family, and DeepSeek V4.1 Flash is catalogued on OpenRouter and NVIDIA (#3312, #3288).
 
-The v2.1.0 release baseline is `846b67ad0ef684eb5f508ab029789e619a4977e6`.
+The v2.1.0 release baseline is `eafaec0eddc0ae6f6d4e79332f2ef40ee5ac05cb`.
 Release bundles include the server, sandbox helper and bundled skills for macOS
 ARM64, Linux x64/ARM64 and Windows x64. See `docs/UPGRADE-v2.1.0.md` before
 upgrading an existing serve installation.
