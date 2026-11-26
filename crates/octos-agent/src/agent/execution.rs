@@ -129,7 +129,7 @@ fn should_auto_send_tool_files(
 /// - `run_pipeline` (spawn_only pipeline tool registered via manifest)
 /// - `browser` (`tools/browser.rs`)
 /// - `delegate_task` (`tools/delegate.rs`)
-/// - `search` (`tools/deep_search.rs`), `deep_crawl` (`tools/site_crawl.rs`)
+/// - `search` (`tools/deep_search.rs`), `deep_crawl` (`crates/app-skills/deep-crawl/src/main.rs`)
 /// - `synthesize_research` (`tools/synthesize_research.rs`)
 /// - `check` (`tools/check.rs`): a cold `cargo check` legitimately compiles
 ///   the dependency graph; the tool enforces its own 120s child timeout,
