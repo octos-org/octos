@@ -3,11 +3,7 @@
 All notable changes to octos will be documented in this file.
 ## [Unreleased]
 
-### Deprecated
-
-- The `/app` web client (octos-web, the embedded legacy SPA) is deprecated and will be removed in a future release. Use [octoscode-web](https://github.com/octos-org/octoscode-web) as the web client instead. As step 1 (RFC #3262), `/app` now shows a deprecation banner on every load; the octos-web submodule and its build steps are removed in a later step.
-
-## [2.1.0-rc.1] - 2026-11-02
+## [2.1.0] - 2026-11-26
 
 ### Highlights
 
@@ -22,10 +18,19 @@ All notable changes to octos will be documented in this file.
 - Cron: profile-scoped create and delete methods (#2891) and serve delivery acknowledged through the session queue (#2888).
 - Models: Claude Opus 5.5 with adaptive thinking for Claude 4.6+ (#2493); GLM tool images stay text-only (#2924).
 - Runtime: fresh profiles use the Node image (#2927) and report their actual session execution environment (#2928); supervised workers resume and hand off stalled check cycles (#2922); Matrix operators can ignore senders to break bot-to-bot loops (#2875).
+- Chat and Code become durable session work modes (#3255). Every Chat receives a server-owned, confined workspace, with runtime-created Profiles rooted under `<state home>/chat-workspaces`; legacy layouts, migration refusals and hidden-root recovery are documented in the upgrade guide (#3256, #3326, #3356, #3360, #3372).
+- OUP adds authenticated catalog bootstrap and confined host-scoped execution (#3203, #3260); reviewed skill installation binds the approved commit and artifact digest (#3183); session-scoped memory adds synchronous entries, edit and delete (#3179).
+- Peers support native reopen and fork with durable resume semantics (#3333), and a turn may hand off any number of peers (#3364).
+- Fleet tasks and peer interactions can declare required files for their first model request, delivered under the worker's authority with size, digest and required-input enforcement (#3350, #3352, #3363).
+- The serve IM bridge core drives an existing Chat from explicitly bound Telegram direct chats, with `serve.im` configuration, one owner per bot, durable turn identity and hardened polling/replies (#3325, #3334, #3361, #3365, #3366).
+- Autonomy gains a single-source dual projection with durable gaps and wake authority (#3324), and both bridges hand compaction summaries to their successors (#3228).
+- Native PPTX visual repair preserves image evidence and registered OCR positions through repair and review (#3142, #3344).
+- Telegram/Discord support explicit chat/guild-to-profile routing (#3297); OrcaRouter is available as an OpenAI-compatible family, and DeepSeek V4.1 Flash is catalogued on OpenRouter and NVIDIA (#3312, #3288).
 
-This release candidate pairs with OctosCode 0.4.0-rc.1. Release bundles include the
-server, sandbox helper and bundled skills for macOS ARM64, Linux x64/ARM64
-and Windows x64.
+The v2.1.0 release baseline is `846b67ad0ef684eb5f508ab029789e619a4977e6`.
+Release bundles include the server, sandbox helper and bundled skills for macOS
+ARM64, Linux x64/ARM64 and Windows x64. See `docs/UPGRADE-v2.1.0.md` before
+upgrading an existing serve installation.
 
 ### Security
 
@@ -35,6 +40,13 @@ and Windows x64.
 - Guard hooks fail closed when the breaker trips (#2844); the skills cargo-build fallback sits behind an operator opt-in (#2861); skill mutations in `manage_skills` are confirmation-gated (#2858).
 - Workspace media is opened through trusted directory file descriptors (#2946); profile defaults, cost/usage ledgers and account-manager sandbox config fail closed on corrupt or malformed data (#2954, #2965, #2957); the autonomy monitor/expired sink is budgeted per owning session (#2801).
 - Dependency advisories: gix 0.83 and jsonwebtoken 10.4 (#2838), rustls 0.23.46 and the vulnerable rustls pulled in through Serenity (#2879, #2955), pyo3 0.29.3 (#2932), lettre 0.11.22 (#2933), rmcp 2.1 (#2841), plus dashboard, swarm-app, octos-web and PPTX-skill package bumps.
+- Chat workspaces are confined and hidden from other sessions, snapshots, file APIs and `send_file`; missing, replaced or overlapping hidden roots fail closed (#3256, #3326, #3356, #3360). Host-scoped execution and exact-call write-tool policies add bounded authorization (#3111, #3260).
+- Declared inputs use the receiving worker's scope, reject hidden-path precheck leaks and actual-digest disclosure, and enforce size limits before full reads (#3350, #3352, #3363).
+- Session permission/status operations enforce ownership and persist permissions across restart (#3284, #3285); profile-scoped agent and peer events no longer cross profile boundaries on replay or live delivery (#3271).
+- Gateway provider fallback isolates credentials, Discord thread-parent lookup fails closed, and Telegram transport errors redact bot tokens (#3265, #3311, #3365, #3366).
+- Persistence, repository/Office paths, provider/lane failures and credential/config errors received additional fail-closed handling (#2999, #3004, #3039, #3040).
+- Remote skill binaries require signed provenance, and reviewed installs verify commit/digest/signature before atomic publication; skill downloads, install subprocesses, hook/plugin capture and MCP stdio framing are bounded (#3023, #3025, #3027, #3029, #3061, #3074, #3183).
+- Per-profile credential pools and cross-provider fallback credentials are isolated, key-like bare hex values are redacted, autonomy probes inherit the session sandbox, and `send_file` is bound to the current turn (#3060, #3097, #3148, #3175, #3265).
 
 ### Fixed
 
@@ -45,12 +57,28 @@ and Windows x64.
 - Windows: directories are classified before opening (#2887) and unsupported environment probes are reported (#2930).
 - Peer handles derived from Unicode titles are safe ASCII (#2921); typed command details cover the `bash` and `exec_command` aliases (#2750); deep-search fails on artifact write errors (#2967); malformed Ominix config is preserved (#2952); admin implicit launches stay out of user sticky profiles (#2977).
 - `send_file` deliveries keep their transcript order (#2937); cron session scope and validation are aligned across the API surface (#2966).
+- Startup and restart handling now covers legacy Chat layouts without splitting fresh profiles across roots, recreates only known-empty server roots, and keeps torn peer purge and fleet keeper recovery fenced to their owning generation (#3328, #3332, #3343, #3356, #3360, #3372).
+- Goal-ledger turn charges settle exactly once in either snapshot/charge order, without advancing metadata timestamps or losing queued budget updates (#3270).
+- Cron rejects unschedulable calendars, isolates invalid persisted timestamps, aligns user weekdays and avoids duplicate or ambiguous CLI ids (#3264, #3327, #3329, #3330).
+- Gateway startup isolates slow actor construction, heartbeat liveness is monotonic, ingress grant I/O stays out of admission locks, and dangling flat session branches are diagnosable (#3280, #3290, #3296, #3274).
+- Windows doctor locates fresh-PATH installations through independent HOME/USERPROFILE candidates and the deploy default (#3322).
+- Turn persistence failures are surfaced, terminal timestamps and cancellation semantics are preserved, and cancelled work stops in-flight tools/MCP and skill-install operations (#2969, #3000, #3007, #3014, #3053, #3102, #3104, #3157).
+- Session rename/delete/discovery and broken-history handling were hardened; transport streams, live forwarders and stdio queues are bounded without dropping valid users or oversized-line recovery (#2926, #2959, #2973, #3010, #3021, #3055, #3058, #3076, #3098, #3101, #3238).
+- Undo/restore now retains per-turn points, refuses restores over later edits and reports structured conflicts; non-git diffs and path/hunk rendering were corrected (#2914, #3030, #3045, #3075, #3103, #3143, #3200, #3204, #3205).
 
 ### Changed
 
 - Agent shared DTOs moved to `octos-core` and FFI support moved out of the CLI (#2944, #2947); embedding and session memory lifecycle is bounded (#2950); immutable `ToolSpec` artifacts are cached across turns (#2988).
 - CI: UPCR coverage gate in the check job (#2794), release gating on npm/Homebrew distribution alignment (#2799), branch hygiene policy and quality ratchet (#2804), a `test-octos-cli-gate` so required checks survive research-only skips (#2843), affected-test runs on ordinary PRs (#2963), required checks for merge groups (#2958), macOS jobs on macos-15 (#2925), Windows integration libtest de-duplication (#2972), and fail-closed handling of unmapped build configs (#2974).
 - Test-suite and docs housekeeping (table-driven recovery scenarios, Windows lane de-noising, approval/recovery invariants, architecture and security doc corrections) and routine dependency bumps for the dashboard, swarm-app, octos-web and the PPTX skill's Python packages.
+- Experimental JIT development supports source skills and the `skill_dev` agent tool (#3279); peer gathering records the staging originator, and snapshot/restore refusals carry structured reasons (#3099, #3103).
+- Third-party install-time Cargo builds, npm scripts and lifecycle commands are off by default behind explicit operator opt-ins (#3202). The unused standalone `octos-pipeline` crate is removed; DOT runtime retirement remains separate (#2691, #3044).
+- CI/Nightly: ARM64 tests receive sufficient thread-stack headroom, test growth is measured from the merge base, a current-head maintainer approval may exempt up to 150 net test lines, larger growth requires a maintainer label, self-hosted runners skip the incompatible cache, and tool-regression E2E uses the dev serve build (#3293, #3317, #3318, #3319, #3321, #3373).
+- Test suites received further table-driven consolidation, shared fixtures and platform-specific isolation, including macOS case-folding, hidden-folder fixtures and grant-I/O deadline polling.
+
+### Deprecated
+
+- The `/app` web client (octos-web, the embedded legacy SPA) is deprecated and will be removed in a future release. Use [octoscode-web](https://github.com/octos-org/octoscode-web) as the web client instead. As step 1 (RFC #3262), `/app` now shows a deprecation banner on every load (#3323); the octos-web submodule and its build steps are removed in a later step.
 
 ## [2.0.3] - 2026-10-13
 
