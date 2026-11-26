@@ -93,7 +93,10 @@ A connection that does not request it sees byte-identical replies.
     binding each folder between a writable working folder and it over itself,
     so a command cannot rename one to move a reserved folder out from under
     the next command. macOS denies reading and writing them, and writing the
-    folders between the working folder and them. Landlock, Docker and
+    folders between the working folder and them. Docker mounts only the
+    working folder, extra binds and the build-cache slot, so a reserved
+    folder outside every mount is absent from the container; one inside a
+    mount is covered with an empty `--tmpfs` (T-0681). Landlock and
     AppContainer cannot hide a folder inside one they grant, so there a
     command whose working folder (or a configured read path) holds one
     refuses to run. If a registered folder is missing when a command is

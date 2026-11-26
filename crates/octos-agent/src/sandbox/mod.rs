@@ -211,8 +211,12 @@ pub struct SandboxConfig {
     /// - macOS: `(deny file-read* file-write* (subpath <folder>))` for each,
     ///   last, so it wins over every grant, and `(deny file-write* (literal
     ///   <parent>))` for each folder between the cwd and it.
-    /// - Landlock, Docker and AppContainer cannot hide a folder inside one
-    ///   they grant: a command whose cwd or a configured read path holds one
+    /// - Docker: mounts only the workspace, extra binds and the build-cache
+    ///   slot, so a hidden folder outside every mount is absent from the
+    ///   container; one inside a mount is covered by an empty `--tmpfs`
+    ///   (bwrap parity, T-0681).
+    /// - Landlock and AppContainer cannot hide a folder inside one they
+    ///   grant: a command whose cwd or a configured read path holds one
     ///   refuses to run.
     /// - No sandbox grants every path for the command's whole run: every
     ///   command refuses while any folder is hidden, empty or not.
@@ -1149,7 +1153,9 @@ pub fn create_sandbox(config: &SandboxConfig) -> Box<dyn Sandbox> {
             build_backend(choice, config),
             matches!(
                 choice,
-                SandboxBackendChoice::Bwrap | SandboxBackendChoice::Macos
+                SandboxBackendChoice::Bwrap
+                    | SandboxBackendChoice::Macos
+                    | SandboxBackendChoice::Docker
             ),
         ),
         SandboxDecision::Unconfined(reason) => {
@@ -1197,12 +1203,23 @@ struct HiddenFolderGuard {
     read_allow_paths: Vec<String>,
 }
 
+/// Why a non-hiding backend refuses a command: the wording differs per
+/// cause, so a read-path overlap never blames the working folder (T-0681).
+enum HiddenConflict {
+    /// A registered folder failed validation or is missing and unaccountable.
+    Unaccountable,
+    /// The working folder holds a hidden folder, or lies inside one.
+    Workspace,
+    /// A configured read path holds a hidden folder.
+    ReadPath { read: PathBuf, folder: PathBuf },
+}
+
 impl HiddenFolderGuard {
-    fn exposes_hidden(&self, cwd: &Path) -> bool {
+    fn hidden_conflict(&self, cwd: &Path) -> Option<HiddenConflict> {
         // A command outlives this check: one that starts while no chat
         // exists yet could still be running when the first one is made.
         if self.inner.is_noop() {
-            return !self.hidden.folders().is_empty();
+            return (!self.hidden.folders().is_empty()).then_some(HiddenConflict::Unaccountable);
         }
         let canonical = |path: &Path| std::fs::canonicalize(path).ok();
         let cwd = canonical(cwd);
@@ -1222,7 +1239,7 @@ impl HiddenFolderGuard {
                         .resolve_existing_folder(&registered, &folder)
                         .is_err()
                     {
-                        return true;
+                        return Some(HiddenConflict::Unaccountable);
                     }
                     resolved.push(folder);
                 }
@@ -1237,25 +1254,35 @@ impl HiddenFolderGuard {
                                 .resolve_existing_folder(&registered, &folder)
                                 .is_err()
                             {
-                                return true;
+                                return Some(HiddenConflict::Unaccountable);
                             }
                             resolved.push(folder);
                         }
-                        Err(_) => return true,
+                        Err(_) => return Some(HiddenConflict::Unaccountable),
                     },
                     Ok(false) => {}
-                    Err(_) => return true,
+                    Err(_) => return Some(HiddenConflict::Unaccountable),
                 },
             }
         }
-        resolved.iter().any(|folder| {
-            cwd.as_ref()
+        resolved.iter().find_map(|folder| {
+            if cwd
+                .as_ref()
                 .is_some_and(|cwd| folder.starts_with(cwd) || cwd.starts_with(folder))
-                || read.iter().any(|path| folder.starts_with(path))
+            {
+                Some(HiddenConflict::Workspace)
+            } else {
+                read.iter()
+                    .find(|path| folder.starts_with(path))
+                    .map(|path| HiddenConflict::ReadPath {
+                        read: path.clone(),
+                        folder: folder.clone(),
+                    })
+            }
         })
     }
 
-    fn refuse(&self, cwd: &Path) -> Command {
+    fn refuse(&self, cwd: &Path, conflict: &HiddenConflict) -> Command {
         let backend = self.inner.backend_name();
         let line = if self.inner.is_noop() {
             "sandbox none: commands run without a sandbox here, which cannot hide chat folders \
@@ -1263,11 +1290,25 @@ impl HiddenFolderGuard {
              Install a sandbox backend; octos doctor shows which."
                 .to_string()
         } else {
-            format!(
-                "sandbox {backend}: this folder holds chat folders, which this sandbox cannot \
-                 hide from the shell. Refusing to run the command. Work in a folder that does \
-                 not hold the octos data directory."
-            )
+            match conflict {
+                HiddenConflict::Workspace => format!(
+                    "sandbox {backend}: this folder holds chat folders, or lies inside one, \
+                     which this sandbox cannot hide from the shell. Refusing to run the \
+                     command. Work in a folder that does not hold the octos data directory."
+                ),
+                HiddenConflict::ReadPath { read, folder } => format!(
+                    "sandbox {backend}: the read path {} holds chat folders ({}), which this \
+                     sandbox cannot hide from the shell. Refusing to run the command. Narrow \
+                     sandbox.read_allow_paths so no entry holds a chat folder.",
+                    read.display(),
+                    folder.display()
+                ),
+                HiddenConflict::Unaccountable => format!(
+                    "sandbox {backend}: a registered chat folder cannot be accounted for, so \
+                     overlaps cannot be checked. Refusing to run the command. Restore the \
+                     folder or restart the server."
+                ),
+            }
         };
         refusing_command(&line, cwd)
     }
@@ -1275,8 +1316,8 @@ impl HiddenFolderGuard {
 
 impl Sandbox for HiddenFolderGuard {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
-        if self.exposes_hidden(cwd) {
-            return self.refuse(cwd);
+        if let Some(conflict) = self.hidden_conflict(cwd) {
+            return self.refuse(cwd, &conflict);
         }
         self.inner.wrap_command(shell_command, cwd)
     }
@@ -1287,8 +1328,8 @@ impl Sandbox for HiddenFolderGuard {
         cwd: &Path,
         slot: Option<&Path>,
     ) -> Command {
-        if self.exposes_hidden(cwd) {
-            return self.refuse(cwd);
+        if let Some(conflict) = self.hidden_conflict(cwd) {
+            return self.refuse(cwd, &conflict);
         }
         self.inner
             .wrap_command_with_build_cache_slot(shell_command, cwd, slot)
@@ -1400,6 +1441,9 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
         SandboxBackendChoice::Docker => Box::new(DockerSandbox {
             config: fence_degraded_docker(config),
             allow_network: config.allow_network,
+            // Docker masks hidden folders under its mounts with an empty
+            // tmpfs; folders outside every mount never reach the container.
+            hidden_folders: config.hidden_folders.clone(),
             // Per-call cache target mounts are supplied by the shell tool.
         }),
         SandboxBackendChoice::Landlock => {
@@ -1841,6 +1885,21 @@ mod tests {
         assert!(NoSandbox.is_noop());
     }
 
+    fn bwrap_guard(hidden: octos_core::HiddenFolders, read: Vec<String>) -> HiddenFolderGuard {
+        HiddenFolderGuard {
+            inner: Box::new(bwrap::BwrapSandbox {
+                allow_network: false,
+                workspace_write: true,
+                deliverable_root: None,
+                repo_git_write: None,
+                read_only_view: None,
+                hidden_folders: None,
+            }),
+            hidden,
+            read_allow_paths: read,
+        }
+    }
+
     #[tokio::test]
     async fn should_refuse_when_a_non_hiding_backend_cannot_resolve_hidden_folder() {
         let temp = tempfile::tempdir().unwrap();
@@ -1851,26 +1910,14 @@ mod tests {
         std::fs::rename(&hidden_path, temp.path().join("renamed")).unwrap();
         let hidden = octos_core::HiddenFolders::default();
         hidden.add(hidden_path).unwrap();
-        let guard = HiddenFolderGuard {
-            inner: Box::new(bwrap::BwrapSandbox {
-                allow_network: false,
-                workspace_write: true,
-                deliverable_root: None,
-                repo_git_write: None,
-                read_only_view: None,
-                hidden_folders: None,
-            }),
-            hidden,
-            read_allow_paths: Vec::new(),
-        };
-        let output = guard
+        let output = bwrap_guard(hidden, Vec::new())
             .wrap_command("echo must-not-run", &cwd)
             .output()
             .await
             .expect("refusal command runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success());
-        assert!(stderr.contains("Refusing to run"), "{stderr}");
+        assert!(stderr.contains("cannot be accounted for"), "{stderr}");
         assert!(!stderr.contains("must-not-run"), "{stderr}");
     }
 
@@ -1887,27 +1934,40 @@ mod tests {
             assert_eq!(folder, hidden_path);
             Err("owner rejected the replacement".to_owned())
         }));
-        let guard = HiddenFolderGuard {
-            inner: Box::new(bwrap::BwrapSandbox {
-                allow_network: false,
-                workspace_write: true,
-                deliverable_root: None,
-                repo_git_write: None,
-                read_only_view: None,
-                hidden_folders: None,
-            }),
-            hidden,
-            read_allow_paths: Vec::new(),
-        };
-        let output = guard
+        let output = bwrap_guard(hidden, Vec::new())
             .wrap_command("echo must-not-run", &cwd)
             .output()
             .await
             .expect("refusal command runs");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success());
-        assert!(stderr.contains("Refusing to run"), "{stderr}");
+        assert!(stderr.contains("cannot be accounted for"), "{stderr}");
         assert!(!stderr.contains("must-not-run"), "{stderr}");
+    }
+
+    /// T-0681: a read path holding a chat folder refuses with a message that
+    /// names the read path, not the innocent working folder.
+    #[tokio::test]
+    async fn should_name_the_read_path_when_it_holds_a_hidden_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, cwd) = (temp.path().join("home"), temp.path().join("work"));
+        std::fs::create_dir_all(home.join("chats")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        hidden.add(home.join("chats")).unwrap();
+        let read = vec![home.to_string_lossy().into_owned()];
+        let out = bwrap_guard(hidden, read)
+            .wrap_command("echo x", &cwd)
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("read path") && stderr.contains("holds chat folders"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("this folder"), "{stderr}");
     }
 
     #[cfg(unix)]
