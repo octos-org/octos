@@ -226,6 +226,10 @@ const TERMINAL_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs
 const PROMPT_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
+/// Share of the provider window the outgoing projection may fill before
+/// pinned-tail rows are degraded (headroom for estimate error and output).
+const APPUI_CONTEXT_PRESSURE_NUMERATOR: usize = 85;
+const APPUI_CONTEXT_PRESSURE_DENOMINATOR: usize = 100;
 const APPUI_CONTEXT_COMPACT_TARGET_NUMERATOR: usize = 2;
 const APPUI_CONTEXT_COMPACT_TARGET_DENOMINATOR: usize = 3;
 /// Wall-clock budget for delivering a *terminal* task lifecycle update
@@ -4178,6 +4182,7 @@ fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> Pro
         include_reasoning: PromptBuildPolicy::reasoning_for_model(llm_provider.model_id()),
         supports_media: true,
         max_prompt_token_estimate: None,
+        context_pressure_budget: None,
         model_capability_id: format!(
             "{}/{}",
             llm_provider.provider_name(),
@@ -5028,6 +5033,7 @@ impl AppUiPromptContextBridge {
             include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
+            context_pressure_budget: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
             redact_memory_events: false,
         }
@@ -5240,7 +5246,15 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // `policy` above stays uncapped for the record/coverage/compaction
         // passes so the persisted transcript is never re-recorded from a
         // trimmed view.
-        let out_policy = self.outgoing_prompt_policy(&request);
+        let mut out_policy = self.outgoing_prompt_policy(&request);
+        // Compaction cannot summarize the pinned tail of a long tool loop;
+        // keep the outgoing request inside the provider window regardless.
+        out_policy.context_pressure_budget = Some(
+            (request.context_window as usize * APPUI_CONTEXT_PRESSURE_NUMERATOR
+                / APPUI_CONTEXT_PRESSURE_DENOMINATOR)
+                .saturating_sub(overhead)
+                .max(1),
+        );
         let frame = scratch.manager.for_prompt(&out_policy);
         // `context.state.v1`: push the live estimate so the client's gauge
         // follows the turn instead of freezing at the session-open value

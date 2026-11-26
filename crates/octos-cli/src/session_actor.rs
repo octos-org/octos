@@ -726,6 +726,7 @@ impl SessionActorPromptContextBridge {
             include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
+            context_pressure_budget: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
             redact_memory_events: false,
         }
@@ -5877,6 +5878,7 @@ impl SessionActor {
             include_reasoning: PromptBuildPolicy::reasoning_for_model(self.agent.model_id()),
             supports_media: true,
             max_prompt_token_estimate: None,
+            context_pressure_budget: None,
             model_capability_id: format!(
                 "{}/{}",
                 self.agent.provider_name(),
