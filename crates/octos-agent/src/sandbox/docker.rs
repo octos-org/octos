@@ -154,6 +154,50 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+/// Whether the workspace is ALSO bound at its host path inside the container.
+/// The model's prompt names the host workspace path (the UI context knows no
+/// container), so a shell-only `/workspace` mount made the model's first
+/// `ls <host path>` fail with ENOENT (burn-in r8 R8-F01). Aliasing the same
+/// source at its own path adds no new content — both mounts expose the same
+/// directory — but an alias that lands exactly on a container system
+/// directory (e.g. cwd = `/tmp`) would shadow it, so those stay unmounted.
+fn may_alias_host_path(cwd: &Path) -> bool {
+    // Aliasing shadows the destination inside the container, so a workspace
+    // path that IS a container system directory (or `/`) must never alias;
+    // anything deeper (e.g. `/home/me/project`) only shadows itself.
+    const SHADOWED: &str = "/ /usr /usr/local /bin /sbin /lib /lib64 /etc /var /opt /root /tmp /proc /sys /dev /run /boot /mnt /media /srv /home /workspace";
+    if !cwd.is_absolute() {
+        return false;
+    }
+    let trimmed = cwd.to_string_lossy().trim_end_matches('/').to_owned();
+    let normalized = if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed
+    };
+    !SHADOWED.split(' ').any(|dir| dir == normalized)
+}
+
+/// Git `safe.directory` grants for the workspace's container paths, passed
+/// through the environment so no config file is written anywhere (T-0686):
+/// the container's user (image default, e.g. root in node:22-bookworm) does
+/// not own the host bind mount, so git refused with "detected dubious
+/// ownership" and `git diff -- a b` silently degraded to a two-file
+/// `--no-index` comparison. Scoped to the exact mount destinations — never a
+/// wildcard, never a host-side write.
+fn add_git_safe_directory_env(cmd: &mut Command, dests: &[String]) {
+    if dests.is_empty() {
+        return;
+    }
+    cmd.arg("--env")
+        .arg(format!("GIT_CONFIG_COUNT={}", dests.len()));
+    for (i, dest) in dests.iter().enumerate() {
+        cmd.arg("--env")
+            .arg(format!("GIT_CONFIG_KEY_{i}=safe.directory"));
+        cmd.arg("--env").arg(format!("GIT_CONFIG_VALUE_{i}={dest}"));
+    }
+}
+
 impl DockerSandbox {
     fn wrap_with_slot(&self, shell_command: &str, cwd: &Path, slot: Option<&Path>) -> Command {
         let mut cmd = Command::new("docker");
@@ -212,21 +256,29 @@ impl DockerSandbox {
             return fail;
         }
 
+        let mut workspace_dests: Vec<String> = Vec::new();
         match self.config.mount_mode {
-            MountMode::ReadWrite => {
-                cmd.arg("-v").arg(format!("{cwd_str}:/workspace"));
+            MountMode::ReadWrite | MountMode::ReadOnly => {
+                let ro = if self.config.mount_mode == MountMode::ReadOnly {
+                    ":ro"
+                } else {
+                    ""
+                };
+                cmd.arg("-v").arg(format!("{cwd_str}:/workspace{ro}"));
                 cmd.arg("-w").arg("/workspace");
                 hidden_mounts.push((cwd.to_path_buf(), "/workspace".to_owned()));
-            }
-            MountMode::ReadOnly => {
-                cmd.arg("-v").arg(format!("{cwd_str}:/workspace:ro"));
-                cmd.arg("-w").arg("/workspace");
-                hidden_mounts.push((cwd.to_path_buf(), "/workspace".to_owned()));
+                workspace_dests.push("/workspace".to_owned());
+                if may_alias_host_path(cwd) {
+                    cmd.arg("-v").arg(format!("{cwd_str}:{cwd_str}{ro}"));
+                    hidden_mounts.push((cwd.to_path_buf(), cwd_str.clone().into_owned()));
+                    workspace_dests.push(cwd_str.clone().into_owned());
+                }
             }
             MountMode::None => {
                 cmd.arg("-w").arg("/tmp");
             }
         }
+        add_git_safe_directory_env(&mut cmd, &workspace_dests);
 
         // Extra bind mounts (validated against dangerous sources)
         for bind in &self.config.extra_binds {
@@ -337,6 +389,77 @@ mod tests {
             allow_network: false,
             hidden_folders: Some(hidden),
         }
+    }
+
+    #[test]
+    fn should_alias_only_safe_host_workspace_paths() {
+        assert!(may_alias_host_path(Path::new(
+            "/data2/kamico/octos-dogfood/work"
+        )));
+        assert!(may_alias_host_path(Path::new("/home/me/project")));
+        assert!(may_alias_host_path(Path::new("/Users/me/project")));
+        for denied in [
+            "/",
+            "/tmp",
+            "/usr",
+            "/var",
+            "/etc",
+            "/home",
+            "/workspace",
+            "/proc",
+        ] {
+            assert!(
+                !may_alias_host_path(Path::new(denied)),
+                "{denied} must not be aliased"
+            );
+        }
+        assert!(!may_alias_host_path(Path::new("relative/path")));
+    }
+
+    /// T-0686: the prompt-visible host workspace path works inside the
+    /// container (no ENOENT), git status/diff work without any
+    /// `safe.directory='*'` wildcard or config write, and hidden folders stay
+    /// masked on the alias mount too.
+    #[tokio::test]
+    async fn should_alias_host_path_and_scope_git_ownership() {
+        let Some(image) = image() else { return };
+        let git_ok = Proc::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !git_ok {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let out = Proc::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "host git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(work.join("a.txt"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(work.join("a.txt"), "hello2\n").unwrap();
+        let hidden = octos_core::HiddenFolders::default();
+        std::fs::create_dir_all(work.join("chats/abc")).unwrap();
+        std::fs::write(work.join("chats/abc/secret.txt"), "s").unwrap();
+        hidden.add(work.join("chats")).unwrap();
+        let host = work.display();
+        let probe = format!(
+            "ls {host} >/dev/null && git status --porcelain | grep -q a.txt && git -C {host} diff --stat | grep -q a.txt && if [ -e {host}/chats/abc/secret.txt ]; then echo LEAKED; exit 1; fi; printf ok"
+        );
+        let mut wrapped = sandbox(&image, hidden).wrap_command(&probe, &work);
+        let out = wrapped.output().await.unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "failed: {stderr}");
     }
 
     /// T-0681: a sibling-layout hidden root never reaches the container; an in-workspace one is tmpfs-masked.
