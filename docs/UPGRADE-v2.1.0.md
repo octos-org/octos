@@ -40,7 +40,7 @@ old server will see those new Chats. The exact compatibility contract is in
 ## Hidden Chat roots remain fail-closed
 
 The server Chat root is precomputed and hidden before commands start (#3326,
-#3356, #3360).
+#3356, #3360, #3377).
 
 - Only a missing server-owned root **still known to be empty** may be
   recreated privately, and only when none of the current command's workspace
@@ -53,6 +53,17 @@ The server Chat root is precomputed and hidden before commands start (#3326,
 - Backends that cannot hide a reserved folder beneath a granted root refuse
   overlapping commands. With sandboxing disabled or unavailable, every command
   refuses while any Chat root is reserved.
+
+Docker can now hide Chat roots instead of rejecting the default new-install
+Code workflow (#3377). A sibling data directory outside the container's mounts
+is naturally invisible; a hidden root inside a mount is covered with a private
+empty `tmpfs`. If a bind source is the hidden root or lies inside it, the
+command still refuses because that bind would cover the mask. The default
+bootstrap read grant no longer exposes the whole Octos home: only existing
+shared skill directories are granted. Landlock, AppContainer and no-sandbox
+refusal semantics are unchanged. Refusal text now distinguishes a **read path**
+that contains a hidden root from the command workspace itself and names the
+path to narrow.
 
 The refusal names the missing path and the available recovery action. Restore
 the original directory, or have an operator verify deletion and unregister a
