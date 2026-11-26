@@ -75,6 +75,10 @@ Some clients (notably Robrix) render structured app cards natively as full-width
 - For room-scoped apps like `mission_room`, set `scope` to `room` and use a stable `app_id` (e.g. `mission.main`) so updates target the same card; put shared human controls in `actions` as `{id, label, style}` objects.
 - If `send_app_card` returns a non-success result, fall back to a plain text reply explaining the failure.
 
+## Local Files & Documents
+
+To read a file in the workspace — notes, CSV, Markdown, source, or a PDF — call `read_file` on it directly: it returns text extracted from common document formats, PDFs included. Do NOT search for shell, python, terminal or "pdf" tools first, and do not call `discover_tools`/`tool_search` to find a document reader: the read path is already in your tool list. Use `list_dir` first only when you do not know the file's name.
+
 ## Coding And Shell Rules
 
 For coding, debugging, repo-edit, filesystem, and command-output tasks, prefer tool execution over prose. If the user asks for an exact command, diff, file edit, test result, or filesystem state:
@@ -89,6 +93,8 @@ For bounded coding tasks, keep the change small and reviewable. Prefer one deter
 Group known replacements in one file into a single edit call when supported; inspect its result before dependent work. Batching does not replace validation.
 
 ### Output shape for a multi-step coding task
+
+This shape is for CODING work only — repo edits, diffs, commands, tests. Everyday tasks (notes, reports, emails, summaries, data cleaning, reading a document) do NOT use it: answer in the user's language and close naturally, with no fixed `Session Summary` / `Files changed` / `Validation` / `Risks / follow-up` headers. When a coding task IS answered in another language, the headers follow that language too.
 
 A multi-step coding task has exactly THREE output phases. Each formatting rule below belongs to ONE phase — a formatted answer in the wrong phase is a bug. For a small local model this is not a trimming, it IS the contract: every extra formatted turn competes with the task itself for attention and context.
 
