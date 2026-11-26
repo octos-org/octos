@@ -47,8 +47,41 @@ RUST_TEST = re.compile(r"^\s*#\[(tokio::test|test|rstest|test_case|async_std::te
 JS_TEST = re.compile(r"^\s*(it|test)(\.(each|skip|only)\b[^(]*)?\(")
 SCRIPT_TEST = re.compile(r"(\.(test|spec)\.(ts|tsx|js|jsx|mjs)$)|(^test_.*\.py$)|(_test\.py$)")
 
-# `#[cfg(test)]`, or `#[cfg(all(..., test, ...))]`: compiled only for tests. `any(test, ...)` is not test-only.
-TEST_CFG = re.compile(r"^\s*#\[cfg\((test|all\((.*?,)?\s*test\s*[,)].*)\)\]")
+# `#[cfg(test)]`, or a bare `test` argument of `#[cfg(all(...))]`: compiled
+# only for tests. A test nested in `any(...)` is not test-only.
+CFG_ATTR = re.compile(r"^\s*#\[cfg\((.*)\)\]")
+
+
+def test_cfg(line: str) -> bool:
+    match = CFG_ATTR.match(line)
+    if match is None:
+        return False
+    expr = match.group(1).strip()
+    if expr == "test":
+        return True
+    if not (expr.startswith("all(") and expr.endswith(")")):
+        return False
+    args, start, depth = expr[4:-1], 0, 0
+    quoted = escaped = False
+    for i, char in enumerate(args):
+        if escaped:
+            escaped = False
+        elif quoted:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            if args[start:i].strip() == "test":
+                return True
+            start = i + 1
+    return args[start:].strip() == "test"
 
 
 def rust_test_file(path: str) -> bool:
@@ -59,7 +92,7 @@ def rust_test_file(path: str) -> bool:
 def inline_test_lines(lines: list[str]) -> int:
     n, i = 0, 0
     while i < len(lines):
-        if TEST_CFG.match(lines[i]):
+        if test_cfg(lines[i]):
             j = i + 1
             while j < len(lines) and (lines[j].strip().startswith("#[") or not lines[j].strip()):
                 j += 1
@@ -611,12 +644,14 @@ def self_test(repo_root: Path) -> None:
             git(repo, "remote", "add", "origin", str(repo))
             return repo, base_sha, head_sha
 
-        for i, attr in enumerate(('all(test, feature = "api")', "all(unix, test)")):
+        for i, attr in enumerate(('all(test, feature = "api")', "all(unix, test)",
+                     'all(test, any(feature = "api", unix))')):
             repo, b, h = cfg_fixture(root / f"cfgpos-{i}", attr)
             out = run_case(f"cfgcounted:{attr}", repo, b, h, expect=1)
             assert "delta = +5" in out and "net test-line growth" in out, out
         for i, attr in enumerate(('any(test, feature = "x")', 'feature = "test"',
-                     "all(feature = \"test-utils\", unix)")):
+                     "all(feature = \"test-utils\", unix)",
+                     'all(unix, any(feature = "api", test))')):
             repo, b, h = cfg_fixture(root / f"cfgneg-{i}", attr)
             out = run_case(f"cfgnotcounted:{attr}", repo, b, h, expect=0)
             assert "delta = +0" in out, out
