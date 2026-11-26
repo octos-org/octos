@@ -6392,6 +6392,7 @@ dependencies = [
  "octos-llm",
  "octos-memory",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

@@ -23,7 +23,8 @@ use eyre::Result;
 use octos_agent::tools::{ConcurrencyClass, Tool, ToolContext, ToolResult};
 use octos_core::SessionKey;
 use octos_fleet::{
-    AcceptanceCriterion, BASE_TOOLS, FsGrant, NetworkGrant, TaskSpec, Verifier, WorkerGrant,
+    AcceptanceCriterion, BASE_TOOLS, FailingTest, FsGrant, NetworkGrant, TaskSpec, Verifier,
+    WorkerGrant,
 };
 use serde_json::{Value, json};
 
@@ -63,7 +64,8 @@ fn is_peer_session(session_id: &SessionKey) -> bool {
 /// is an optional array of shell command strings, each mapped to a
 /// `CommandExit(0)` criterion (run as split argv, NO shell, by the worker's
 /// acceptance gate) — a task with no acceptance is vacuously accepted once its
-/// attempt ends.
+/// attempt ends. An optional `failing_test` command makes the task a coding
+/// goal (see [`parse_failing_test`]).
 fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
     let tasks = args
         .get("tasks")
@@ -105,7 +107,7 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
                     .collect()
             })
             .unwrap_or_default();
-        let acceptance = task
+        let mut acceptance: Vec<AcceptanceCriterion> = task
             .get("acceptance")
             .and_then(Value::as_array)
             .map(|criteria| {
@@ -126,6 +128,7 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
                     .collect()
             })
             .unwrap_or_default();
+        let failing_test = parse_failing_test(task.get("failing_test"), &task_id, &mut acceptance)?;
         let grant = parse_grant(task.get("grant"), &task_id)?;
         let inputs = octos_core::task_inputs::parse_declared_inputs(task.get("inputs"))
             .map_err(|err| format!("task `{task_id}`: {err}"))?;
@@ -137,9 +140,63 @@ fn parse_task_specs(args: &Value) -> Result<Vec<TaskSpec>, String> {
             acceptance,
             grant,
             inputs,
+            failing_test,
         });
     }
     Ok(out)
+}
+
+/// The acceptance-criterion id given to a `failing_test` that the task's
+/// `acceptance` list does not already contain.
+const FAILING_TEST_CRITERION: &str = "failing_test";
+
+/// Parse a task's `failing_test` command — the test the task exists to fix —
+/// into the fleet's [`FailingTest`]. The named test IS an acceptance criterion:
+/// if the same command is already listed under `acceptance` that criterion is
+/// named, otherwise one is appended. A task with no `failing_test` (absent or
+/// null) names none.
+///
+/// Only the SHAPE is checked here. Whether the task can be admitted on the
+/// test (it needs the full-trust grant, for the isolated worktree) is decided
+/// by the fleet when the plan is created, and whether the test really fails on
+/// the base revision by the worker before anything is edited.
+fn parse_failing_test(
+    value: Option<&Value>,
+    task_id: &str,
+    acceptance: &mut Vec<AcceptanceCriterion>,
+) -> Result<Option<FailingTest>, String> {
+    let value = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let cmd = value
+        .as_str()
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .ok_or_else(|| {
+            format!("task `{task_id}`: `failing_test` must be a non-empty command string")
+        })?;
+    let listed = acceptance.iter().find(|criterion| {
+        matches!(
+            &criterion.verifier,
+            Verifier::CommandExit { cmd: listed, code: 0 } if listed == cmd
+        )
+    });
+    let criterion = match listed {
+        Some(criterion) => criterion.id.clone(),
+        None => {
+            acceptance.push(AcceptanceCriterion {
+                id: FAILING_TEST_CRITERION.to_owned(),
+                description: format!("`{cmd}` fails on the base revision and exits 0 on the fix"),
+                verifier: Verifier::CommandExit {
+                    cmd: cmd.to_owned(),
+                    code: 0,
+                },
+            });
+            FAILING_TEST_CRITERION.to_owned()
+        }
+    };
+    Ok(Some(FailingTest { criterion }))
 }
 
 /// PR A — parse a task's optional operator `grant` object into a
@@ -588,8 +645,12 @@ impl Tool for GoalPlanTool {
         "Plan this session's goal as a durable fleet of background tasks. Call once early \
          with task IDs, titles, self-contained briefs, dependencies and acceptance checks; \
          then call goal_dispatch. Requires a live session; an existing fleet is returned \
-         unchanged. Workers run in isolated scratch directories, not your checkout: v1 \
-         supports self-contained local work, not in-repo or remote-mutating goals. \
+         unchanged. Workers never edit your checkout. By default a worker runs in an \
+         isolated scratch directory (self-contained local work). With fs=host and \
+         network.mode=full in a git workspace it works in its own git worktree on branch \
+         fleet/<fleet>/<task>: its commit there is the deliverable, interrupted work is \
+         recovered instead of redone, and acceptance is recorded against the delivered \
+         tree. Remote-mutating goals are not supported. \
          Grant only required capabilities. Defaults: base file tools, own scratch dir, \
          no network. network.mode=hosts allows web_fetch to listed hosts, not shell egress; \
          full allows raw egress. web_fetch/web_search require a network grant. fs=host \
@@ -630,6 +691,10 @@ impl Tool for GoalPlanTool {
                                 "description": "Shell commands (split argv, no shell) that must each exit 0 for the task to be accepted. Omit for a task with no mechanical check."
                             },
                             "inputs": octos_core::task_inputs::declared_inputs_schema(),
+                            "failing_test": {
+                                "type": "string",
+                                "description": "For a task that fixes a failing test: ONE test command (split argv, no shell) that FAILS now and must exit 0 once the task is done. Before any edit it is run on the base revision and the task is refused if it already passes. If an attempt is interrupted after the fix was written, the recovered work is verified and delivered without redoing it. Only for a git-worktree task: requires grant fs=host and network.mode=full, and a git workspace."
+                            },
                             "grant": {
                                 "type": "object",
                                 "description": "Optional operator capability grant for THIS task's worker. Omit for least privilege (today's closed worker: no network, base file tools, own scratch dir). Grant more only where needed.",
@@ -2016,5 +2081,104 @@ mod declared_inputs_tests {
                 "got: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(task: Value) -> Value {
+        json!({ "tasks": [task] })
+    }
+
+    fn full_trust() -> Value {
+        json!({ "fs": "host", "network": { "mode": "full" } })
+    }
+
+    #[test]
+    fn should_make_the_named_command_an_acceptance_criterion_when_task_names_a_failing_test() {
+        let tasks = parse_task_specs(&plan(json!({
+            "task_id": "fix",
+            "title": "Fix the failing test",
+            "failing_test": "  cargo test -p demo named_case  ",
+            "grant": full_trust(),
+        })))
+        .unwrap();
+
+        let task = &tasks[0];
+        let goal = task
+            .failing_test
+            .as_ref()
+            .expect("the task names its failing test");
+        assert_eq!(task.acceptance.len(), 1, "the named test IS the acceptance");
+        let admitted = &task.acceptance[0];
+        assert_eq!(admitted.id, goal.criterion);
+        assert_eq!(
+            admitted.verifier,
+            Verifier::CommandExit {
+                cmd: "cargo test -p demo named_case".to_owned(),
+                code: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn should_name_the_listed_criterion_when_failing_test_is_also_an_acceptance_command() {
+        let tasks = parse_task_specs(&plan(json!({
+            "task_id": "fix",
+            "title": "Fix the failing test",
+            "acceptance": ["cargo fmt --check", "cargo test -p demo named_case"],
+            "failing_test": "cargo test -p demo named_case",
+            "grant": full_trust(),
+        })))
+        .unwrap();
+
+        let task = &tasks[0];
+        assert_eq!(task.acceptance.len(), 2, "the command is not listed twice");
+        assert_eq!(
+            task.failing_test.as_ref().unwrap().criterion,
+            task.acceptance[1].id,
+        );
+    }
+
+    #[test]
+    fn should_leave_task_ordinary_when_no_failing_test_is_named() {
+        for task in [
+            json!({ "task_id": "a", "title": "t", "acceptance": ["true"] }),
+            json!({ "task_id": "a", "title": "t", "failing_test": null }),
+        ] {
+            let tasks = parse_task_specs(&plan(task)).unwrap();
+            assert_eq!(tasks[0].failing_test, None);
+        }
+    }
+
+    #[test]
+    fn should_reject_plan_when_failing_test_is_not_a_command_string() {
+        for bad in [json!(""), json!("   "), json!(42), json!(["cargo", "test"])] {
+            let err = parse_task_specs(&plan(json!({
+                "task_id": "fix",
+                "title": "Fix the failing test",
+                "failing_test": bad,
+                "grant": full_trust(),
+            })))
+            .unwrap_err();
+            assert!(
+                err.contains("fix") && err.contains("failing_test"),
+                "got: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn should_describe_failing_test_in_the_plan_tool_schema() {
+        let schema = GoalPlanTool::new("p").input_schema();
+        let field = &schema["properties"]["tasks"]["items"]["properties"]["failing_test"];
+        assert_eq!(field["type"], "string");
+        let description = field["description"].as_str().unwrap();
+        assert!(
+            description.contains("fs=host") && description.contains("network.mode=full"),
+            "the keeper must be told which grant a failing test needs: {description}",
+        );
     }
 }

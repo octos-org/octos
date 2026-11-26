@@ -82,6 +82,7 @@ pub fn task_spec_granted(
         acceptance,
         grant,
         inputs: Vec::new(),
+        failing_test: None,
     }
 }
 
@@ -224,6 +225,19 @@ pub fn git_ref_exists(repo: &Path, refname: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// `git worktree list --porcelain` for the repo at `repo`: every registered
+/// worktree with the branch it has checked out.
+pub fn git_worktree_list(repo: &Path) -> String {
+    use std::process::Command as StdCommand;
+    let out = StdCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git worktree list");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Whether `file` exists in the tree of `branch` in the repo at `repo` (i.e. a

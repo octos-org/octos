@@ -56,13 +56,16 @@ pub use grant::{
 pub use records::{
     AcceptanceCriterion, AcceptanceVerdict, Attempt, AttemptStatus, ChildResultSnapshot,
     ChildStatus, DecisionEntry, DecisionKind, DurablePlan, EscalationRequest, EvidenceRef,
-    FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease, OutboxEvent,
-    PlanTask, SCHEMA_VERSION, Verifier, WorkerKind,
+    FailingTest, FleetBudget, FleetChildRecord, FleetEventKind, FleetRecord, FleetStatus, Lease,
+    OutboxEvent, PlanTask, SCHEMA_VERSION, VerificationPhase, VerificationRecord,
+    VerificationRequest, VerificationResult, Verifier, WorkerKind, WorktreeBindRequest,
+    WorktreeBinding,
 };
 pub use sqlite_ledger::{
     Decision, Escalation, Finding, Goal, GoalLedger, Task, TaskSettleAuthority, digest_from_ledger,
 };
 pub use store::{
-    AckOutcome, CompleteOutcome, DenyEscalationOutcome, FleetKernelStore, FleetSnapshot,
-    InterruptedAttempt, LaunchOutcome, MarkRunningOutcome, PlanMutateOutcome, ReconcileReport,
+    AckOutcome, BeginVerification, BindWorktreeOutcome, CompleteOutcome, DenyEscalationOutcome,
+    FleetKernelStore, FleetSnapshot, InterruptedAttempt, LaunchOutcome, MarkRunningOutcome,
+    PlanMutateOutcome, ReconcileReport,
 };

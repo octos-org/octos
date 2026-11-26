@@ -134,3 +134,20 @@ Wrong owner/attempt/generation, healthy vs stale lease, exact cap/overflow, gran
 |---|---:|---|
 | `fleet::tests::should_keep_a_tasks_declared_inputs_through_the_plan_to_its_view` | 2 | A task's declared inputs survive the plan, the store and the view a worker is handed. |
 | `fleet::tests::should_read_and_write_a_task_without_inputs_as_before_inputs_existed` | 4 | A task without inputs is written as before the field existed, and a record from before it reads back. |
+
+## Worktree-task recovery across a host death (coding pilot, #3337)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `fleet::tests::should_persist_and_project_failing_test_when_spec_is_valid` | 2 | A task's failing test survives the plan and the store and reaches the view a worker is handed. |
+| `fleet::tests::should_reject_failing_test_and_write_nothing_when_admission_terms_are_invalid` | 5 | Table of five: a failing test that names a missing criterion, expects a non-zero exit, has an empty command, names a criterion that is not a command, or lacks the full-trust grant a worktree needs is refused, and nothing is written. |
+| `fleet::tests::should_reject_edit_when_added_task_names_an_invalid_failing_test` | 5 | The same check applies to a task added by a plan edit. |
+| `store::worktree::tests::should_keep_base_immutable_when_later_attempts_bind_again` | 4 | The base revision of a generation is recorded once: later attempts read it back and cannot move it, and the recorded directory changes only when an attempt marks its own as populated. |
+| `store::worktree::tests::should_bind_a_new_base_when_fleet_generation_changes` | 4 | A new plan generation binds a base of its own instead of inheriting the previous one. |
+| `store::worktree::tests::should_change_nothing_when_a_superseded_attempt_writes` | 3 | Binding, marking populated, beginning and committing a run from an attempt that lost the task change nothing, and the successor cannot commit the dead attempt's intent either. |
+| `store::worktree::tests::should_find_committed_result_when_same_run_is_looked_up_again` | 4 | A committed result is found again for the same phase, criterion, command, commit and tree. |
+| `store::worktree::tests::should_find_nothing_when_tree_commit_command_or_phase_differs` | 4 | A result is never reused for another tree, commit, command or phase. |
+| `store::worktree::tests::should_permit_a_rerun_when_the_prior_result_is_unknown` | 4 | An intent without a result is not a result: the run may be repeated, and the earlier unknown run is reported. |
+| `store::worktree::tests::should_not_reuse_result_when_process_was_ended_by_a_signal` | 4 | An outcome without an exit code is not a verdict to reuse. |
+| `store::worktree::tests::should_fail_when_marking_populated_without_a_binding` | 4 | A directory cannot be recorded as holding work before a base is bound. |
+| `store::worktree::tests::should_write_no_worktree_fields_when_child_never_ran_in_a_worktree` | 4 | A child that never ran in a worktree is written without the worktree and journal fields. |

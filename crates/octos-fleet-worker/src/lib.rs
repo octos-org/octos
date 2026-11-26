@@ -44,11 +44,14 @@ mod closed_registry;
 mod escalate;
 mod pool;
 mod worker;
+mod worktree_run;
 
 #[cfg(test)]
 mod first_inputs_tests;
 #[cfg(test)]
 mod testutil;
+#[cfg(test)]
+mod worktree_run_tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

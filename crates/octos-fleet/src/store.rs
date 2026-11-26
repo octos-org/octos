@@ -43,6 +43,10 @@ use uuid::Uuid;
 use crate::grant::WorkerGrant;
 use crate::records::*;
 
+mod worktree;
+
+pub use worktree::{BeginVerification, BindWorktreeOutcome};
+
 const FLEETS: TableDefinition<&str, &str> = TableDefinition::new("fleets");
 const FLEET_CHILDREN: TableDefinition<&str, &str> = TableDefinition::new("fleet_children");
 const ATTEMPTS: TableDefinition<&str, &str> = TableDefinition::new("attempts");
@@ -480,6 +484,8 @@ impl FleetKernelStore {
                         tokens_committed: 0,
                         deps: t.deps.clone(),
                         pending_escalation: None,
+                        worktree: None,
+                        verifications: Vec::new(),
                         generation: 0,
                         updated_at_ms: now_ms,
                     };
@@ -561,6 +567,8 @@ impl FleetKernelStore {
                     tokens_committed: 0,
                     deps,
                     pending_escalation: None,
+                    worktree: None,
+                    verifications: Vec::new(),
                     generation: fleet.generation,
                     updated_at_ms: now_ms,
                 };
@@ -1763,6 +1771,8 @@ impl FleetKernelStore {
                         tokens_committed: 0,
                         deps: task.deps.clone(),
                         pending_escalation: None,
+                        worktree: None,
+                        verifications: Vec::new(),
                         generation: new_gen,
                         updated_at_ms: now_ms,
                     };
@@ -2888,6 +2898,7 @@ mod tests {
             acceptance: vec![],
             grant: crate::grant::WorkerGrant::minimal(),
             inputs: vec![],
+            failing_test: None,
         }
     }
 

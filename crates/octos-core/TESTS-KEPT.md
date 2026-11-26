@@ -154,3 +154,20 @@
 | `task_inputs::tests::should_refuse_a_declaration_when_it_is_malformed` | 3 | A declaration that is not a list, lacks a path, or has an unknown field or a bad pin is refused naming the entry, never read as "no inputs". |
 | `task_inputs::tests::should_persist_a_plain_required_input_as_its_path_alone` | 4 | A persisted declaration round-trips, and a plain required input stays a bare path. |
 | `task_inputs::tests::should_name_every_input_and_its_reason_in_the_report_summary` | 5 | The report names every declared input as delivered or with its omission reason; none is dropped from it. |
+
+## Worktree-task recovery across a host death (coding pilot, #3337)
+
+| Test | Category | Property guarded |
+|---|---:|---|
+| `git_worktree::tests::should_find_a_recorded_checkout_recoverable_wherever_its_head_was_left` | 4 | A recorded directory that is still a worktree of the repository can be committed from with its HEAD on the task branch, detached, or on another branch; looking at it changes nothing. |
+| `git_worktree::tests::should_tell_a_recorded_checkout_that_is_gone_from_one_git_cannot_commit_from` | 4 | Nothing on disk, or an empty directory, is gone. Files in a directory git does not know, or in a worktree that lost its `.git` file, are unrecoverable — and are not removed. |
+| `git_worktree::tests::should_commit_the_directory_to_the_task_branch_when_head_is_not_on_it` | 4 | From a detached HEAD or another branch, the snapshot puts the directory's content on the task branch as one commit on top of its head, and moves neither HEAD nor the other branch; an unchanged directory commits nothing. |
+| `git_worktree::tests::should_snapshot_leftover_work_when_dead_writer_left_an_index_lock` | 4 | An `index.lock` a killed host left does not block the snapshot. |
+| `git_worktree::tests::should_add_a_second_checkout_of_the_branch_when_an_earlier_one_still_holds_work` | 4 | A second checkout of the task branch is created beside one that still holds uncommitted work, without touching it; once that work is committed and the old directory retired, the new one holds it. |
+| `git_worktree::tests::should_return_commit_and_its_tree_when_branch_exists` | 4 | The tree a receipt is bound to is the tree of the commit just read; a missing branch is an error, never an empty digest. |
+| `git_worktree::tests::should_name_every_directory_of_a_task_after_its_stem` | 4 | No two work checkouts share a directory, and only `<stem>.work-…` siblings count as this task's. |
+| `git_worktree::tests::should_remove_only_this_tasks_leftover_checkouts_when_sweeping` | 4 | The sweep removes this task's leftovers — a registered work checkout and a clean checkout — keeps the one it is told to, and touches neither another task whose id starts the same way nor the bare stem. |
+| `git_worktree::tests::should_check_out_the_commits_own_bytes_when_the_repository_plants_a_filter` | 3 | With a smudge filter, the attribute line that applies it and a `post-checkout` hook planted in the task repository's `.git`, a clean checkout holds the commit's own bytes and runs no hook — while a worktree of that repository is rewritten by the same filter. |
+| `git_worktree::tests::should_refuse_a_clean_checkout_command_it_cannot_write_safely` | 3 | A ref name, an abbreviation or an option in place of a full object id is refused, and so is an object store path that is relative or holds a line break; the path is quoted for the shell. |
+| `git_worktree::tests::should_tell_a_regular_file_in_a_commit_from_everything_else` | 3 | Only a regular file in the commit satisfies a file criterion — not a directory, a symlink, an untracked file or a glob; an absolute path, a `..` path and a ref name are errors. |
+| `git_worktree::tests::should_refuse_to_inspect_a_recorded_checkout_whose_path_is_a_symlink` | 3 | A recorded path that is a symlink is refused, as creating a checkout through one is. |

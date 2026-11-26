@@ -15,6 +15,13 @@
 //! 6. records the real outcome + snapshot to the store, then unblocks
 //!    dependents.
 //!
+//! An attempt in a git WORKTREE has exactly one way to run, wrapped around
+//! steps 2–5 by [`crate::worktree_run`]: before the agent, admission binds the
+//! immutable base revision and recovers whatever an interrupted attempt left in
+//! the checkout (it is never reset); after the agent, the checkout is committed
+//! and the gate verifies that committed tree, leaving a receipt bound to it. A
+//! SCRATCH attempt has no tree: its gate checks its working directory.
+//!
 //! # Known v1 limitations (documented, not yet fixed)
 //!
 //! - **Token under-commit on non-success paths (P2-2).** A timeout or infra
@@ -40,7 +47,7 @@
 //!   hostile concurrent mutator of the task's own workspace.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,30 +60,39 @@ use octos_agent::workspace_policy::{Validator, ValidatorPhaseKind, ValidatorSpec
 use octos_core::{Message, Task, TaskContext, TaskKind, TaskResult, TokenUsage};
 use octos_fleet::{
     AcceptanceVerdict, ChildResultSnapshot, CompleteOutcome, EscalationRequest, EvidenceRef, Fleet,
-    FleetKernelStore, MarkRunningOutcome, TaskView, Verifier,
+    FleetKernelStore, MarkRunningOutcome, TaskView, Verifier, WorktreeBinding,
 };
 
 use crate::escalate::EscalationSlot;
+use crate::worktree_run::{Admission, KillPoint, Stop, WorktreeRun, kill_point};
 use crate::{AgentFactory, SandboxGrant};
 
 /// The controller-repo context for a WORKTREE attempt, threaded into
-/// [`run_attempt`] so it can land the deliverable on the task branch before
-/// completion and refuse to record a phantom success on an EMPTY branch. `None`
-/// for the scratch fallback (no worktree, no branch).
+/// [`run_attempt`] so it can bind the task branch's base revision, recover and
+/// verify the work in the checkout, and refuse to record a phantom success on
+/// an unchanged tree. `None` for the scratch fallback (no worktree, no branch).
 #[derive(Debug, Clone)]
 pub struct WorktreeContext {
     /// Canonical controller repository root.
     pub repo_root: PathBuf,
     /// The task-stable `fleet/<fleet>/<task>` branch the checkout is on.
     pub branch: String,
-    /// The branch head captured at prepare — the base the deliverable must
-    /// advance past for the attempt to count as having produced work.
-    pub base_commit: String,
     /// The repository's `.git` common dir (objects/refs/worktree-admin), OUTSIDE
     /// the checkout cwd. Threaded into the sandbox grant (`repo_git_dir`) so the
     /// worker's `git commit` can rw the ONLY path beyond its cwd it needs — a
     /// TARGETED bind, not full-`/`.
     pub git_dir: PathBuf,
+    /// The pool's `fleet-work` root. Every directory of this task lies under it,
+    /// and nothing is created or removed outside it.
+    pub work_root: PathBuf,
+    /// `<work_root>/<fleet>/<task>`: the name every directory of this task
+    /// starts with. A clean checkout for a verification is `<stem>.verify-…`.
+    pub stem: PathBuf,
+    /// The directory an INTERRUPTED attempt of this generation worked in, when
+    /// it may still hold work that attempt never committed. This attempt does
+    /// not work there: it commits what the directory holds, retires it, and
+    /// continues in its own. `None` when there is nothing to recover.
+    pub recover_from: Option<PathBuf>,
 }
 
 /// Settle an escalation NON-terminally via the store's four-part fence, mapping
@@ -184,8 +200,8 @@ pub async fn run_attempt(
     working_dir: &Path,
     // Some(ctx) when this attempt runs in a git worktree (the pool allocated one
     // for a `FsGrant::Host` task on a git controller root under a supporting
-    // backend); None for the scratch-cwd fallback. Drives the deliverable
-    // auto-commit + empty-branch reject.
+    // backend); None for the scratch-cwd fallback. A worktree attempt is
+    // bound, recovered and verified by `worktree_run`.
     worktree: Option<&WorktreeContext>,
     deadline: Duration,
     owner_epoch: u64,
@@ -248,6 +264,9 @@ pub async fn run_attempt(
              an empty branch with no changes counts as NO deliverable.)\n",
         );
     }
+    // (A worktree attempt that resumes recovered work appends a note to the
+    // brief before step 3a builds the Task from it.)
+    let attempt_started = Instant::now();
 
     // The sandbox scope comes from THIS task's grant (projected fresh per
     // attempt), not a hardcode:
@@ -279,7 +298,7 @@ pub async fn run_attempt(
     // agent's granted registry AND the acceptance validators — so a
     // non-idempotent factory can never sandbox the agent while handing the
     // validators a weaker (e.g. no-op) sandbox.
-    let sandbox = factory.sandbox_for(working_dir, grant);
+    let sandbox = factory.sandbox_for(working_dir, grant.clone());
 
     // PR B — the agent folds each response's cumulative spend into `tracker` (via
     // `run_task_with_tracker`), so an escalation that ends on the TIMEOUT /
@@ -315,6 +334,30 @@ pub async fn run_attempt(
     let worktree_backend_ok =
         worktree.is_none() || (sandbox.supports_repo_git_write() && sandbox.runs_posix_sh());
 
+    // EVERY worktree attempt takes the recover-and-verify path (see
+    // `worktree_run`): there is no other way to run a task in a worktree. A
+    // scratch attempt (`worktree = None`) has no tree to bind and none of this.
+    let tree_run = worktree.map(|worktree| WorktreeRun {
+        store: &store,
+        fleet_id,
+        task_id,
+        attempt_id,
+        owner_epoch,
+        task_view,
+        admitted_test: task_view.failing_test.as_ref(),
+        worktree,
+        sandbox: &sandbox,
+        checkout: working_dir,
+        factory,
+        grant: &grant,
+        clean_checkouts: AtomicUsize::new(0),
+        clock: &actual_now_ms,
+    });
+
+    // The base a worktree attempt was admitted against; set by `stage_tree`
+    // when the agent is to run, and read back by the verification after it.
+    let mut bound_base: Option<WorktreeBinding> = None;
+
     let computed = if sandbox.is_noop() {
         tracing::error!(
             %fleet_id, %task_id, %attempt_id,
@@ -340,14 +383,47 @@ pub async fn run_attempt(
             "worktree attempt: resolved sandbox no longer supports full-FS write or POSIX sh"
                 .to_string(),
         )
-    } else if let Some(reason) = populate_worktree(worktree, &sandbox, working_dir, deadline).await
-    {
+    } else if task_view.failing_test.is_some() && worktree.is_none() {
+        // The pool refuses to dispatch a task that names a failing test without
+        // a worktree; this is the same refusal for any other caller. In a
+        // scratch directory there is no base revision for the test to fail on.
         tracing::error!(
-            %fleet_id, %task_id, %attempt_id, %reason,
-            "fleet worker: worktree populate failed; terminating the attempt",
+            %fleet_id, %task_id, %attempt_id,
+            "fleet worker: task names a failing test but has no git worktree; terminating the \
+             attempt",
         );
-        Computed::terminated(reason)
+        Computed::terminated(
+            "a task that names a failing test requires an isolated git worktree".to_string(),
+        )
+    } else if let Some(staged) =
+        stage_tree(tree_run.as_ref(), deadline, &mut brief, &mut bound_base).await
+    {
+        match staged {
+            Staged::Stop(outcome) => return outcome,
+            Staged::Settled(computed) => {
+                if let Some(reason) = &computed.error {
+                    tracing::error!(
+                        %fleet_id, %task_id, %attempt_id, %reason,
+                        "fleet worker: attempt settled before the agent ran",
+                    );
+                }
+                computed
+            }
+        }
+    } else if tree_run.is_some() && deadline <= attempt_started.elapsed() {
+        Computed::terminated(format!(
+            "deadline exceeded after {}s, before the agent could start",
+            deadline.as_secs()
+        ))
     } else {
+        // A worktree attempt has already spent part of the deadline on
+        // admission, so its agent gets what is left; a scratch attempt spent
+        // nothing and gets the full deadline.
+        let deadline = if tree_run.is_some() {
+            deadline.saturating_sub(attempt_started.elapsed())
+        } else {
+            deadline
+        };
         // 3. Fresh, granted-registry agent (cannot park, cannot fan out; holds
         //    EXACTLY the operator-granted tools) under the shared sandbox. Its
         //    per-tool timeouts AND per-command shell ceiling are clamped to
@@ -493,33 +569,41 @@ pub async fn run_attempt(
                             .checked_sub(elapsed)
                             .unwrap_or(Duration::ZERO)
                             .max(ACCEPTANCE_MIN_BUDGET);
-                        let (verdict, error) = run_acceptance(
-                            task_view,
-                            working_dir,
-                            factory,
-                            sandbox.clone(),
-                            deadline.as_secs().max(1),
-                            remaining,
-                        )
-                        .await;
-                        // For a worktree attempt that PASSED acceptance, land the
-                        // deliverable on the branch (auto-commit any uncommitted
-                        // checkout changes INSIDE the worker's sandbox — §4b) and
-                        // REQUIRE the branch to have advanced; an accepted run
-                        // that left an EMPTY branch produced no deliverable and
-                        // must not be recorded a success. The scratch fallback
-                        // (no worktree) passes through unchanged.
-                        let (verdict, error) = settle_worktree_deliverable(
-                            verdict,
-                            error,
-                            worktree,
-                            &sandbox,
-                            working_dir,
-                            task_id,
-                            deadline,
-                        )
-                        .await;
-                        Computed::from_verdict(verdict, error, &result)
+                        match (tree_run.as_ref(), bound_base.as_ref()) {
+                            // A worktree attempt: the checkout is committed
+                            // (INSIDE the worker's sandbox — §4b), that commit
+                            // is checked in a clean checkout of its own, and
+                            // each command leaves a receipt bound to it. A tree
+                            // with no change relative to the base is NO
+                            // deliverable (`worktree_run`).
+                            (Some(run), Some(base)) => match run.verify(base, remaining).await {
+                                Ok((verdict, error)) => {
+                                    Computed::from_verdict(verdict, error, &result)
+                                }
+                                Err(Stop(outcome)) => return outcome,
+                            },
+                            // The agent only runs on a worktree after admission
+                            // bound its base, so this cannot happen. If it ever
+                            // does, there is nothing to verify against: fail
+                            // closed rather than accept an unbound tree.
+                            (Some(_), None) => Computed::terminated(
+                                "worktree attempt has no bound base revision".to_string(),
+                            ),
+                            // A scratch attempt: the mechanical gate over its
+                            // working directory.
+                            (None, _) => {
+                                let (verdict, error) = run_acceptance(
+                                    task_view,
+                                    working_dir,
+                                    factory,
+                                    sandbox.clone(),
+                                    deadline.as_secs().max(1),
+                                    remaining,
+                                )
+                                .await;
+                                Computed::from_verdict(verdict, error, &result)
+                            }
+                        }
                     }
                 }
             }
@@ -529,6 +613,9 @@ pub async fn run_attempt(
     // An escalation (if any) was already settled + returned INSIDE the agent arm
     // above, BEFORE acceptance ran — so reaching here means the turn did NOT
     // escalate and the normal verdict applies.
+    // (Test-only: a test can stop the attempt here, as if the host had been
+    // killed after the verdict was computed and before it was committed.)
+    kill_point(&store, KillPoint::BeforeCompletion).await;
     let now = actual_now_ms();
 
     // 7. Record the real outcome + snapshot to the store DIRECTLY (not
@@ -579,6 +666,50 @@ pub async fn run_attempt(
     }
 }
 
+/// What bringing the working tree to a known state decided, when it decided
+/// anything other than "run the agent".
+enum Staged {
+    /// A store fence was lost or the store failed; return this outcome as-is.
+    Stop(AttemptOutcome),
+    /// The attempt is settled without running the agent.
+    Settled(Computed),
+}
+
+/// Bring the attempt's working tree to a known state before the agent runs.
+/// `None` means "run the agent".
+///
+/// - A scratch attempt has no tree to stage.
+/// - A worktree attempt runs its admission (see [`crate::worktree_run`]), which
+///   may settle the attempt outright — refused, terminated, or already verified
+///   from recovered work with no model call. When the agent is to run, the base
+///   it was admitted against is left in `bound_base`, and a resume note (if
+///   any) is appended to `brief`.
+async fn stage_tree<C: Fn() -> u64>(
+    tree_run: Option<&WorktreeRun<'_, C>>,
+    deadline: Duration,
+    brief: &mut String,
+    bound_base: &mut Option<WorktreeBinding>,
+) -> Option<Staged> {
+    let run = tree_run?;
+    match run.admit(deadline).await {
+        Err(Stop(outcome)) => Some(Staged::Stop(outcome)),
+        Ok(Admission::Settled {
+            verdict,
+            error,
+            output,
+        }) => Some(Staged::Settled(Computed::settled_without_agent(
+            verdict, error, output,
+        ))),
+        Ok(Admission::RunAgent { base, resume }) => {
+            if let Some(note) = resume {
+                brief.push_str(&note);
+            }
+            *bound_base = Some(base);
+            None
+        }
+    }
+}
+
 /// The verdict plus the fields fed into the [`ChildResultSnapshot`].
 struct Computed {
     verdict: AcceptanceVerdict,
@@ -613,6 +744,22 @@ impl Computed {
             files: files_to_strings(result),
             error: Some(reason),
             actual_tokens: total_tokens(&result.token_usage),
+        }
+    }
+
+    /// An attempt settled without running the agent: no model was called, so
+    /// no tokens are committed and no files are attributed to a run.
+    fn settled_without_agent(
+        verdict: AcceptanceVerdict,
+        error: Option<String>,
+        output: String,
+    ) -> Self {
+        Self {
+            verdict,
+            output,
+            files: Vec::new(),
+            error,
+            actual_tokens: 0,
         }
     }
 
@@ -1001,8 +1148,9 @@ const WORKTREE_GIT_OP_DEADLINE: Duration = Duration::from_secs(120);
 /// Build the sandboxed git-op command: wrap it in the worker's sandbox, put it in
 /// its own process group (so the timeout can group-kill a detached filter/hook
 /// child), STRIP controller secrets from its environment, and keep git away
-/// from every configuration outside the repository.
-fn sandboxed_git_command(
+/// from every configuration outside the repository. A worktree attempt's
+/// acceptance commands are built the same way, for the same reasons.
+pub(crate) fn sandboxed_git_command(
     sandbox: &Arc<dyn Sandbox>,
     cwd: &Path,
     shell_cmd: &str,
@@ -1053,7 +1201,7 @@ fn sandboxed_git_command(
 ///
 /// `Err` also on a spawn failure or a DEADLINE (the child + its group are
 /// SIGTERM→SIGKILL'd).
-async fn run_sandboxed_git(
+pub(crate) async fn run_sandboxed_git(
     sandbox: &Arc<dyn Sandbox>,
     cwd: &Path,
     shell_cmd: &str,
@@ -1092,110 +1240,22 @@ async fn run_sandboxed_git(
 /// codex fix #5 — POPULATE a `--no-checkout` worktree's working tree INSIDE the
 /// worker's sandbox (via `git reset --hard`), so a worker-planted local smudge
 /// filter runs at the WORKER's grant (contained), never host-side as the daemon
-/// during the controller's `git worktree add`. Returns `None` on success (or the
-/// scratch fallback, `worktree = None`); `Some(reason)` on failure/timeout, so
-/// the caller terminates the attempt rather than run the agent in an empty tree.
-async fn populate_worktree(
-    worktree: Option<&WorktreeContext>,
+/// during the controller's `git worktree add`. Returns `None` on success;
+/// `Some(reason)` on failure/timeout, so the caller terminates the attempt
+/// rather than run the agent in an empty tree. Only for a checkout the
+/// controller just created empty — a directory that holds an attempt's work is
+/// never reset.
+pub(crate) async fn populate_worktree(
     sandbox: &Arc<dyn Sandbox>,
     checkout: &Path,
     deadline: Duration,
 ) -> Option<String> {
-    worktree?;
     let cmd = octos_core::worktree_populate_command();
     // require_success = true (fix 4): a non-zero `git reset --hard` left the tree
     // unpopulated — FAIL the attempt rather than run the agent in an empty tree.
     match run_sandboxed_git(sandbox, checkout, &cmd, deadline, true).await {
         Ok(()) => None,
         Err(err) => Some(format!("worktree populate failed: {err}")),
-    }
-}
-
-/// Land + verify a WORKTREE attempt's deliverable. For an `Accepted` verdict
-/// with a worktree context: run the auto-commit fallback (`git add -A &&
-/// git commit`) INSIDE the worker's sandbox — so a worker-planted local-config
-/// `filter.*`/commit hook triggered by it runs at the WORKER's network grant
-/// (contained), NOT host-side with the controller's network (§4b, mixed-grant
-/// escape dissolution) — then REQUIRE the branch to have advanced past its base:
-///
-/// - branch advanced → keep `Accepted` (the deliverable is durable on the
-///   branch, which survives the later checkout removal);
-/// - branch UNCHANGED (empty) → downgrade to `Rejected` — an accepted run that
-///   produced no commit is not a real deliverable and must not be recorded a
-///   success on an empty `fleet/*` branch;
-/// - branch-read ERROR (infra) → `Terminated`.
-///
-/// The commit command's own exit code is NOT gated on: a clean tree is a
-/// deliberate no-op (exit 0), and a worker's own broken filter (contained) must
-/// not be an infra error — the authoritative check is whether the branch
-/// advanced, read host-side (hooks-disabled). A non-`Accepted` verdict, or the
-/// scratch fallback (`worktree = None`), passes through unchanged.
-async fn settle_worktree_deliverable(
-    verdict: AcceptanceVerdict,
-    error: Option<String>,
-    worktree: Option<&WorktreeContext>,
-    sandbox: &Arc<dyn Sandbox>,
-    checkout: &Path,
-    task_id: &str,
-    deadline: Duration,
-) -> (AcceptanceVerdict, Option<String>) {
-    let Some(ctx) = worktree else {
-        return (verdict, error);
-    };
-    if !matches!(verdict, AcceptanceVerdict::Accepted { .. }) {
-        return (verdict, error);
-    }
-
-    // (b) Auto-commit any uncommitted deliverable INSIDE the worker's sandbox,
-    // BOUNDED by a deadline with a cancellation-safe process-group kill (codex
-    // fix #4): a worker-planted clean/process filter or `post-commit` hook fired
-    // here must not HANG forever (retaining pool permits + leaving the child
-    // Running). A clean tree is a no-op. A spawn failure or a DEADLINE is infra
-    // → Terminated; a non-zero EXIT is not gated on (the branch-advance check
-    // below is authoritative).
-    let message = format!("fleet {task_id} deliverable");
-    let commit_cmd = octos_core::deliverable_commit_command(&message);
-    // require_success = false: the commit's exit code is NOT authoritative (a
-    // clean tree no-ops at exit 0; a worker's own broken filter is contained, not
-    // infra). The branch-advance check below is the authority.
-    if let Err(err) = run_sandboxed_git(sandbox, checkout, &commit_cmd, deadline, false).await {
-        let reason = format!("worktree deliverable auto-commit failed: {err}");
-        tracing::error!(%reason, "fleet worker: deliverable auto-commit error");
-        return (
-            AcceptanceVerdict::Terminated {
-                reason: reason.clone(),
-            },
-            Some(reason),
-        );
-    }
-
-    // Authoritative: did the branch advance past its base? (Read host-side,
-    // hooks-disabled — a read-only `rev-parse`, no code-exec surface.)
-    match octos_core::branch_advanced_past(&ctx.repo_root, &ctx.branch, &ctx.base_commit) {
-        Ok(true) => (verdict, error),
-        Ok(false) => {
-            let reason = format!(
-                "accepted run left an EMPTY fleet branch — no commit / no changes to commit \
-                 for task {task_id}; refusing to record a phantom deliverable"
-            );
-            tracing::warn!(%reason, "fleet worker: empty worktree deliverable");
-            (
-                AcceptanceVerdict::Rejected {
-                    reason: reason.clone(),
-                },
-                Some(reason),
-            )
-        }
-        Err(err) => {
-            let reason = format!("worktree deliverable branch check failed: {err}");
-            tracing::error!(%reason, "fleet worker: deliverable branch check error");
-            (
-                AcceptanceVerdict::Terminated {
-                    reason: reason.clone(),
-                },
-                Some(reason),
-            )
-        }
     }
 }
 
@@ -1216,7 +1276,7 @@ async fn settle_worktree_deliverable(
 /// single-writer-per-task-workspace assumption (see the module "Known v1
 /// limitations"); it is a point-in-time confinement, not a race-proof absolute
 /// guarantee against a hostile concurrent mutator of the task's own workspace.
-fn check_file_exists_confined(
+pub(crate) fn check_file_exists_confined(
     workspace_root: &Path,
     path: &str,
 ) -> Result<Option<PathBuf>, String> {
@@ -1489,8 +1549,10 @@ mod tests {
         let dummy_worktree = || WorktreeContext {
             repo_root: std::path::PathBuf::from("/nonexistent-repo"),
             branch: "fleet/f1/a".to_string(),
-            base_commit: "0000000".to_string(),
             git_dir: std::path::PathBuf::from("/nonexistent-repo/.git"),
+            work_root: std::path::PathBuf::from("/nonexistent-work"),
+            stem: std::path::PathBuf::from("/nonexistent-work/f1/a"),
+            recover_from: None,
         };
 
         // Minimal grant, scratch (no worktree) → no raw egress, cwd-only.
