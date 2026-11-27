@@ -69,6 +69,14 @@ rewritten. Landlock, AppContainer and no-sandbox refusal semantics are
 unchanged. Refusal text now distinguishes a **read path** that contains a
 hidden root from the command workspace itself and names the path to narrow.
 
+On Windows, Docker mount sources produced by canonicalization are normalized
+from verbatim drive/UNC forms (`\\?\C:\…`, `\\?\UNC\server\share\…`) to the
+plain forms Docker Desktop accepts. The workspace cwd, `extra_binds` and cache
+slot all validate and mount the normalized source while hidden-root checks
+keep the original host path; bind destinations and read-only modes are
+preserved. Device paths, drive-relative or malformed UNC paths, extra colons
+and control characters still fail closed (#3385).
+
 The refusal names the missing path and the available recovery action. Restore
 the original directory, or have an operator verify deletion and unregister a
 legacy root through the repair flow; do not bypass the hidden-folder check.
