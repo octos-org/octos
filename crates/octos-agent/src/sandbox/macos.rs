@@ -742,6 +742,9 @@ mod tests {
     use super::*;
 
     /// The SBPL profile a config produces, straight off the wrapped command.
+    /// Off-target the Macos backend arm fails closed with a refusal command
+    /// (no `-p` profile), so the policy-text tests below cannot run there.
+    #[cfg(not(target_os = "windows"))]
     fn sbpl_profile(read_allow_paths: &[&str], strict: bool, cwd: &Path) -> String {
         let config = crate::sandbox::SandboxConfig {
             read_allow_paths: read_allow_paths.iter().map(|p| (*p).to_owned()).collect(),
@@ -765,6 +768,7 @@ mod tests {
     /// bare global `(allow file-read*)` line, while the workspace and the
     /// granted paths are covered. The legacy unconfigured empty list keeps
     /// the documented global-read default for the raw CLI path.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn should_never_widen_derived_read_grants_to_a_global_read() {
         let temp = tempfile::tempdir().unwrap();
