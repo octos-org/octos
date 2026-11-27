@@ -1302,17 +1302,19 @@ pub(crate) async fn g1_raise_approval(
     panic!("the approval never became pending");
 }
 
-/// Poll `f` until it yields, or panic. 30s: heavily loaded CI runners run
-/// these suites ~5x slower than a dev box, and the IM approval tests chain
-/// several async hops (raise → ledger broadcast → watch task → channel).
-pub(crate) async fn until_some<T>(mut f: impl FnMut() -> Option<T>) -> T {
+/// Poll `f` until it yields, or panic naming `what` — the label travels in
+/// the CI log, so a hung wait says WHICH hop never fired instead of an
+/// anonymous "it never happened". 30s: heavily loaded CI runners run these
+/// suites ~5x slower than a dev box, and the IM approval tests chain several
+/// async hops (raise → ledger broadcast → watch task → channel).
+pub(crate) async fn until_some<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     for _ in 0..3000 {
         if let Some(done) = f() {
             return done;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("it never happened");
+    panic!("it never happened: {what}");
 }
 
 /// An IM approval-button press for `nonce`; `decision` is "a" or "d".

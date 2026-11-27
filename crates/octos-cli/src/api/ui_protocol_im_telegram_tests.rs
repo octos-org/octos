@@ -264,7 +264,7 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     )
     .await;
     let im = im.unwrap();
-    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 2)).await;
+    let sends = until_some("sends==2", || Some(fake.sends()).filter(|s| s.len() == 2)).await;
     assert!(sends.contains(&(ME, "reply: hello".into(), Some(50), true)));
     let refused = "This chat is not linked to octos.".to_owned();
     assert!(sends.contains(&(GROUP, refused, Some(51), true)));
@@ -274,15 +274,15 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
         let told = polls.iter().position(|offset| *offset == 52)?;
         (polls.len() > told + 1).then_some(())
     };
-    until_some(polled_since).await;
+    until_some("poll cadence", polled_since).await;
     // After a quiet week Telegram numbers the next update at random, here
     // below the last offset: it still reaches the bridge before it is told.
     // The unlinked group, told once, is not told again.
     fake.push(update(6, GROUP, "group", "hello again"));
     fake.push(update(7, ME, "private", "a week later"));
-    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 3)).await;
+    let sends = until_some("sends==3", || Some(fake.sends()).filter(|s| s.len() == 3)).await;
     assert_eq!(sends[2], (ME, "reply: a week later".into(), Some(7), true));
-    until_some(|| fake.asked_from(8).then_some(())).await;
+    until_some("answer u8", || fake.asked_from(8).then_some(())).await;
     drop(im);
     drop(fx);
 
@@ -303,8 +303,9 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     )
     .await;
     let _im = im.unwrap();
-    until_some(|| fake.asked_from(53).then_some(())).await;
-    let sends = until_some(|| Some(fake.sends()).filter(|s| !s.is_empty())).await;
+    until_some("answer u53", || fake.asked_from(53).then_some(())).await;
+    let nonempty = || Some(fake.sends()).filter(|s| !s.is_empty());
+    let sends = until_some("sends nonempty", nonempty).await;
     assert_eq!(sends, [(ME, "reply: again".into(), Some(52), true)]);
     let prompts = llm.prompts.lock().unwrap().clone();
     assert_eq!(prompts, ["hello", "a week later", "again"]);
@@ -334,7 +335,7 @@ async fn a_rate_limited_refusal_does_not_hold_up_the_next_stop() {
     )
     .await;
     let _im = im.unwrap();
-    let sends = until_some(|| Some(fake.sends()).filter(|s| s.len() == 2)).await;
+    let sends = until_some("sends==2", || Some(fake.sends()).filter(|s| s.len() == 2)).await;
     let answered: Vec<_> = sends.iter().map(|s| (s.0, s.2)).collect();
     assert_eq!(answered, [(GROUP, Some(70)), (ME, Some(71))]);
 }
@@ -440,13 +441,13 @@ async fn neither_an_unreadable_update_nor_a_panic_holds_up_the_bot_and_it_is_pol
         };
         poll_with(&bot, handle, |_| async {}).await
     });
-    until_some(|| fake.asked_from(64).then_some(())).await;
+    until_some("answer u64", || fake.asked_from(64).then_some(())).await;
     assert_eq!(*seen.lock().unwrap(), ["one", "panic", "two"]);
     let polls = fake.times("getUpdates");
     assert!(polls[1] - polls[0] >= Duration::from_secs(2));
     // The next batch is handled too, and the bot never had two polls.
     fake.push(update(65, ME, "private", "three"));
-    until_some(|| fake.asked_from(66).then_some(())).await;
+    until_some("answer u66", || fake.asked_from(66).then_some(())).await;
     assert_eq!(
         seen.lock().unwrap().last().map(String::as_str),
         Some("three")

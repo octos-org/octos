@@ -572,7 +572,7 @@ async fn held_turn(
 
 /// The `at`-th projected approval's nonce (projections accumulate).
 async fn projected(channel: &FakeChannel, at: usize) -> String {
-    until_some(|| {
+    until_some("approval button projection", || {
         let buttoned = channel.buttoned.lock().unwrap();
         Some(buttoned.get(at)?.1[0].strip_prefix(CALLBACK_PREFIX)?[..16].to_owned())
     })
@@ -580,7 +580,7 @@ async fn projected(channel: &FakeChannel, at: usize) -> String {
 }
 
 async fn sent_with(channel: &FakeChannel, needle: &str) {
-    until_some(|| {
+    until_some("channel send/edit", || {
         let sent = channel.sent.lock().unwrap();
         sent.iter().any(|(_, t, _)| t.contains(needle)).then_some(())
     })
