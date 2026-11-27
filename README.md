@@ -405,6 +405,7 @@ Follow one Calendar request through admission, Tokio tasks, a host tool and its 
 - [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
 - [Progress feedback and opt-in periodic reflection](docs/event-driven-reflection.md)
 - [Running from source with live patching (experimental)](docs/JIT_DEV_MODE.md)
+- [GitHub Action: mentions, prompts and pull request watch](action/README.md)
 - [Documentation site](https://octos-org.github.io/octos/)
 
 ## Contributing

@@ -1,0 +1,279 @@
+name: Octos
+description: >-
+  Run the Octos agent on issues and pull requests: answer a mention, review a
+  pull request with line comments, run a fixed prompt, or watch a pull request
+  and fix CI failures and review comments.
+author: octos-org
+branding:
+  icon: message-circle
+  color: purple
+
+inputs:
+  prompt:
+    description: >-
+      Instructions for a run without a mention, for example issue triage or a
+      scheduled report. When set, the action runs on every event that reaches it.
+    required: false
+    default: ""
+  trigger_phrase:
+    description: Text that calls Octos in an issue, a pull request, a comment or a review.
+    required: false
+    default: "@octos"
+  label_trigger:
+    description: A label that asks Octos to work on the issue or pull request it is put on.
+    required: false
+    default: ""
+  watch_label:
+    description: >-
+      Pull requests with this label are watched: Octos reacts to failed CI runs
+      and to reviews from maintainers. `@octos watch` and `@octos unwatch` set
+      and remove it.
+    required: false
+    default: octos-watch
+  access:
+    description: >-
+      `read` lets Octos read the checkout and answer. `write` also lets it edit
+      files, which the action commits and pushes: to the pull request's branch,
+      or to a new branch for an issue. Only people with write access get `write`.
+    required: false
+    default: read
+  comment:
+    description: >-
+      Post the answer as a comment. With `false` the answer goes to the run
+      summary and the `result` output only.
+    required: false
+    default: "true"
+  allowed_non_write_users:
+    description: >-
+      Logins without write access that may start a run, comma separated, or `*`.
+      Their runs are always read-only.
+    required: false
+    default: ""
+  allowed_bots:
+    description: Bot logins that may start a run, comma separated, or `*`. Their runs are always read-only.
+    required: false
+    default: ""
+  allowed_tools:
+    description: >-
+      Octos tools or tool groups to allow on top of files, shell and search, for
+      example `group:web`. `*` lifts the list. Ignored when `config_file` has
+      its own `tool_policy`.
+    required: false
+    default: ""
+  max_fix_attempts:
+    description: How many automatic fix commits Octos may add to one watched pull request.
+    required: false
+    default: "3"
+  auto_review:
+    description: >-
+      Review a pull request when it is opened, reopened, marked ready or pushed
+      to, as far as the workflow lets these events through. Drafts and pull
+      requests from forks are left to the `@octos review` command.
+    required: false
+    default: "false"
+  branch_prefix:
+    description: Prefix of the branch Octos pushes for an issue.
+    required: false
+    default: octos/
+  dry_run:
+    description: Read from GitHub and run the agent, but post nothing and push nothing.
+    required: false
+    default: "false"
+  provider:
+    description: Octos provider name, for example `deepseek`, `anthropic` or `openai`. Its key comes from `env`.
+    required: false
+    default: ""
+  model:
+    description: Model id for the provider.
+    required: false
+    default: ""
+  base_url:
+    description: Base URL of a custom or self-hosted endpoint.
+    required: false
+    default: ""
+  api_type:
+    description: Wire protocol of a custom endpoint, as `octos chat --api-type` takes it.
+    required: false
+    default: ""
+  effort:
+    description: Reasoning effort, as `octos chat --effort` takes it.
+    required: false
+    default: ""
+  max_iterations:
+    description: Upper bound on agent steps in one run.
+    required: false
+    default: "50"
+  timeout_minutes:
+    description: The agent is stopped after this many minutes.
+    required: false
+    default: "20"
+  require_sandbox:
+    description: Refuse to run shell commands when no sandbox is available on the runner.
+    required: false
+    default: "true"
+  setup_sandbox:
+    description: >-
+      On Linux, install bubblewrap and allow it to create user namespaces when it
+      is not usable yet. Needs passwordless sudo, as GitHub-hosted runners have.
+    required: false
+    default: "true"
+  config_file:
+    description: Path in the repository of an Octos config file to start from.
+    required: false
+    default: ""
+  octos_version:
+    description: Octos release tag to install, or `latest`.
+    required: false
+    default: latest
+  octos_sha256:
+    description: Expected SHA-256 of the release bundle. Without it the release's own checksum file is used.
+    required: false
+    default: ""
+  octos_path:
+    description: Path of an `octos` binary that is already on the runner. Skips the download.
+    required: false
+    default: ""
+  github_token:
+    description: Token for reading the thread, commenting and pushing. The agent never sees it.
+    required: false
+    default: ${{ github.token }}
+  commit_name:
+    description: Author name of the commits the action makes.
+    required: false
+    default: github-actions[bot]
+  commit_email:
+    description: Author email of the commits the action makes.
+    required: false
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+
+outputs:
+  should_run:
+    description: "`true` when the event asked for a run and the sender was allowed to ask."
+    value: ${{ steps.prepare.outputs.should_run }}
+  skip_reason:
+    description: Why nothing ran.
+    value: ${{ steps.prepare.outputs.skip_reason }}
+  kind:
+    description: >-
+      What started the run: `mention`, `label`, `prompt`, `code_review` (Octos
+      reviews a pull request), `review` (Octos answers a maintainer's review)
+      or `ci_failure`.
+    value: ${{ steps.prepare.outputs.kind }}
+  conclusion:
+    description: "`success` or `failure` of the agent run."
+    value: ${{ steps.run.outputs.conclusion }}
+  result:
+    description: The agent's final message.
+    value: ${{ steps.run.outputs.result }}
+  review_url:
+    description: Link to the pull request review Octos posted.
+    value: ${{ steps.publish.outputs.review_url }}
+  review_comments:
+    description: Number of line comments in that review.
+    value: ${{ steps.publish.outputs.review_comments }}
+  pushed:
+    description: "`true` when a commit was pushed."
+    value: ${{ steps.publish.outputs.pushed }}
+  branch_name:
+    description: Branch that holds the commit.
+    value: ${{ steps.publish.outputs.branch_name }}
+  commit_sha:
+    description: The commit the action made.
+    value: ${{ steps.publish.outputs.commit_sha }}
+
+runs:
+  using: composite
+  steps:
+    # Every input reaches the scripts through the environment, never through
+    # the text of a command. The first step copies the script out of the
+    # action's folder, and the later steps run that copy, so nothing that runs
+    # after the agent is read from a place the agent could write to.
+    - name: Read the event
+      id: prepare
+      shell: bash
+      env:
+        OCTOS_ACTION_TOKEN: ${{ inputs.github_token }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_TRIGGER_PHRASE: ${{ inputs.trigger_phrase }}
+        INPUT_LABEL_TRIGGER: ${{ inputs.label_trigger }}
+        INPUT_WATCH_LABEL: ${{ inputs.watch_label }}
+        INPUT_ACCESS: ${{ inputs.access }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_ALLOWED_NON_WRITE_USERS: ${{ inputs.allowed_non_write_users }}
+        INPUT_ALLOWED_BOTS: ${{ inputs.allowed_bots }}
+        INPUT_MAX_FIX_ATTEMPTS: ${{ inputs.max_fix_attempts }}
+        INPUT_AUTO_REVIEW: ${{ inputs.auto_review }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+      run: python3 -I "$GITHUB_ACTION_PATH/octos_action.py" prepare
+
+    - name: Set up the sandbox
+      if: steps.prepare.outputs.should_run == 'true' && runner.os == 'Linux' && inputs.setup_sandbox == 'true'
+      shell: bash
+      run: |
+        works() { bwrap --ro-bind / / --unshare-net --unshare-pid true >/dev/null 2>&1; }
+        if works; then
+          echo "bubblewrap is ready"
+          exit 0
+        fi
+        if ! sudo -n true 2>/dev/null; then
+          echo "::notice::No passwordless sudo, so bubblewrap was not set up. Octos uses its own sandbox helper."
+          exit 0
+        fi
+        if ! command -v bwrap >/dev/null 2>&1; then
+          sudo -n apt-get update -qq
+          sudo -n apt-get install -y -qq bubblewrap
+        fi
+        if ! works; then
+          # Ubuntu 24.04 and later keep unprivileged programs from creating user namespaces.
+          sudo -n sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+        fi
+        if works; then
+          echo "bubblewrap is ready"
+        else
+          echo "::warning::bubblewrap could not be set up. Octos uses its own sandbox helper, or refuses to run commands."
+        fi
+
+    - name: Install Octos
+      id: install
+      if: steps.prepare.outputs.should_run == 'true' && inputs.octos_path == ''
+      shell: bash
+      env:
+        INPUT_OCTOS_VERSION: ${{ inputs.octos_version }}
+        INPUT_OCTOS_SHA256: ${{ inputs.octos_sha256 }}
+      run: python3 -I "$RUNNER_TEMP/octos-action/octos_action.py" install
+
+    # No GitHub token in this step.
+    - name: Run Octos
+      id: run
+      if: steps.prepare.outputs.should_run == 'true'
+      shell: bash
+      env:
+        OCTOS_ACTION_PLAN: ${{ steps.prepare.outputs.plan }}
+        INPUT_OCTOS_PATH: ${{ inputs.octos_path || steps.install.outputs.octos_path }}
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base_url }}
+        INPUT_API_TYPE: ${{ inputs.api_type }}
+        INPUT_EFFORT: ${{ inputs.effort }}
+        INPUT_MAX_ITERATIONS: ${{ inputs.max_iterations }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        INPUT_REQUIRE_SANDBOX: ${{ inputs.require_sandbox }}
+        INPUT_ALLOWED_TOOLS: ${{ inputs.allowed_tools }}
+        INPUT_CONFIG_FILE: ${{ inputs.config_file }}
+      run: python3 -I "$RUNNER_TEMP/octos-action/octos_action.py" run
+
+    - name: Publish the result
+      id: publish
+      if: always() && steps.prepare.outputs.should_run == 'true'
+      shell: bash
+      env:
+        OCTOS_ACTION_TOKEN: ${{ inputs.github_token }}
+        OCTOS_ACTION_PLAN: ${{ steps.prepare.outputs.plan }}
+        OCTOS_ACTION_GIT_CONFIG: ${{ steps.prepare.outputs.git_config }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_MAX_FIX_ATTEMPTS: ${{ inputs.max_fix_attempts }}
+        INPUT_BRANCH_PREFIX: ${{ inputs.branch_prefix }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_COMMIT_NAME: ${{ inputs.commit_name }}
+        INPUT_COMMIT_EMAIL: ${{ inputs.commit_email }}
+      run: python3 -I "$RUNNER_TEMP/octos-action/octos_action.py" publish

@@ -1,0 +1,72 @@
+name: Octos action e2e
+
+# Runs the GitHub Action in `action/` once on a hosted runner, against a
+# scripted stand-in for the model, so it needs no secret. Nothing is posted or
+# pushed: the action runs with `dry_run`.
+
+on:
+  pull_request:
+    paths:
+      - "action/**"
+      - ".github/workflows/action-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: action-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: action end to end (mock model)
+    # The author of a fork's pull request has no write access, so the action
+    # would skip the run and there would be nothing to check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Start the mock model
+        run: |
+          # Made up per run: the check looks for this value in what the model
+          # was sent, and a fixed value would be found in this file's own diff.
+          echo "MOCK_KEY=mock-$(openssl rand -hex 16)" >> "$GITHUB_ENV"
+          python3 action/dev/mock_llm.py --port 18473 --port-file "$RUNNER_TEMP/llm.port" \
+            --log "$RUNNER_TEMP/llm.log" --script "$(cat action/dev/e2e_script.json)" &
+          for _ in $(seq 1 50); do
+            [ -s "$RUNNER_TEMP/llm.port" ] && exit 0
+            sleep 0.2
+          done
+          echo "the mock model did not start" >&2
+          exit 1
+
+      - name: Run the action
+        id: octos
+        uses: ./action
+        env:
+          OPENAI_API_KEY: ${{ env.MOCK_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          prompt: Write the file the test asks for.
+          access: write
+          dry_run: "true"
+          provider: openai
+          model: mock-model
+          base_url: http://127.0.0.1:18473/v1
+
+      - name: Check the run
+        env:
+          JOB_TOKEN: ${{ github.token }}
+          MODEL_KEY: ${{ env.MOCK_KEY }}
+          SHOULD_RUN: ${{ steps.octos.outputs.should_run }}
+          KIND: ${{ steps.octos.outputs.kind }}
+          CONCLUSION: ${{ steps.octos.outputs.conclusion }}
+          RESULT: ${{ steps.octos.outputs.result }}
+          PUSHED: ${{ steps.octos.outputs.pushed }}
+          COMMIT_SHA: ${{ steps.octos.outputs.commit_sha }}
+        run: python3 action/dev/e2e_check.py "$RUNNER_TEMP/llm.log"
