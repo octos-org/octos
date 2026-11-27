@@ -7,19 +7,25 @@ plus inline `#[cfg(test)]` / `#[cfg(all(..., test, ...))]` modules, JS/TS `*.tes
 `test_*.py`/`_test.py` — over `git archive` of the base and head refs.
 
 pull_request and merge_group enforce: net growth > 0 fails unless EITHER
-(a) the PR carries `test-growth-approved` added by a human maintainer, or
-(b) a human maintainer's LATEST review on the PR's CURRENT head is
-APPROVED (shu 2026-11-19 ruling: approving the current head IS approving
-its test growth — one maintainer action instead of two). See MAINTAINERS;
-the shared agent account never counts, approvals on stale heads do not
-count, and a later CHANGES_REQUESTED/DISMISSED supersedes an earlier
-approval. shu 2026-11-25 caps the review path: growth above
-REVIEW_CAP lines is exempt ONLY by the maintainer-applied label, never
-by a review — an approved PR with too many tests must be shrunk, or
-explicitly label-exempted by a maintainer's own choice. The baseline is
-the merge-base of the event base and head refs, so a PR behind main is
-not credited with deleting main's newer tests. Push to main only
-reports the numbers.
+(a) the PR's CURRENT `test-growth-approved` label generation was applied
+by someone who is NOT the PR author and is either a human maintainer or
+the release agent `anantheparty` — shu 2026-11-27: 「维护者自己给自己打
+的 test-growth-approved 标签不算，但我们要去积极的给别人的pr打这个标
+签，并且提出简化测试的需求和方法」: an author's own label never exempts,
+whoever they are (ymote's self-labelled #3340 merged +4,140 test lines);
+the agent labels OTHER authors' PRs, paired with concrete suggestions to
+simplify the tests. An unknown author fails closed. Or (b) a human
+maintainer's LATEST review on the PR's CURRENT head is APPROVED (shu
+2026-11-19 ruling: approving the current head IS approving its test
+growth — one maintainer action instead of two; the agent account never
+counts here, approvals on stale heads do not count, and a later
+CHANGES_REQUESTED/DISMISSED supersedes an earlier approval). shu
+2026-11-25 caps the review path: growth above REVIEW_CAP lines is exempt
+ONLY by the label, never by a review — an approved PR with too many tests
+must be shrunk, or explicitly label-exempted by a non-author maintainer
+or the agent. The baseline is the merge-base of the event base and head
+refs, so a PR behind main is not credited with deleting main's newer
+tests. Push to main only reports the numbers.
 
 `--self-test` runs offline cases in temporary git repositories.
 """
@@ -39,6 +45,11 @@ from pathlib import Path
 
 LABEL = "test-growth-approved"
 MAINTAINERS = frozenset({"alan0x", "BH3GEI", "ymote"})
+# shu 2026-11-27: the release agent proactively labels OTHER authors' PRs
+# (with concrete test-simplification suggestions); that label counts. An
+# author's own label never does, so the applier must differ from the author.
+AGENT = "anantheparty"
+LABEL_APPLIERS = MAINTAINERS | {AGENT}
 # shu 2026-11-25: a maintainer's APPROVED review exempts at most this many
 # net test lines; beyond it only the maintainer-applied label exempts.
 REVIEW_CAP = 150
@@ -155,7 +166,46 @@ def measure(repo: Path, ref: str) -> dict[str, int]:
     return files
 
 
-def label_approved(repo_slug: str, pr_number: int, events_json: Path | None) -> tuple[bool, str]:
+def pr_author(repo_slug: str, pr_number: int, author_json: Path | None) -> str | None:
+    """The PR author's login, or None when it cannot be determined.
+
+    shu 2026-11-27: a label exempts only when its applier is not the PR
+    author, so the author must be known before any label can count; None
+    fails closed. Order: offline fixture, the pull_request event payload
+    (`pull_request.user.login`), then the pulls API (merge_group runs).
+    """
+    if author_json is not None:
+        return json.loads(author_json.read_text()).get("author")
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path:
+        try:
+            payload = json.loads(Path(event_path).read_text())
+            login = payload.get("pull_request", {}).get("user", {}).get("login")
+            if login:
+                return login
+        except (OSError, ValueError):
+            pass
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo_slug}/pulls/{pr_number}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read()).get("user", {}).get("login")
+    except Exception:
+        return None
+
+
+def label_approved(
+    repo_slug: str, pr_number: int, events_json: Path | None, author_json: Path | None
+) -> tuple[bool, str]:
     if events_json is not None:
         events = json.loads(events_json.read_text())
     else:
@@ -194,11 +244,25 @@ def label_approved(repo_slug: str, pr_number: int, events_json: Path | None) -> 
             applied_by = event.get("actor", {}).get("login")
         elif event.get("event") == "unlabeled":
             applied_by = None
-    if applied_by in MAINTAINERS:
+    if applied_by is None:
+        return False, "no maintainer-applied label event found"
+    author = pr_author(repo_slug, pr_number, author_json)
+    if author is not None and applied_by == author:
+        return False, (
+            f"{LABEL} was applied by the PR author ({applied_by}); an author's "
+            f"own label never exempts (shu 2026-11-27)"
+        )
+    if author is None:
+        return False, (
+            f"cannot determine the PR author, failing closed: {LABEL} applied "
+            f"by {applied_by} does not exempt"
+        )
+    if applied_by in LABEL_APPLIERS:
         return True, applied_by
-    if applied_by:
-        return False, f"current {LABEL} label was applied by {applied_by}, not a maintainer"
-    return False, "no maintainer-applied label event found"
+    return False, (
+        f"current {LABEL} label was applied by {applied_by}, not a maintainer "
+        f"or the release agent"
+    )
 
 
 def review_approved(
@@ -302,9 +366,9 @@ def run(args: argparse.Namespace) -> int:
         print("net test-line change is zero or negative: green")
         return 0
     if args.pr is not None:
-        approved, who = label_approved(args.repo_slug, args.pr, args.events_json)
+        approved, who = label_approved(args.repo_slug, args.pr, args.events_json, args.author_json)
         if approved:
-            print(f"{LABEL} applied by maintainer {who}: growth exempt, green")
+            print(f"{LABEL} applied by {who} (not the PR author): growth exempt, green")
             return 0
         print(f"exemption check (label): {who}")
         if delta > REVIEW_CAP:
@@ -317,9 +381,9 @@ def run(args: argparse.Namespace) -> int:
                 f"Shrink this PR's tests to +{REVIEW_CAP} lines or fewer: merge "
                 f"duplicate cases (table-driven tests), or delete redundant old "
                 f"tests to offset the new ones. A maintainer's APPROVED review "
-                f"no longer exempts above {REVIEW_CAP} lines — only a maintainer "
-                f"({', '.join(sorted(MAINTAINERS))}) applying `{LABEL}` can, and "
-                f"that is their own call to make."
+                f"no longer exempts above {REVIEW_CAP} lines — only `{LABEL}` "
+                f"applied by a maintainer ({', '.join(sorted(MAINTAINERS))}) or "
+                f"the release agent, never by the PR author, can."
             )
             return 1
         approved, who = review_approved(args.repo_slug, args.pr, args.reviews_json)
@@ -339,7 +403,8 @@ def run(args: argparse.Namespace) -> int:
         f"If it truly cannot be offset, state why in the PR and ask a "
         f"maintainer ({', '.join(sorted(MAINTAINERS))}) to either approve the "
         f"current head (an APPROVED review IS the test-growth approval, up to "
-        f"{REVIEW_CAP} lines), or apply `{LABEL}`."
+        f"{REVIEW_CAP} lines), or apply `{LABEL}` — a maintainer or the "
+        f"release agent may apply it, never the PR author."
     )
     return 1
 
@@ -462,14 +527,25 @@ def self_test(repo_root: Path) -> None:
         # CI's GH_TOKEN, so pair them with an empty events fixture too.
         no_events = root / "no-events.json"
         no_events.write_text("[]")
+
+        def author_fixture(path: Path, login: str | None) -> str:
+            path.write_text(json.dumps({"author": login}))
+            return str(path)
+
+        other_author = author_fixture(root / "author-other.json", "octocat")
+        agent_author = author_fixture(root / "author-agent.json", "anantheparty")
+        maintainer_author = author_fixture(root / "author-maintainer.json", "ymote")
+        unknown_author = author_fixture(root / "author-unknown.json", None)
         maintainer_events = root / "maintainer.json"
         maintainer_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "anantheparty"}, "label": {"name": LABEL}},
             {"event": "labeled", "actor": {"login": "alan0x"}, "label": {"name": LABEL}},
         ]))
+        # A maintainer labelling SOMEONE ELSE's PR exempts.
         out = case(
             root, "label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
             "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+            "--author-json", other_author,
             expect=0,
         )
         assert "alan0x" in out, out
@@ -477,12 +553,43 @@ def self_test(repo_root: Path) -> None:
         bot_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "anantheparty"}, "label": {"name": LABEL}},
         ]))
+        # shu 2026-11-27: the release agent labelling SOMEONE ELSE's PR
+        # (paired with concrete simplification suggestions) exempts.
         out = case(
-            root, "bot-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
+            root, "agent-label-other", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
             "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+            "--author-json", other_author,
+            expect=0,
+        )
+        assert "anantheparty" in out, out
+        # ...but the agent labelling its OWN PR never exempts.
+        out = case(
+            root, "agent-self-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
+            "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+            "--author-json", agent_author,
             expect=1,
         )
-        assert "applied by anantheparty, not a maintainer" in out, out
+        assert "applied by the PR author (anantheparty)" in out, out
+        # A maintainer's self-label is just as void (ymote's #3340 case).
+        ymote_events = root / "ymote.json"
+        ymote_events.write_text(json.dumps([
+            {"event": "labeled", "actor": {"login": "ymote"}, "label": {"name": LABEL}},
+        ]))
+        out = case(
+            root, "maintainer-self-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
+            "--events-json", str(ymote_events), "--reviews-json", str(no_reviews),
+            "--author-json", maintainer_author,
+            expect=1,
+        )
+        assert "applied by the PR author (ymote)" in out, out
+        # An unidentifiable author fails closed even for a maintainer label.
+        out = case(
+            root, "label-unknown-author", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
+            "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+            "--author-json", unknown_author,
+            expect=1,
+        )
+        assert "failing closed" in out, out
         # A maintainer's approval that was later removed must not exempt.
         removed_events = root / "removed.json"
         removed_events.write_text(json.dumps([
@@ -492,10 +599,12 @@ def self_test(repo_root: Path) -> None:
         out = case(
             root, "removed-label", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
             "--events-json", str(removed_events), "--reviews-json", str(no_reviews),
+            "--author-json", other_author,
             expect=1,
         )
         assert "no maintainer-applied label event" in out, out
-        # A bot re-label after maintainer approval supersedes the generation.
+        # The CURRENT generation decides: a maintainer's label re-applied by
+        # the agent (after an unlabel) exempts someone else's PR...
         relabel_events = root / "relabel.json"
         relabel_events.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "alan0x"}, "label": {"name": LABEL}},
@@ -505,9 +614,18 @@ def self_test(repo_root: Path) -> None:
         out = case(
             root, "bot-relabel", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
             "--events-json", str(relabel_events), "--reviews-json", str(no_reviews),
+            "--author-json", other_author,
+            expect=0,
+        )
+        assert "anantheparty" in out, out
+        # ...but the same generation on the agent's own PR does not.
+        out = case(
+            root, "bot-relabel-self", 2, "--pr", "1", "--repo-slug", "octos-org/octos",
+            "--events-json", str(relabel_events), "--reviews-json", str(no_reviews),
+            "--author-json", agent_author,
             expect=1,
         )
-        assert "applied by anantheparty, not a maintainer" in out, out
+        assert "applied by the PR author (anantheparty)" in out, out
 
         # The label-only cases above are pinned offline on the review path
         # via `no_reviews` (CI has GH_TOKEN; without the fixture the script
@@ -574,7 +692,8 @@ def self_test(repo_root: Path) -> None:
                        "--repo-slug", "octos-org/octos", "--events-json", str(no_events), "--reviews-json", fixture, expect=0)
         assert "alan0x approved the current head" in out, out
 
-        # Label still exempts without any approval (original behavior).
+        # Label still exempts without any approval (original behavior),
+        # when a maintainer applies it to someone else's PR.
         label_only = root / "label-only.json"
         label_only.write_text(json.dumps([
             {"event": "labeled", "actor": {"login": "ymote"}, "label": {"name": LABEL}},
@@ -583,6 +702,7 @@ def self_test(repo_root: Path) -> None:
         out = run_case("label-only", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos",
                        "--events-json", str(label_only), "--reviews-json", str(no_reviews),
+                       "--author-json", other_author,
                        expect=0)
         assert "ymote" in out, out
 
@@ -609,15 +729,28 @@ def self_test(repo_root: Path) -> None:
         out = run_case("cap-151-label", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos",
                        "--events-json", str(maintainer_events), "--reviews-json", str(no_reviews),
+                       "--author-json", other_author,
                        expect=0)
         assert "delta = +151" in out and "alan0x" in out, out
 
-        repo, base, head = fixture_repo(root / "cap-151-bot-label", 75, pad=1)
-        out = run_case("cap-151-bot-label", repo, base, head, "--pr", "1",
+        # Above the cap the label is the ONLY exemption; the agent's label on
+        # someone else's PR counts there too (shu 2026-11-27)...
+        repo, base, head = fixture_repo(root / "cap-151-agent-label", 75, pad=1)
+        out = run_case("cap-151-agent-label", repo, base, head, "--pr", "1",
                        "--repo-slug", "octos-org/octos",
                        "--events-json", str(bot_events), "--reviews-json", str(no_reviews),
+                       "--author-json", other_author,
+                       expect=0)
+        assert "delta = +151" in out and "anantheparty" in out, out
+
+        # ...while the author's own label stays void above the cap as well.
+        repo, base, head = fixture_repo(root / "cap-151-self-label", 75, pad=1)
+        out = run_case("cap-151-self-label", repo, base, head, "--pr", "1",
+                       "--repo-slug", "octos-org/octos",
+                       "--events-json", str(ymote_events), "--reviews-json", str(no_reviews),
+                       "--author-json", maintainer_author,
                        expect=1)
-        assert "delta = +151" in out and "not a maintainer" in out, out
+        assert "delta = +151" in out and "applied by the PR author (ymote)" in out, out
         # 11-25 wake/test-lines.py parity: #[cfg(all(..., test, ...))] is
         # test-only; cfg(any(test, ...)) and cfg(feature = "test") are not.
         def cfg_fixture(root: Path, attr: str) -> tuple[Path, str, str]:
@@ -677,6 +810,7 @@ def main() -> None:
     parser.add_argument("--pr", type=int)
     parser.add_argument("--repo-slug", default="octos-org/octos")
     parser.add_argument("--events-json", type=Path)
+    parser.add_argument("--author-json", type=Path)
     parser.add_argument("--reviews-json", type=Path)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
