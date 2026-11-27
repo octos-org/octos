@@ -88,6 +88,7 @@ impl GatewayPromptParts {
             let keep = match heading {
                 "Research & Search Rules" => research_available,
                 "Rich Card Rendering (capable clients)" => available("send_app_card"),
+                "Local Files & Documents" => available("read_file"),
                 "Pipelines" => available("run_pipeline"),
                 "Background Tasks" => [
                     "spawn",
@@ -295,4 +296,28 @@ pub fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> S
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts() -> GatewayPromptParts {
+        GatewayPromptParts {
+            pre_memory: BUNDLED_PROMPT.to_string(),
+            post_memory: String::new(),
+            uses_bundled_base: true,
+        }
+    }
+
+    /// T-0694: the local-files guidance rides with `read_file`, and the
+    /// Session Summary shape is scoped to coding work.
+    #[test]
+    fn should_project_file_guidance_by_read_file_and_scope_the_summary_shape() {
+        let projected = parts().project_available_rules(|name| name == "read_file");
+        assert!(projected.contains("## Local Files & Documents"));
+        assert!(projected.contains("This shape is for CODING work only"));
+        let without = parts().project_available_rules(|_| false);
+        assert!(!without.contains("## Local Files & Documents"));
+    }
 }
