@@ -304,8 +304,7 @@ async fn a_direct_message_runs_once_across_a_redelivery_and_a_restart() {
     .await;
     let _im = im.unwrap();
     until_some("answer u53", || fake.asked_from(53).then_some(())).await;
-    let nonempty = || Some(fake.sends()).filter(|s| !s.is_empty());
-    let sends = until_some("sends nonempty", nonempty).await;
+    let sends = until_some("nonempty", || Some(fake.sends()).filter(|s| !s.is_empty())).await;
     assert_eq!(sends, [(ME, "reply: again".into(), Some(52), true)]);
     let prompts = llm.prompts.lock().unwrap().clone();
     assert_eq!(prompts, ["hello", "a week later", "again"]);

@@ -579,10 +579,12 @@ async fn projected(channel: &FakeChannel, at: usize) -> String {
     .await
 }
 
-async fn sent_with(channel: &FakeChannel, needle: &str) {
-    until_some(&format!("channel send/edit containing '{needle}'"), || {
+/// The first send/edit containing ANY needle; two needles cover racing
+/// terminal texts ("cancelled" from the interrupt, the sweep's other text).
+async fn sent_with(channel: &FakeChannel, needles: &[&str]) {
+    until_some(&format!("channel send/edit containing {needles:?}"), || {
         let sent = channel.sent.lock().unwrap();
-        sent.iter().any(|(_, t, _)| t.contains(needle)).then_some(())
+        sent.iter().any(|(_, t, _)| needles.iter().any(|n| t.contains(n))).then_some(())
     })
     .await;
 }
@@ -605,7 +607,7 @@ async fn approval_buttons_decide_once_and_everything_stale_fails_closed() {
     assert!(!approve.is_finished());
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
     assert_eq!(approve.await.unwrap(), ToolApprovalDecision::Approve);
-    sent_with(&channel, "Approved.").await;
+    sent_with(&channel, &["Approved."]).await;
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
     assert_eq!(channel.acked.lock().unwrap().len(), 4);
     channel
@@ -615,7 +617,7 @@ async fn approval_buttons_decide_once_and_everything_stale_fails_closed() {
     let nonce = projected(&channel, 1).await;
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "d")).await;
     assert_eq!(deny.await.unwrap(), ToolApprovalDecision::Deny);
-    sent_with(&channel, "may not have gone through").await;
+    sent_with(&channel, &["may not have gone through"]).await;
     llm.release.add_permits(1);
     assert_eq!(delivery.await.unwrap(), Delivery::Sent);
 }
@@ -632,7 +634,7 @@ async fn expired_stopped_and_risky_approvals_are_fail_closed() {
     let nonce = projected(&channel, 0).await;
     tokio::time::sleep(Duration::from_millis(60)).await;
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
-    sent_with(&channel, "expired").await;
+    sent_with(&channel, &["expired"]).await;
     drop(expired);
     llm.release.add_permits(1);
     delivery.await.unwrap();
@@ -641,14 +643,14 @@ async fn expired_stopped_and_risky_approvals_are_fail_closed() {
         panic!("the turn did not start");
     };
     let risky = raise(&turn_id, "high");
-    sent_with(&channel, "high-risk").await;
+    sent_with(&channel, &["high-risk"]).await;
     assert_eq!(channel.buttoned.lock().unwrap().len(), 1); // the expired one only
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), "deadbeefdeadbeef", "a")).await;
     assert!(!risky.is_finished());
     let stopped = raise(&turn_id, "low");
     let nonce = projected(&channel, 1).await;
     bridge.handle(message(3, "/stop")).await;
-    sent_with(&channel, "no longer open").await;
+    sent_with(&channel, &["no longer open", "was cancelled"]).await;
     bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
     assert!(channel.acked.lock().unwrap().iter().all(|alert| *alert));
     drop(stopped);
