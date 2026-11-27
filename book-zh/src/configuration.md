@@ -320,6 +320,7 @@ agent 设置。模型请求使用固定的常用工具与调用入口；其他�
 | `BRAVE_API_KEY` | Brave Search API 密钥 |
 | `PERPLEXITY_API_KEY` | Perplexity Sonar API 密钥 |
 | `YDC_API_KEY` | You.com API 密钥 |
+| `KEENABLE_API_KEY` | Keenable Search API 密钥 |
 
 ### 渠道
 

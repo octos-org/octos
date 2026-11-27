@@ -605,11 +605,12 @@ The `web_search` tool uses multiple search providers with automatic fallback.
 | DuckDuckGo | *(none)* | Free | Always available, HTML scraping fallback |
 | Brave Search | `BRAVE_API_KEY` | Free tier: 2K queries/month | REST API |
 | You.com | `YDC_API_KEY` | Paid | Rich JSON results with snippets |
+| Keenable | `KEENABLE_API_KEY` | 100,000 free requests/month, then $4 per 1,000 ([pricing](https://docs.keenable.ai/pricing)) | Independent web index; results with page excerpts. Inert while the key is unset or empty |
 | Perplexity Sonar | `PERPLEXITY_API_KEY` | Paid | AI-synthesized answers with citations |
 
 ### 5.2 Provider Selection
 
-Providers are tried in order: **DuckDuckGo → Brave → You.com → Perplexity**. The first provider returning non-empty results wins. If all fail, DuckDuckGo results are returned as fallback.
+Providers are tried in order: **DuckDuckGo → Brave → You.com → Keenable → Perplexity**. The first provider returning non-empty results wins. If all fail, DuckDuckGo results are returned as fallback.
 
 **Auto-rotate on quota / rate-limit errors** (M8.10b, #578): if the active provider returns a quota-exhaustion or rate-limit error (HTTP 402, 429, or provider-specific error strings), `web_search` rotates to the next configured provider mid-call rather than surfacing the error. This makes the tool robust against quota churn without requiring agent-side retry logic.
 
@@ -2315,6 +2316,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | `BRAVE_API_KEY` | Brave Search API key |
 | `PERPLEXITY_API_KEY` | Perplexity Sonar API key |
 | `YDC_API_KEY` | You.com API key |
+| `KEENABLE_API_KEY` | Keenable Search API key |
 | **Channels** | |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
