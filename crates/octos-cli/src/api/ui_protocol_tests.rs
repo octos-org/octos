@@ -1641,7 +1641,7 @@ async fn unified_terminal_sink_failure_with_ack_queues_recovery_under_profile() 
 #[tokio::test]
 async fn active_only_steer_never_starts_a_replacement_turn() {
     let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
-    let (state, _profile) =
+    let (state, _profile, _cleanup) =
         state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
     assert!(
         !UiProtocolCapabilities::first_server_slice()
@@ -1789,7 +1789,7 @@ async fn host_scope_denies_an_already_loaded_foreign_profile() {
         return;
     }
     let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
-    let (mut state, _profile) =
+    let (mut state, _profile, _cleanup) =
         state_with_profile_llm(dir.path(), "allowed", Arc::new(NoopLlm)).await;
     let foreign = make_m11e_profile_with_llm_and_sandbox(
         "foreign",
@@ -2666,7 +2666,8 @@ async fn registry_search_reports_the_core_host_platform_for_reviewed_install() {
 #[tokio::test]
 async fn permission_set_reloads_default_alias_runtime_policy() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, profile) = state_with_profile_llm(dir.path(), "alpha", Arc::new(NoopLlm)).await;
+    let (state, profile, _cleanup) =
+        state_with_profile_llm(dir.path(), "alpha", Arc::new(NoopLlm)).await;
     let base = SessionKey::with_profile("alpha", "api", "chat");
     let alias = SessionKey(format!("{}#default", base.0));
     let other = SessionKey(format!("{}#work", base.0));
@@ -2792,7 +2793,8 @@ async fn permission_set_reloads_default_alias_runtime_policy() {
 #[tokio::test]
 async fn permission_set_cancellation_still_invalidates_writable_runtime() {
     let dir = tempfile::tempdir().unwrap();
-    let (state, profile) = state_with_profile_llm(dir.path(), "alpha", Arc::new(NoopLlm)).await;
+    let (state, profile, _cleanup) =
+        state_with_profile_llm(dir.path(), "alpha", Arc::new(NoopLlm)).await;
     let base = SessionKey::with_profile("alpha", "api", "cancel-set");
     let mut sessions = octos_bus::SessionManager::open(&profile.data_dir).unwrap();
     sessions.ensure_session_record(&base).await.unwrap();
@@ -3125,7 +3127,8 @@ async fn should_reconcile_and_settle_goal_rows_in_m9_task_output_fixture() {
 
     let (dir, _hidden) = crate::runtime::chat_workspace::tempdir_with_hidden_guard();
     let profile = "m9-tenant";
-    let (state, _runtime) = state_with_profile_llm(dir.path(), profile, Arc::new(NoopLlm)).await;
+    let (state, _runtime, _cleanup) =
+        state_with_profile_llm(dir.path(), profile, Arc::new(NoopLlm)).await;
     // Bare session: only the admitted connection/routed profile identifies
     // the tenant ledger. This catches a fixture-only `_main` fallback.
     let session = SessionKey::new("api", "m9-goal-row-restore");

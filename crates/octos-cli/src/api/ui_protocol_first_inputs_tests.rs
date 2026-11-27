@@ -211,6 +211,7 @@ fn rounds_to_have(requests: &[Value], needs: &[Need]) -> Option<usize> {
 
 struct Fx {
     tmp: tempfile::TempDir,
+    _cleanup: crate::runtime::chat_workspace::HiddenFixtureCleanup,
     state: Arc<AppState>,
     data_dir: PathBuf,
     /// The master session's workspace; an unfenced peer works in it too.
@@ -227,6 +228,7 @@ async fn fixture(needs: Vec<Need>, context_window: Option<u32>) -> Fx {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let server = model_needing(needs).await;
     let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(tmp.path());
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(
@@ -281,6 +283,7 @@ async fn fixture(needs: Vec<Need>, context_window: Option<u32>) -> Fx {
     std::fs::create_dir_all(&workspace).unwrap();
     Fx {
         tmp,
+        _cleanup,
         state: Arc::new(state),
         data_dir,
         workspace,

@@ -549,6 +549,67 @@ pub(crate) fn hidden_fixture_guard(root: &Path) -> HiddenFixtureGuard {
     }
 }
 
+/// T-0700: a lock-free cleanup handle for fixture-built profile runtimes.
+/// [`HiddenFixtureGuard`] serializes the whole test through the global
+/// fixture lock; a test that only bootstraps a profile runtime writes no
+/// shared singletons — its registrations are keyed per profile — so it needs
+/// only the drop-time cleanup. Holding this until after the tempdir would
+/// drop closes the leak: another test's backend never meets a registered
+/// root whose folder is already gone ("cannot be accounted for" refusals
+/// under parallel suites on bwrap and AppContainer).
+#[cfg(all(test, feature = "api"))]
+pub(crate) struct HiddenFixtureCleanup {
+    root: PathBuf,
+}
+
+#[cfg(all(test, feature = "api"))]
+pub(crate) fn hidden_fixture_cleanup(root: &Path) -> HiddenFixtureCleanup {
+    HiddenFixtureCleanup {
+        root: canonical_dir(root),
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+impl Drop for HiddenFixtureCleanup {
+    fn drop(&mut self) {
+        cleanup_registered_under(&self.root);
+    }
+}
+
+#[cfg(all(test, feature = "api"))]
+fn cleanup_registered_under(root: &Path) {
+    let mut layout = layout_write();
+    layout
+        .legacy_profiles
+        .retain(|data_dir, _| !data_dir.starts_with(root));
+    layout
+        .profile_server_roots
+        .retain(|data_dir, _| !data_dir.starts_with(root));
+    layout
+        .healable_server_roots
+        .retain(|r| !r.starts_with(root));
+    layout
+        .server_root_identities
+        .retain(|r, _| !r.starts_with(root));
+    layout
+        .populated_server_roots
+        .retain(|r| !r.starts_with(root));
+    if layout
+        .server_root
+        .as_ref()
+        .is_some_and(|r| r.starts_with(root))
+    {
+        layout.server_root = None;
+    }
+    drop(layout);
+    let reserved = reserved_folders();
+    for folder in reserved.folders() {
+        if canonical_dir(&folder).starts_with(root) {
+            reserved.remove(&folder);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "api"))]
 pub(crate) fn tempdir_with_hidden_guard() -> (tempfile::TempDir, HiddenFixtureGuard) {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -559,36 +620,7 @@ pub(crate) fn tempdir_with_hidden_guard() -> (tempfile::TempDir, HiddenFixtureGu
 #[cfg(all(test, feature = "api"))]
 impl Drop for HiddenFixtureGuard {
     fn drop(&mut self) {
-        let mut layout = layout_write();
-        layout
-            .legacy_profiles
-            .retain(|data_dir, _| !data_dir.starts_with(&self.root));
-        layout
-            .profile_server_roots
-            .retain(|data_dir, _| !data_dir.starts_with(&self.root));
-        layout
-            .healable_server_roots
-            .retain(|root| !root.starts_with(&self.root));
-        layout
-            .server_root_identities
-            .retain(|root, _| !root.starts_with(&self.root));
-        layout
-            .populated_server_roots
-            .retain(|root| !root.starts_with(&self.root));
-        if layout
-            .server_root
-            .as_ref()
-            .is_some_and(|root| root.starts_with(&self.root))
-        {
-            layout.server_root = None;
-        }
-        drop(layout);
-        let reserved = reserved_folders();
-        for folder in reserved.folders() {
-            if canonical_dir(&folder).starts_with(&self.root) {
-                reserved.remove(&folder);
-            }
-        }
+        cleanup_registered_under(&self.root);
     }
 }
 

@@ -130,7 +130,7 @@ async fn real_ws_turn_cleanup(case: DisconnectCase) {
         entered_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
-    let (mut state, _profile) =
+    let (mut state, _profile, _cleanup) =
         state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, llm.clone()).await;
     std::fs::create_dir_all(llm.path.parent().unwrap()).unwrap();
     std::fs::write(&llm.path, "TOOL_RAN_AFTER_CLOSE\n").unwrap();
@@ -445,7 +445,7 @@ async fn turn_admission_holds_grant_fence_through_active_turn_insert() {
         "{MAIN_PROFILE_ID}:api:turn-admission-fence-{}",
         uuid::Uuid::new_v4()
     ));
-    let (mut state, _profile) =
+    let (mut state, _profile, _cleanup) =
         state_with_profile_llm(dir.path(), MAIN_PROFILE_ID, Arc::new(NoopLlm)).await;
     Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
         octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),
@@ -531,7 +531,7 @@ async fn revoked_work_secret_prebind_cancels_only_matching_generation_over_real_
         tool_call_id: format!("call_{}", uuid::Uuid::new_v4().simple()),
         path: dir.path().join("unused"),
     });
-    let (mut state, _profile) =
+    let (mut state, _profile, _cleanup) =
         state_with_profile_llm(dir.path(), &profile, provider.clone()).await;
     Arc::get_mut(&mut state).unwrap().work_secret_store = Arc::new(
         octos_agent::bridge::work_secret::WorkSecretGrantStore::new(dir.path()),

@@ -297,7 +297,11 @@ pub(crate) async fn state_with_profile_llm(
     data_dir: &std::path::Path,
     profile_id: &str,
     llm: Arc<dyn octos_llm::LlmProvider>,
-) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+) -> (
+    Arc<AppState>,
+    Arc<crate::runtime::ProfileRuntime>,
+    crate::runtime::chat_workspace::HiddenFixtureCleanup,
+) {
     state_with_profile_llm_and_sandbox(
         data_dir,
         profile_id,
@@ -496,13 +500,22 @@ pub(crate) fn with_profile_store(
     Arc::get_mut(state).expect("unshared state").profile_store = Some(Arc::new(store));
 }
 
+/// Bootstrapping a profile runtime registers its chats root in the
+/// process-global hidden-folder set. The returned cleanup handle removes
+/// those registrations when it drops — bind it (e.g. `_hidden`) so it
+/// outlives the test's tempdir usage but not the tempdir itself (T-0700).
 pub(crate) async fn state_with_profile_llm_and_sandbox(
     data_dir: &std::path::Path,
     profile_id: &str,
     llm: Arc<dyn octos_llm::LlmProvider>,
     sandbox: octos_agent::SandboxConfig,
-) -> (Arc<AppState>, Arc<crate::runtime::ProfileRuntime>) {
+) -> (
+    Arc<AppState>,
+    Arc<crate::runtime::ProfileRuntime>,
+    crate::runtime::chat_workspace::HiddenFixtureCleanup,
+) {
     std::fs::create_dir_all(data_dir).expect("data dir");
+    let cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(data_dir);
 
     let sessions = Arc::new(tokio::sync::Mutex::new(
         octos_bus::SessionManager::open(data_dir).expect("session manager"),
@@ -521,7 +534,7 @@ pub(crate) async fn state_with_profile_llm_and_sandbox(
         ..AppState::empty_for_tests()
     });
 
-    (state, profile_runtime)
+    (state, profile_runtime, cleanup)
 }
 
 /// T-0636: a `TurnCaller` with no socket. A durable event is appended to the

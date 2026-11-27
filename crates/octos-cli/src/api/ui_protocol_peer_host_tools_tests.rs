@@ -81,6 +81,7 @@ pub(super) fn dev_profile(env_key: &str, env_value: &str) -> crate::profiles::Us
 /// [`fixture`], with `setup` applied to the server state first.
 async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(tmp.path());
     let profile = dev_profile("HOST_TOOLS_TEST_KEY", "test-key");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -667,6 +668,7 @@ impl octos_llm::LlmProvider for ScriptedHostToolLlm {
 /// peer, and the host's connection with the tool set registered on it.
 async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e {
     let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(tmp.path());
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(data_dir.join("memory")).unwrap();
     // The profile's (the system agent's) private memory: no app turn, and no
@@ -733,6 +735,7 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
     .expect("register");
     E2e {
         _tmp: tmp,
+        _cleanup,
         state,
         data_dir,
         system,
@@ -744,6 +747,7 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
 
 struct E2e {
     _tmp: tempfile::TempDir,
+    _cleanup: crate::runtime::chat_workspace::HiddenFixtureCleanup,
     state: Arc<AppState>,
     data_dir: PathBuf,
     system: SessionKey,
