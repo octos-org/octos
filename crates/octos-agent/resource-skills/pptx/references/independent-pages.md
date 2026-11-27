@@ -9,7 +9,14 @@ version and a small valid example, not its answer or deck-specific coordinates.
 Each worker receives its own page data file, design/blank assets, authoritative
 copy, shared canvas/styles, expected page ID and an exclusive attempt directory.
 Both worker and reviewer need direct images. Workers may use `cycle` with `page`
-for focused previews; the shared builder is already compiled, so no worker writes
+for focused previews. Declare the current page data, source/render images,
+and any OCR or repair findings needed in that turn together in `inputs` when
+using `peer_handoff` or `peer_send_input`. Workflow clients can use the same
+declarations on `peer/prepare` when the server advertises
+`peer.prepare.inputs.v1`. Use paths in the receiving peer's workspace and
+the current artifact hashes when available. Check the input delivery report
+before relying on an image for review.
+The shared builder is already compiled, so no worker writes
 or recompiles it. See [page worker](page-worker.md) and [Rust runtime](rust-runtime.md).
 
 Use page references in the root spec: `{"path":"pages/overview.json"}`. Resolve

@@ -2724,6 +2724,10 @@ impl ConnectionUiFeatures {
             &mut capabilities.supported_features,
             workspace_team::FEATURE,
         );
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            "peer.prepare.inputs.v1",
+        );
         for method in APPUI_EXTRA_METHODS {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
                 && !supports_local_solo_profile_create(state)
@@ -16310,6 +16314,8 @@ async fn raw_snapshot_restore(
 
 #[derive(Debug, Deserialize)]
 struct RawPeerPrepareParams {
+    #[serde(default)]
+    inputs: Option<Value>,
     /// The durable task contract for the peer session.
     brief: String,
     /// Optional cumulative token allowance for each staged peer. Omitted
@@ -16554,6 +16560,13 @@ async fn raw_peer_prepare(
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: RawPeerPrepareParams = parse_raw_params(request)?;
+    let inputs = octos_core::task_inputs::parse_declared_inputs(params.inputs.as_ref())
+        .map_err(RpcError::invalid_params)?;
+    if !inputs.is_empty() && (params.memory_namespace.is_some() || params.resume) {
+        return Err(RpcError::invalid_params(
+            "declared inputs require an ordinary staged peer",
+        ));
+    }
     let brief = params.brief.trim();
     if brief.is_empty() {
         return Err(RpcError::invalid_params("brief is required"));
@@ -16655,6 +16668,29 @@ async fn raw_peer_prepare(
         }
     };
 
+    let input_scope =
+        if inputs.is_empty() {
+            None
+        } else {
+            let owner = params.session_id.as_ref().ok_or_else(|| {
+                RpcError::invalid_params("declared inputs require an open owning session")
+            })?;
+            let owner_root = session_workspace_root_for_state(state, owner).ok_or_else(|| {
+                RpcError::invalid_params("open the owning session before staging inputs")
+            })?;
+            let owner_root = dunce::canonicalize(owner_root)
+                .map_err(|_| RpcError::invalid_params("owning workspace is unavailable"))?;
+            if dunce::canonicalize(&workspace_root).ok().as_ref() != Some(&owner_root) {
+                return Err(RpcError::invalid_params(
+                    "stage inputs in the owning session's workspace",
+                ));
+            }
+            let runtime =
+                session_runtime_with_effective_permissions(state, owner, Some(&profile_id)).await?;
+            Some(runtime.agent.session_scope().cloned().ok_or_else(|| {
+                RpcError::invalid_params("owning session has no active input scope")
+            })?)
+        };
     let seed = params
         .title
         .as_deref()
@@ -16811,8 +16847,10 @@ async fn raw_peer_prepare(
             .as_ref()
             .map(|session| session.to_string());
         let member_host_binding = host_binding.clone();
+        let member_inputs = inputs.clone();
+        let member_scope = input_scope.clone();
         let member = tokio::task::spawn_blocking(move || {
-            stage_peer_with_budget(
+            crate::peers::stage_peer_with_inputs(
                 &member_peers_root,
                 &member_workspace_root,
                 &member_seed,
@@ -16828,6 +16866,8 @@ async fn raw_peer_prepare(
                 None,
                 member_token_budget,
                 member_host_binding.as_ref(),
+                &member_inputs,
+                member_scope,
             )
         })
         .await

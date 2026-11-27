@@ -702,6 +702,15 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   handle; display names and briefs retain their original text. Unnamed peers
   suffix collisions; explicitly named peers reject duplicates. Clients must
   use the returned slug/topic rather than derive them from display text.
+  Servers advertising `peer.prepare.inputs.v1` accept an optional `inputs`
+  array for ordinary peers of an open owning `session_id`. Use the workspace
+  of that session. Each entry is a relative path or a
+  `{path, kind?, required?, sha256?}` declaration, as in `peer_handoff`.
+  Every member of the staged group receives the same declarations. Each
+  peer resolves the files in its own checkout with its own read permissions
+  on its first turn. Host-owned/resumed app peers reject nonempty declarations.
+  Clients requiring delivery must check the feature before sending the field
+  because older servers can ignore it.
 - `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
   fields; a server that lists `peer/context/open` honors them): optional
   `model` names a configured `sub_provider` lane exactly like

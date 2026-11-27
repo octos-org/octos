@@ -299,6 +299,59 @@ fn write(root: &Path, name: &str, bytes: impl AsRef<[u8]>) {
     std::fs::write(file, bytes).unwrap();
 }
 
+#[tokio::test]
+async fn peer_prepare_delivers_declared_page_inputs_in_the_first_request() {
+    let fx = fixture(page_needs(), None).await;
+    page_workspace(&fx);
+    session_workspaces().set_resolved("dev", fx.master.clone(), fx.workspace.clone(), None);
+    let params = json!({"session_id":fx.master, "names":["prepared-page"], "brief":BRIEF,
+        "inputs":["pages/page-03.json", {"path":"renders/page-03.png","kind":"image"}]});
+    let prepare = |params| RpcRequest::new("prepare".to_owned(), APPUI_METHOD_PEER_PREPARE, params);
+    let prepared = raw_peer_prepare(&fx.state, &prepare(params), Some("dev"))
+        .await
+        .unwrap();
+    peer_topic_turn(
+        &fx,
+        prepared["slug"].as_str().unwrap(),
+        prepared["topic"].as_str().unwrap(),
+        BRIEF,
+    )
+    .await;
+    let requests = sent(&fx.server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(read_file_calls(&requests), 0);
+    assert_eq!(request_images(&requests[0]), [image_url(PAGE_IMAGE)]);
+    assert!(request_text(&requests[0]).contains(PAGE_DATA));
+}
+
+#[tokio::test]
+async fn peer_prepare_rejects_unusable_inputs_before_staging() {
+    let fx = fixture(vec![], None).await;
+    session_workspaces().set_resolved("dev", fx.master.clone(), fx.workspace.clone(), None);
+    let base =
+        json!({"session_id":fx.master,"names":["refused"],"brief":BRIEF,"inputs":["missing.json"]});
+    for (field, value, reason) in [
+        ("session_id", Value::Null, "owning session"),
+        ("cwd", json!(fx.tmp.path()), "owning session's workspace"),
+        (
+            "memory_namespace",
+            json!("app/test/inputs"),
+            "ordinary staged peer",
+        ),
+        ("inputs", json!(["missing.json"]), "missing"),
+    ] {
+        let mut params = base.clone();
+        params[field] = value;
+        let req = RpcRequest::new("prepare".to_owned(), APPUI_METHOD_PEER_PREPARE, params);
+        let err = raw_peer_prepare(&fx.state, &req, Some("dev"))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains(reason), "{}", err.message);
+        assert!(!fx.data_dir.join("peers/refused").exists());
+    }
+    assert!(sent(&fx.server).await.is_empty());
+}
+
 /// The public sample: one slide's data and its rendering.
 fn page_workspace(fx: &Fx) {
     write(&fx.workspace, "pages/page-03.json", PAGE_DATA);
@@ -352,7 +405,11 @@ async fn hand_off_into(
 /// Send `text` as the next turn of the peer's own session, as the client
 /// that opened it does, and wait until the turn wrote the peer's result.
 async fn peer_turn(fx: &Fx, peer: &PeerStagedEvent, text: &str) {
-    let session = SessionKey(format!("{}#{}", fx.master.base_key(), peer.topic));
+    peer_topic_turn(fx, &peer.slug, &peer.topic, text).await;
+}
+
+async fn peer_topic_turn(fx: &Fx, slug: &str, topic: &str, text: &str) {
+    let session = SessionKey(format!("{}#{topic}", fx.master.base_key()));
     let turn_id = TurnId::new();
     let (ws, mut rx) = ws_connection_for_test(256);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -396,7 +453,7 @@ async fn peer_turn(fx: &Fx, peer: &PeerStagedEvent, text: &str) {
         attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let result = fx.data_dir.join("peers").join(&peer.slug).join("result.md");
+    let result = fx.data_dir.join("peers").join(slug).join("result.md");
     let needle = format!("turn_id: {}", turn_id.0);
     while !std::fs::read_to_string(&result).is_ok_and(|body| body.contains(&needle)) {
         assert!(

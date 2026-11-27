@@ -164,7 +164,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/sub_providers/remove` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `snapshot/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `snapshot/restore` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `peer/prepare` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/prepare` | shipped; optional ordinary-peer `inputs` advertised by `peer.prepare.inputs.v1` (UPCR-2026-R6D93A209) |
 | `peer/gather` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/model/set` | shipped; UPCR-2026-034 host-owned app peers |
 | `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers; optional `share_history` (parallel person context with shared history, amended 2026-09-29) |
