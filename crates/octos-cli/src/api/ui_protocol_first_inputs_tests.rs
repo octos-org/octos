@@ -328,8 +328,7 @@ async fn peer_prepare_delivers_declared_page_inputs_in_the_first_request() {
 async fn peer_prepare_rejects_unusable_inputs_before_staging() {
     let fx = fixture(vec![], None).await;
     session_workspaces().set_resolved("dev", fx.master.clone(), fx.workspace.clone(), None);
-    let base =
-        json!({"session_id":fx.master,"names":["refused"],"brief":BRIEF,"inputs":["missing.json"]});
+    let base = json!({"session_id":fx.master,"cwd":fx.workspace,"names":["refused"],"brief":BRIEF,"inputs":["missing.json"]});
     for (field, value, reason) in [
         ("session_id", Value::Null, "owning session"),
         ("cwd", json!(fx.tmp.path()), "owning session's workspace"),
