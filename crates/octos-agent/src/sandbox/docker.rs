@@ -85,20 +85,30 @@ fn mount_source_has_injection(source: &str) -> bool {
     normalized.contains(['\0', '\n', '\r']) || strip_windows_drive(&normalized).contains(':')
 }
 
-/// Split an extra bind's `source[:dest[:mode]]`, honouring a Windows drive
-/// colon in the source and normalizing a verbatim prefix (`\\?\C:\foo:/bar`
-/// splits after `C:\foo`). The destination never contains a colon on either
-/// host, so a second separator starts the mode (`:ro`) and is NOT part of
-/// the destination — hidden-folder masks are computed from the returned
-/// destination. `None` when the source cannot be normalized for Docker.
-fn split_bind_spec(bind: &str) -> Option<(String, Option<String>)> {
+/// Split an extra bind into its NORMALIZED source and the untouched suffix
+/// (`:dest[:mode]`). Only the host source is normalized for Docker (a
+/// verbatim `\\?\C:\foo` becomes `C:\foo`); the destination and the mode
+/// reach Docker exactly as configured — rebuilding the spec from parts would
+/// drop `:ro` and turn a read-only bind writable. The destination never
+/// contains a colon on either host, so a second separator in the suffix
+/// starts the mode. `None` when the source cannot be normalized.
+fn split_bind_spec(bind: &str) -> Option<(String, String)> {
     let normalized = normalize_mount_source(bind)?;
     let skipped = normalized.len() - strip_windows_drive(&normalized).len();
-    let mut parts = normalized[skipped..].split(':');
-    let tail = parts.next().unwrap_or_default();
-    let source = &normalized[..skipped + tail.len()];
-    let dest = parts.next();
-    Some((source.to_owned(), dest.map(str::to_owned)))
+    let tail = normalized[skipped..].split(':').next().unwrap_or_default();
+    let source = normalized[..skipped + tail.len()].to_owned();
+    let suffix = normalized[skipped + tail.len()..].to_owned();
+    Some((source, suffix))
+}
+
+/// The bind destination for hidden-folder mask computation: the suffix's
+/// first field, or the source when the bind has no explicit destination.
+fn bind_dest<'a>(source: &'a str, suffix: &'a str) -> &'a str {
+    suffix
+        .strip_prefix(':')
+        .and_then(|rest| rest.split(':').next())
+        .filter(|dest| !dest.is_empty())
+        .unwrap_or(source)
 }
 
 /// Check if a bind mount source is dangerous.
@@ -377,7 +387,7 @@ impl DockerSandbox {
 
         // Extra bind mounts (validated against dangerous sources)
         for bind in &self.config.extra_binds {
-            let Some((source, dest)) = split_bind_spec(bind) else {
+            let Some((source, suffix)) = split_bind_spec(bind) else {
                 tracing::warn!(
                     bind = %bind,
                     "skipping bind mount whose source cannot be normalized for Docker"
@@ -391,15 +401,9 @@ impl DockerSandbox {
                 );
                 continue;
             }
-            let dest = dest
-                .filter(|dest| !dest.is_empty())
-                .unwrap_or(source.clone());
-            hidden_mounts.push((std::path::PathBuf::from(&source), dest.clone()));
-            let spec = match dest.is_empty() {
-                true => source,
-                false => format!("{source}:{dest}"),
-            };
-            cmd.arg("-v").arg(spec);
+            let dest = bind_dest(&source, &suffix).to_owned();
+            hidden_mounts.push((std::path::PathBuf::from(&source), dest));
+            cmd.arg("-v").arg(format!("{source}{suffix}"));
         }
 
         if let Some(slot) = slot {
@@ -528,22 +532,34 @@ mod validation_tests {
 
     #[test]
     fn should_split_bind_specs_after_a_windows_drive() {
-        type Case = (&'static str, Option<(&'static str, Option<&'static str>)>);
-        let cases: [Case; 8] = [
-            ("C:\\foo:/bar", Some(("C:\\foo", Some("/bar")))),
-            ("C:\\foo", Some(("C:\\foo", None))),
-            ("/a:/b", Some(("/a", Some("/b")))),
-            ("/a", Some(("/a", None))),
-            ("C:\\foo:ro", Some(("C:\\foo", Some("ro")))),
-            ("/projects:/work:ro", Some(("/projects", Some("/work")))),
-            ("C:\\proj:/work:ro", Some(("C:\\proj", Some("/work")))),
-            ("\\\\?\\C:\\foo:/bar", Some(("C:\\foo", Some("/bar")))),
+        // (bind, source, dest-for-masks, final -v argument): the mode and
+        // destination reach Docker exactly as configured.
+        let cases: [(&str, (&str, &str, &str)); 8] = [
+            ("C:\\foo:/bar", ("C:\\foo", "/bar", "C:\\foo:/bar")),
+            ("C:\\foo", ("C:\\foo", "C:\\foo", "C:\\foo")),
+            ("/a:/b", ("/a", "/b", "/a:/b")),
+            ("/a", ("/a", "/a", "/a")),
+            ("C:\\foo:ro", ("C:\\foo", "ro", "C:\\foo:ro")),
+            (
+                "/projects:/work:ro",
+                ("/projects", "/work", "/projects:/work:ro"),
+            ),
+            (
+                "C:\\proj:/work:ro",
+                ("C:\\proj", "/work", "C:\\proj:/work:ro"),
+            ),
+            (
+                "\\\\?\\C:\\foo:/bar:ro",
+                ("C:\\foo", "/bar", "C:\\foo:/bar:ro"),
+            ),
         ];
-        for (bind, expected) in cases {
-            let got = split_bind_spec(bind);
-            let got = got.as_ref().map(|(s, d)| (s.as_str(), d.as_deref()));
-            assert_eq!(got, expected, "{bind}");
+        for (bind, (source, dest, spec)) in cases {
+            let (got_source, suffix) = split_bind_spec(bind).unwrap();
+            assert_eq!(got_source, source, "{bind}");
+            assert_eq!(bind_dest(&got_source, &suffix), dest, "{bind}");
+            assert_eq!(format!("{got_source}{suffix}"), spec, "{bind}");
         }
+        assert!(split_bind_spec("\\\\.\\pipe\\x:/bar").is_none());
     }
 }
 
