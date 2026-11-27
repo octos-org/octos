@@ -65,6 +65,25 @@ fn octos_home_shared_read_grants(octos_home: &Path) -> Vec<String> {
     .collect()
 }
 
+/// Derive the shell's read grants from the octos home: `(paths, strict)`.
+/// The shared skill trees that exist — or, on a first boot with neither
+/// (T-0698), the default system read paths under `strict`, so the macOS
+/// policy covers the workspace, the git dir and system paths instead of
+/// falling back to the legacy global `(allow file-read*)` when the derived
+/// list is empty. An explicit operator `read_allow_paths` never comes here.
+fn derive_sandbox_read_grants(octos_home: &Path) -> (Vec<String>, bool) {
+    let shared = octos_home_shared_read_grants(octos_home);
+    if !shared.is_empty() {
+        return (shared, false);
+    }
+    let system = octos_agent::sandbox::DEFAULT_READ_ALLOW_PATHS
+        .iter()
+        .filter(|path| Path::new(path).exists())
+        .map(|path| (*path).to_owned())
+        .collect();
+    (system, true)
+}
+
 /// Immutable inputs needed to rebuild only a profile's plugin-derived layer.
 /// Long-lived stores, providers, schedulers, and profile services are reused
 /// from the existing [`ProfileRuntime`].
@@ -1349,9 +1368,9 @@ impl ProfileRuntime {
         if super::host_scope::active() {
             super::host_scope::constrain_sandbox(&mut sandbox_config);
         } else if sandbox_config.read_allow_paths.is_empty() {
-            sandbox_config
-                .read_allow_paths
-                .extend(octos_home_shared_read_grants(&effective_octos_home));
+            let (grants, strict) = derive_sandbox_read_grants(&effective_octos_home);
+            sandbox_config.read_allow_paths.extend(grants);
+            sandbox_config.strict_read_paths |= strict;
         }
         let default_sandbox = sandbox_config.clone();
         let sandbox = create_sandbox(&sandbox_config);
@@ -2314,5 +2333,46 @@ mod tests {
             assert_eq!(config.model, "gpt-4o-mini");
             assert_eq!(config.api_key, "test-key-sk-fake");
         }
+    }
+
+    /// T-0698: a first boot with NEITHER shared skill tree derives the
+    /// system paths under strict — never an empty list (which macOS would
+    /// widen into a global `file-read*`).
+    #[test]
+    fn should_derive_system_grants_when_no_shared_skill_dirs_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let (grants, strict) = derive_sandbox_read_grants(home.path());
+        assert!(strict);
+        assert!(!grants.is_empty());
+        assert!(grants.iter().all(|path| Path::new(path).is_absolute()));
+        assert!(!grants.iter().any(|path| path.contains("skills")));
+    }
+
+    /// T-0698: each existing shared tree is granted by its own exact path,
+    /// never widened by the other's absence.
+    #[test]
+    fn should_grant_only_the_shared_skill_dirs_that_exist() {
+        let home = tempfile::tempdir().unwrap();
+        let bundled = home
+            .path()
+            .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+        let platform = home
+            .path()
+            .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
+        std::fs::create_dir_all(&bundled).unwrap();
+        let (grants, strict) = derive_sandbox_read_grants(home.path());
+        assert!(!strict && grants == [bundled.to_string_lossy().into_owned()]);
+        std::fs::create_dir_all(&platform).unwrap();
+        let (grants, _) = derive_sandbox_read_grants(home.path());
+        assert_eq!(
+            grants,
+            [
+                bundled.to_string_lossy().into_owned(),
+                platform.to_string_lossy().into_owned(),
+            ]
+        );
+        std::fs::remove_dir_all(&bundled).unwrap();
+        let (grants, strict) = derive_sandbox_read_grants(home.path());
+        assert!(!strict && grants == [platform.to_string_lossy().into_owned()]);
     }
 }
