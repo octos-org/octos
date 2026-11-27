@@ -476,6 +476,7 @@ const APPUI_METHOD_SNAPSHOT_RESTORE: &str = "snapshot/restore";
 /// returned cwd/topic, so the peer is an ordinary sovereign session whose
 /// contract survives on disk (reviewable, diffable, respawnable).
 const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
+const APPUI_FEATURE_PEER_PREPARE_INPUTS: &str = "peer.prepare.inputs.v1";
 /// `peer/gather` (#1801 v2): read the profile's peer blackboard — every
 /// staged peer's brief + latest result file (written on the peer's turn
 /// terminals). The manual fan-in: `/gather` composes these into the caller's
@@ -2726,7 +2727,7 @@ impl ConnectionUiFeatures {
         );
         push_capability_feature(
             &mut capabilities.supported_features,
-            "peer.prepare.inputs.v1",
+            APPUI_FEATURE_PEER_PREPARE_INPUTS,
         );
         for method in APPUI_EXTRA_METHODS {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
@@ -22980,6 +22981,19 @@ fn filter_capabilities_for_session_ingress(capabilities: &mut UiProtocolCapabili
     capabilities
         .supported_methods
         .retain(|method| session_ingress_callable_method(method));
+    filter_peer_prepare_inputs_capability(capabilities);
+}
+
+fn filter_peer_prepare_inputs_capability(capabilities: &mut UiProtocolCapabilities) {
+    if !capabilities
+        .supported_methods
+        .iter()
+        .any(|m| m == APPUI_METHOD_PEER_PREPARE)
+    {
+        capabilities
+            .supported_features
+            .retain(|f| f != APPUI_FEATURE_PEER_PREPARE_INPUTS);
+    }
 }
 
 /// Host-managed external credentials share the exact allowlist used by the
@@ -22988,6 +23002,7 @@ fn filter_capabilities_for_host_managed_external(capabilities: &mut UiProtocolCa
     capabilities.supported_methods.retain(|method| {
         crate::api::host_managed::EXTERNAL_ALLOWED_METHODS.contains(&method.as_str())
     });
+    filter_peer_prepare_inputs_capability(capabilities);
     if !capabilities.supported_methods.iter().any(|method| {
         matches!(
             method.as_str(),
