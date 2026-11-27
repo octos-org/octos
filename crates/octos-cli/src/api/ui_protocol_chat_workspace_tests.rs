@@ -15,6 +15,10 @@ use octos_core::ui_protocol::{
 #[tokio::test]
 async fn fixture_cleanup_unregisters_the_profile_chats_root() {
     let temp = tempfile::tempdir().unwrap();
+    // Registration stores the CANONICAL root — on Windows that is the
+    // verbatim `\\?\C:\…` form, so compare against the canonical temp
+    // path, not the lexical one.
+    let root = std::fs::canonicalize(temp.path()).unwrap();
     let reserved = chat_workspace::reserved_folders();
     let registered_under = |root: &Path| {
         reserved
@@ -26,9 +30,9 @@ async fn fixture_cleanup_unregisters_the_profile_chats_root() {
     {
         let (_state, _profile, cleanup) =
             state_with_profile_llm(temp.path(), "t0700", unused_llm()).await;
-        assert!(registered_under(temp.path()) > 0);
+        assert!(registered_under(&root) > 0);
         drop(cleanup);
-        assert_eq!(registered_under(temp.path()), 0);
+        assert_eq!(registered_under(&root), 0);
     }
 }
 
