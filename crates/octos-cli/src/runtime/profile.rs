@@ -2346,8 +2346,15 @@ mod tests {
         if !cfg!(target_os = "macos") {
             return;
         }
-        // First boot: neither shared skill tree exists under the home.
-        let home = tempfile::tempdir().unwrap();
+        // First boot: neither shared skill tree exists under the home. The
+        // fixture home must sit in the REAL user home: a tempdir lives under
+        // /private/var/folders, which the derived system grants legitimately
+        // cover — a "secret" planted there would be readable for the right
+        // reason and prove nothing.
+        let home = tempfile::Builder::new()
+            .prefix("t0698-first-boot-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
         let (grants, strict) = derive_sandbox_read_grants(home.path());
         assert!(strict);
         let work = tempfile::tempdir().unwrap();
@@ -2364,6 +2371,10 @@ mod tests {
             ..Default::default()
         };
         let sandbox = octos_agent::sandbox::create_sandbox(&config);
+        if sandbox.is_noop() {
+            eprintln!("T-0698 evidence: SKIP — no confining backend on this host");
+            return;
+        }
         let run = |cmd: String| {
             let cwd = work.path().to_path_buf();
             let sandbox = &sandbox;
@@ -2402,8 +2413,13 @@ mod tests {
         assert!(code != 0, "chats root must be unreadable: {err}");
         eprintln!("T-0698 evidence: cat chats/abc/secret.txt -> exit {code} (denied)");
 
-        // With a shared skill tree present, its files ARE readable.
-        let home2 = tempfile::tempdir().unwrap();
+        // With a shared skill tree present, its files ARE readable — again
+        // under the real home so readability can only come from the derived
+        // grant, never from a system-path overlap.
+        let home2 = tempfile::Builder::new()
+            .prefix("t0698-shared-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
         let skill = home2
             .path()
             .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR)
