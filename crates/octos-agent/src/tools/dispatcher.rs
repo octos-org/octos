@@ -15,6 +15,12 @@ pub(crate) const DIRECT: &[&str] = &[
     "exec_command",
     "discover_tools",
     "run_tool",
+    // T-0699: user-facing delivery. A Chat told to hand over a file must see
+    // the delivery tool in its list — behind run_tool the model discovered
+    // but never called it, and then claimed the attachment in prose anyway.
+    // Path policy stays with the per-session SendFileTool registration
+    // (chat-folder pin / hidden folders), so visibility widens nothing else.
+    "send_file",
 ];
 const MAX_DISCOVERY_BYTES: usize = 24_000;
 
@@ -234,5 +240,43 @@ impl ToolRegistry {
             success: true,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Stub(&'static str);
+
+    #[async_trait]
+    impl Tool for Stub {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "stub"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &Value) -> Result<ToolResult> {
+            unreachable!("surface test never executes")
+        }
+    }
+
+    /// T-0699: on a dispatch-gateway registry the office-delivery tool is in
+    /// the model-visible tool list, not hidden behind `run_tool`.
+    #[test]
+    fn should_expose_send_file_directly_on_the_dispatch_surface() {
+        let mut registry = ToolRegistry::new();
+        registry.register(DiscoverTools);
+        registry.register(RunTool);
+        registry.register(Stub("send_file"));
+        assert!(registry.is_tool_visible("send_file"));
+        assert!(registry.specs().iter().any(|tool| tool.name == "send_file"));
     }
 }
