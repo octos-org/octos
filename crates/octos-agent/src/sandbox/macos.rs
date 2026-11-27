@@ -741,6 +741,55 @@ impl Sandbox for MacosSandbox {
 mod tests {
     use super::*;
 
+    /// The SBPL profile a config produces, straight off the wrapped command.
+    /// Off-target the Macos backend arm fails closed with a refusal command
+    /// (no `-p` profile), so the policy-text tests below cannot run there.
+    #[cfg(not(target_os = "windows"))]
+    fn sbpl_profile(read_allow_paths: &[&str], strict: bool, cwd: &Path) -> String {
+        let config = crate::sandbox::SandboxConfig {
+            read_allow_paths: read_allow_paths.iter().map(|p| (*p).to_owned()).collect(),
+            strict_read_paths: strict,
+            ..Default::default()
+        };
+        let sandbox =
+            super::super::build_backend(crate::sandbox::SandboxBackendChoice::Macos, &config);
+        let cmd = sandbox.wrap_command("true", cwd);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let at = args.iter().position(|arg| arg == "-p").unwrap();
+        args[at + 1].clone()
+    }
+
+    /// T-0698: an explicit operator read list (or the derived system paths
+    /// under strict) yields a restricted policy — the profile text has NO
+    /// bare global `(allow file-read*)` line, while the workspace and the
+    /// granted paths are covered. The legacy unconfigured empty list keeps
+    /// the documented global-read default for the raw CLI path.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn should_never_widen_derived_read_grants_to_a_global_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path();
+        let bare_global = |profile: &str| profile.lines().any(|line| line == "(allow file-read*)");
+
+        let legacy = sbpl_profile(&[], false, cwd);
+        assert!(bare_global(&legacy));
+
+        let strict_empty = sbpl_profile(&[], true, cwd);
+        assert!(!bare_global(&strict_empty));
+
+        let derived = sbpl_profile(&["/usr", "/bin"], true, cwd);
+        assert!(!bare_global(&derived));
+        assert!(derived.contains("(allow file-read* (subpath "));
+        assert!(derived.contains("\"/usr\""));
+
+        let explicit = sbpl_profile(&["/usr"], false, cwd);
+        assert!(!bare_global(&explicit));
+    }
+
     #[test]
     fn should_refuse_rules_when_hidden_folder_was_deleted() {
         let temp = tempfile::tempdir().unwrap();

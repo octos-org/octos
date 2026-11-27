@@ -233,7 +233,10 @@ pub struct SandboxReadOnlyView {
 }
 
 /// Default system paths that must be readable for shell commands to work.
-pub(crate) const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
+/// Public so a profile runtime can grant them EXPLICITLY when its derived
+/// shared grants come up empty — the difference between a restricted policy
+/// and the legacy global `(allow file-read*)` fallback (T-0698).
+pub const DEFAULT_READ_ALLOW_PATHS: &[&str] = &[
     "/usr",
     "/bin",
     "/sbin",
