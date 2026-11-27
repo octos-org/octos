@@ -1308,7 +1308,9 @@ pub(crate) async fn g1_raise_approval(
 /// suites ~5x slower than a dev box, and the IM approval tests chain several
 /// async hops (raise → ledger broadcast → watch task → channel).
 pub(crate) async fn until_some<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..3000 {
+    // 90s: the Windows CI leg runs the async orchestration several times
+    // slower than the Linux one that motivated the first raise.
+    for _ in 0..9000 {
         if let Some(done) = f() {
             return done;
         }

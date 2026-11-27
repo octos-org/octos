@@ -580,7 +580,7 @@ async fn projected(channel: &FakeChannel, at: usize) -> String {
 }
 
 async fn sent_with(channel: &FakeChannel, needle: &str) {
-    until_some("channel send/edit", || {
+    until_some(&format!("channel send/edit containing '{needle}'"), || {
         let sent = channel.sent.lock().unwrap();
         sent.iter().any(|(_, t, _)| t.contains(needle)).then_some(())
     })
