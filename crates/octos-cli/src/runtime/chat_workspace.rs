@@ -557,26 +557,26 @@ pub(crate) fn hidden_fixture_guard(root: &Path) -> HiddenFixtureGuard {
 /// drop closes the leak: another test's backend never meets a registered
 /// root whose folder is already gone ("cannot be accounted for" refusals
 /// under parallel suites on bwrap and AppContainer).
-#[cfg(all(test, feature = "api"))]
+#[cfg(test)]
 pub(crate) struct HiddenFixtureCleanup {
     root: PathBuf,
 }
 
-#[cfg(all(test, feature = "api"))]
+#[cfg(test)]
 pub(crate) fn hidden_fixture_cleanup(root: &Path) -> HiddenFixtureCleanup {
     HiddenFixtureCleanup {
         root: canonical_dir(root),
     }
 }
 
-#[cfg(all(test, feature = "api"))]
+#[cfg(test)]
 impl Drop for HiddenFixtureCleanup {
     fn drop(&mut self) {
         cleanup_registered_under(&self.root);
     }
 }
 
-#[cfg(all(test, feature = "api"))]
+#[cfg(test)]
 fn cleanup_registered_under(root: &Path) {
     let mut layout = layout_write();
     layout
