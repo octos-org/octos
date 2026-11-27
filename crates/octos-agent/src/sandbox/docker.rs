@@ -41,14 +41,18 @@ fn mount_source_has_injection(source: &str) -> bool {
     source.contains(['\0', '\n', '\r']) || strip_windows_drive(source).contains(':')
 }
 
-/// Split an extra bind's `source[:dest]`, honouring a Windows drive colon in
-/// the source (`C:\foo:/bar` splits after `C:\foo`, not after `C`).
+/// Split an extra bind's `source[:dest[:mode]]`, honouring a Windows drive
+/// colon in the source (`C:\foo:/bar` splits after `C:\foo`, not after
+/// `C`). The destination never contains a colon on either host, so a second
+/// separator starts the mode (`:ro`) and is NOT part of the destination —
+/// hidden-folder masks are computed from the returned destination.
 fn split_bind_spec(bind: &str) -> (&str, Option<&str>) {
     let skipped = bind.len() - strip_windows_drive(bind).len();
-    match bind[skipped..].find(':') {
-        Some(at) => (&bind[..skipped + at], Some(&bind[skipped + at + 1..])),
-        None => (bind, None),
-    }
+    let mut parts = bind[skipped..].split(':');
+    let tail = parts.next().unwrap_or_default();
+    let source = &bind[..skipped + tail.len()];
+    let dest = parts.next();
+    (source, dest)
 }
 
 /// Check if a bind mount source is dangerous.
@@ -371,12 +375,14 @@ mod validation_tests {
 
     #[test]
     fn should_split_bind_specs_after_a_windows_drive() {
-        let cases: [(&str, (&str, Option<&str>)); 5] = [
+        let cases: [(&str, (&str, Option<&str>)); 7] = [
             ("C:\\foo:/bar", ("C:\\foo", Some("/bar"))),
             ("C:\\foo", ("C:\\foo", None)),
             ("/a:/b", ("/a", Some("/b"))),
             ("/a", ("/a", None)),
             ("C:\\foo:ro", ("C:\\foo", Some("ro"))),
+            ("/projects:/work:ro", ("/projects", Some("/work"))),
+            ("C:\\proj:/work:ro", ("C:\\proj", Some("/work"))),
         ];
         for (bind, expected) in cases {
             assert_eq!(split_bind_spec(bind), expected, "{bind}");
