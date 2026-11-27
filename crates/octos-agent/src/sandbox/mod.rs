@@ -721,6 +721,11 @@ pub trait HostBackendProbe {
     fn windows_container_helper(&self) -> bool;
     /// `docker` is on PATH.
     fn docker(&self) -> bool;
+    /// The Docker daemon answers `docker info` and runs LINUX containers
+    /// (OSType == "linux"). A Docker Desktop daemon in Windows containers
+    /// mode — or an unreachable daemon — answers false. The probe never
+    /// pulls an image, switches the daemon, or touches host configuration.
+    fn docker_linux_containers(&self) -> bool;
 }
 
 /// The production probe: real host checks; `false` for backends whose probe
@@ -767,6 +772,18 @@ impl HostBackendProbe for RealHostProbe {
 
     fn docker(&self) -> bool {
         which_exists("docker")
+    }
+
+    fn docker_linux_containers(&self) -> bool {
+        // Read-only daemon probe: no pull, no daemon switch, no host change.
+        // Any failure (daemon down, pipe missing) answers false — fail closed.
+        std::process::Command::new("docker")
+            .args(["info", "--format", "{{.OSType}}"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|out| out.status.success() && out.stdout == b"linux\n")
+            .unwrap_or(false)
     }
 }
 
@@ -913,10 +930,19 @@ fn refuse_wrong_os(requested: &str, needs: &str, os: HostOs) -> SandboxDecision 
 
 /// Refusal for an explicit mode whose backend is missing/broken on this host.
 fn refuse_missing(requested: &str, missing: &str, os: HostOs) -> SandboxDecision {
+    refuse_with(
+        requested,
+        &format!("sandbox.mode=\"{requested}\" is set but {missing}"),
+        &remediation_for(os),
+    )
+}
+
+/// A typed explicit-mode refusal with a caller-chosen remediation.
+fn refuse_with(requested: &str, reason: &str, remediation: &str) -> SandboxDecision {
     SandboxDecision::Refuse(SandboxUnavailable {
         requested: requested.to_string(),
-        reason: format!("sandbox.mode=\"{requested}\" is set but {missing}"),
-        remediation: remediation_for(os),
+        reason: reason.to_string(),
+        remediation: remediation.to_string(),
     })
 }
 
@@ -981,10 +1007,22 @@ pub fn decide_sandbox(
             }
         }
         SandboxMode::Docker => {
-            if probe.docker() {
-                SandboxDecision::Confine(SandboxBackendChoice::Docker)
-            } else {
+            if !probe.docker() {
                 refuse_missing("docker", "docker was not found on PATH", os)
+            } else if !probe.docker_linux_containers() {
+                // Windows-containers-mode daemons (or an unreachable daemon)
+                // cannot run the Linux images the Docker backend assumes —
+                // refuse with a typed, machine-detectable reason instead of
+                // failing later at `docker run` with a manifest error.
+                refuse_with(
+                    "docker",
+                    "sandbox.mode=\"docker\" is set but the Docker daemon does not run \
+                     Linux containers (daemon unreachable or in Windows containers mode)",
+                    "switch Docker Desktop to Linux containers (tray icon → \
+                     'Switch to Linux containers'), or choose another sandbox.mode",
+                )
+            } else {
+                SandboxDecision::Confine(SandboxBackendChoice::Docker)
             }
         }
         SandboxMode::AppContainer => {
@@ -1013,7 +1051,10 @@ pub fn decide_sandbox(
                 }
                 _ => None,
             };
-            match native.or_else(|| probe.docker().then_some(SandboxBackendChoice::Docker)) {
+            match native.or_else(|| {
+                (probe.docker() && probe.docker_linux_containers())
+                    .then_some(SandboxBackendChoice::Docker)
+            }) {
                 Some(choice) => SandboxDecision::Confine(choice),
                 None if config.fail_closed => SandboxDecision::Refuse(SandboxUnavailable {
                     requested: "auto".to_string(),
@@ -1606,6 +1647,7 @@ mod tests {
         linux_helper: bool,
         windows_helper: bool,
         docker: bool,
+        docker_linux: bool,
     }
 
     impl HostBackendProbe for FakeProbe {
@@ -1624,6 +1666,9 @@ mod tests {
         fn docker(&self) -> bool {
             self.docker
         }
+        fn docker_linux_containers(&self) -> bool {
+            self.docker_linux
+        }
     }
 
     const NO_BACKENDS: FakeProbe = FakeProbe {
@@ -1632,6 +1677,7 @@ mod tests {
         linux_helper: false,
         windows_helper: false,
         docker: false,
+        docker_linux: false,
     };
 
     const ALL_OSES: [HostOs; 4] = [HostOs::Linux, HostOs::Macos, HostOs::Windows, HostOs::Other];
@@ -1652,6 +1698,81 @@ mod tests {
                 SandboxDecision::Unconfined(UnconfinedReason::AutoNoBackend),
                 "default config on a backend-less {os:?} host must stay unconfined"
             );
+        }
+    }
+
+    /// T-0709: a Docker Desktop daemon in WINDOWS containers mode cannot run
+    /// the Linux images the Docker backend assumes. The probe must see the
+    /// daemon's container OS, not just the CLI/daemon's presence.
+    const DOCKER_WINDOWS_MODE: FakeProbe = FakeProbe {
+        docker: true,
+        docker_linux: false,
+        ..NO_BACKENDS
+    };
+    const DOCKER_LINUX_MODE: FakeProbe = FakeProbe {
+        docker: true,
+        docker_linux: true,
+        ..NO_BACKENDS
+    };
+
+    fn docker_mode() -> SandboxConfig {
+        SandboxConfig {
+            mode: SandboxMode::Docker,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn should_refuse_explicit_docker_when_the_daemon_runs_windows_containers() {
+        for os in ALL_OSES {
+            let decision = decide_sandbox(&docker_mode(), os, &DOCKER_WINDOWS_MODE);
+            let SandboxDecision::Refuse(unavailable) = decision else {
+                panic!("explicit docker on a Windows-mode daemon must refuse ({os:?})");
+            };
+            assert_eq!(unavailable.requested, "docker");
+            assert!(unavailable.reason.contains("Linux containers"), "{os:?}");
+            assert!(
+                unavailable
+                    .remediation
+                    .contains("Switch to Linux containers"),
+                "{os:?}"
+            );
+        }
+        // A Linux-containers daemon stays the supported path.
+        for os in ALL_OSES {
+            assert_eq!(
+                decide_sandbox(&docker_mode(), os, &DOCKER_LINUX_MODE),
+                SandboxDecision::Confine(SandboxBackendChoice::Docker),
+                "explicit docker on a Linux-mode daemon must confine ({os:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_pick_a_windows_mode_daemon_in_auto() {
+        for os in ALL_OSES {
+            assert_eq!(
+                decide_sandbox(&auto_config(), os, &DOCKER_WINDOWS_MODE),
+                SandboxDecision::Unconfined(UnconfinedReason::AutoNoBackend),
+                "auto must not select a Windows-mode daemon ({os:?})"
+            );
+            assert_eq!(
+                decide_sandbox(&auto_config(), os, &DOCKER_LINUX_MODE),
+                SandboxDecision::Confine(SandboxBackendChoice::Docker),
+                "auto keeps picking a Linux-mode daemon ({os:?})"
+            );
+        }
+        // fail_closed is NOT relaxed by the probe: no capable backend stays
+        // a refusal even when a Windows-mode daemon is present.
+        let fail_closed = SandboxConfig {
+            fail_closed: true,
+            ..Default::default()
+        };
+        for os in ALL_OSES {
+            assert!(matches!(
+                decide_sandbox(&fail_closed, os, &DOCKER_WINDOWS_MODE),
+                SandboxDecision::Refuse(_)
+            ));
         }
     }
 
