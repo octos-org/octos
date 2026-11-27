@@ -2343,9 +2343,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let (grants, strict) = derive_sandbox_read_grants(home.path());
         assert!(strict);
-        assert!(!grants.is_empty());
         assert!(grants.iter().all(|path| Path::new(path).is_absolute()));
         assert!(!grants.iter().any(|path| path.contains("skills")));
+        // The system paths exist on macOS/Linux; Windows has none of them
+        // and AppContainer appends its own WINDOWS_READ_ALLOW_PATHS, so an
+        // empty list there is correct too — the cross-platform invariant is
+        // strict + no widening, not a particular length.
+        #[cfg(unix)]
+        assert!(!grants.is_empty());
     }
 
     /// T-0698: each existing shared tree is granted by its own exact path,
