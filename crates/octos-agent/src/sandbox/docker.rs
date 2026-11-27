@@ -357,26 +357,46 @@ mod tests {
     use super::*;
     use std::process::Command as Proc;
 
-    /// A locally available test image; None skips (CI without a registry).
-    fn image() -> Option<String> {
+    /// The locally available test images, in preference order; empty skips
+    /// (CI without a registry).
+    fn images() -> Vec<String> {
         let up = Proc::new("docker").arg("info").output();
-        if !up.ok()?.status.success() {
-            return None;
+        if !up.is_ok_and(|out| out.status.success()) {
+            return Vec::new();
         }
-        let images = [
+        [
             "ubuntu:24.04",
             "node:22-bookworm",
             "python:3.12-slim",
             "alpine:latest",
-        ];
-        for image in images {
-            let mut inspect = Proc::new("docker");
-            let out = inspect.args(["image", "inspect", image]).output();
-            if out.is_ok_and(|out| out.status.success()) {
-                return Some(image.to_owned());
-            }
-        }
-        None
+        ]
+        .into_iter()
+        .filter(|image| {
+            Proc::new("docker")
+                .args(["image", "inspect", image])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// A locally available test image; None skips (CI without a registry).
+    fn image() -> Option<String> {
+        images().into_iter().next()
+    }
+
+    /// A locally available test image that actually ships `git` (only
+    /// `node:22-bookworm` of the candidates does); None skips. The r8 probe
+    /// runs git INSIDE the container, so an image without git must not stand
+    /// in — its checks would never execute.
+    fn git_image() -> Option<String> {
+        images().into_iter().find(|image| {
+            Proc::new("docker")
+                .args(["run", "--rm", image, "git", "--version"])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
     }
 
     fn sandbox(image: &str, hidden: octos_core::HiddenFolders) -> DockerSandbox {
@@ -422,7 +442,7 @@ mod tests {
     /// masked on the alias mount too.
     #[tokio::test]
     async fn should_alias_host_path_and_scope_git_ownership() {
-        let Some(image) = image() else { return };
+        let Some(image) = git_image() else { return };
         let git_ok = Proc::new("git")
             .arg("--version")
             .output()
@@ -454,7 +474,7 @@ mod tests {
         hidden.add(work.join("chats")).unwrap();
         let host = work.display();
         let probe = format!(
-            "ls {host} >/dev/null && git status --porcelain | grep -q a.txt && git -C {host} diff --stat | grep -q a.txt && if [ -e {host}/chats/abc/secret.txt ]; then echo LEAKED; exit 1; fi; printf ok"
+            "ls {host} >/dev/null && git status --porcelain | grep -q a.txt && git -C {host} diff --stat | grep -q a.txt && if [ -e {host}/chats/abc/secret.txt ]; then echo LEAKED; exit 1; fi && printf ok"
         );
         let mut wrapped = sandbox(&image, hidden).wrap_command(&probe, &work);
         let out = wrapped.output().await.unwrap();
