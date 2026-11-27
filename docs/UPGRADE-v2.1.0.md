@@ -59,11 +59,15 @@ Code workflow (#3377). A sibling data directory outside the container's mounts
 is naturally invisible; a hidden root inside a mount is covered with a private
 empty `tmpfs`. If a bind source is the hidden root or lies inside it, the
 command still refuses because that bind would cover the mask. The default
-bootstrap read grant no longer exposes the whole Octos home: only existing
-shared skill directories are granted. Landlock, AppContainer and no-sandbox
-refusal semantics are unchanged. Refusal text now distinguishes a **read path**
-that contains a hidden root from the command workspace itself and names the
-path to narrow.
+bootstrap read grant no longer exposes the whole Octos home: each existing
+shared skill directory is granted by its precise path. When neither directory
+exists, the derived configuration grants only the existing default system
+read paths and enables strict reads, so macOS SBPL covers the workspace, Git
+metadata and those system paths—never a global `file-read*`—and the default
+shell still works (#3382). Explicit operator `read_allow_paths` are not
+rewritten. Landlock, AppContainer and no-sandbox refusal semantics are
+unchanged. Refusal text now distinguishes a **read path** that contains a
+hidden root from the command workspace itself and names the path to narrow.
 
 The refusal names the missing path and the available recovery action. Restore
 the original directory, or have an operator verify deletion and unregister a
