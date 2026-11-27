@@ -16,6 +16,45 @@ const BLOCKED_DOCKER_BIND_SOURCES: &[&str] = &[
     "/dev",
 ];
 
+/// Strip a legitimate Windows drive-letter prefix (`C:\…` or `C:/…`): its
+/// colon is the drive's, not the mount spec's `source:dest` separator. Bare
+/// `C:foo` is a drive-RELATIVE path (per-drive cwd), not an absolute one, so
+/// it is not stripped and stays refused like every other colon path. UNC
+/// paths (`\\server\share`) carry no drive colon and pass through whole.
+fn strip_windows_drive(source: &str) -> &str {
+    let bytes = source.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return &source[2..];
+    }
+    source
+}
+
+/// True when `source` cannot be a Docker mount source: control characters
+/// always, and any `:` left after a legitimate Windows drive prefix (it would
+/// split the `-v source:dest` spec — T-0696). This is NOT "allow all colons":
+/// a second colon, a bare `C:foo`, or any Unix colon still fails closed.
+fn mount_source_has_injection(source: &str) -> bool {
+    source.contains(['\0', '\n', '\r']) || strip_windows_drive(source).contains(':')
+}
+
+/// Split an extra bind's `source[:dest[:mode]]`, honouring a Windows drive
+/// colon in the source (`C:\foo:/bar` splits after `C:\foo`, not after
+/// `C`). The destination never contains a colon on either host, so a second
+/// separator starts the mode (`:ro`) and is NOT part of the destination —
+/// hidden-folder masks are computed from the returned destination.
+fn split_bind_spec(bind: &str) -> (&str, Option<&str>) {
+    let skipped = bind.len() - strip_windows_drive(bind).len();
+    let mut parts = bind[skipped..].split(':');
+    let tail = parts.next().unwrap_or_default();
+    let source = &bind[..skipped + tail.len()];
+    let dest = parts.next();
+    (source, dest)
+}
+
 /// Check if a bind mount source is dangerous.
 pub(crate) fn is_blocked_bind_source(source: &str) -> bool {
     let normalized = source.trim_end_matches('/');
@@ -229,13 +268,10 @@ impl DockerSandbox {
             cmd.arg("--env").arg(format!("{var}="));
         }
 
-        // Workspace mount -- validate path to prevent volume mount injection via ':'
+        // Workspace mount -- validate path to prevent volume mount injection
+        // via ':' (a Windows drive-letter colon is not the separator).
         let cwd_str = cwd.to_string_lossy();
-        if cwd_str.contains(':')
-            || cwd_str.contains('\0')
-            || cwd_str.contains('\n')
-            || cwd_str.contains('\r')
-        {
+        if mount_source_has_injection(&cwd_str) {
             tracing::error!(
                 "cwd contains invalid characters for Docker mount, refusing to execute"
             );
@@ -282,8 +318,7 @@ impl DockerSandbox {
 
         // Extra bind mounts (validated against dangerous sources)
         for bind in &self.config.extra_binds {
-            let mut parts = bind.split(':');
-            let source = parts.next().unwrap_or(bind);
+            let (source, dest) = split_bind_spec(bind);
             if is_blocked_bind_source(source) {
                 tracing::warn!(
                     bind = %bind,
@@ -291,10 +326,7 @@ impl DockerSandbox {
                 );
                 continue;
             }
-            let dest = parts
-                .next()
-                .filter(|dest| !dest.is_empty())
-                .unwrap_or(source);
+            let dest = dest.filter(|dest| !dest.is_empty()).unwrap_or(source);
             hidden_mounts.push((std::path::PathBuf::from(source), dest.to_owned()));
             cmd.arg("-v").arg(bind);
         }
@@ -306,7 +338,7 @@ impl DockerSandbox {
                 _ => return cache_mount_refusal(),
             };
             let source = target.to_string_lossy();
-            if source.contains([':', '\0', '\n', '\r']) || is_blocked_bind_source(&source) {
+            if mount_source_has_injection(&source) || is_blocked_bind_source(&source) {
                 return cache_mount_refusal();
             }
             // Only artifacts are writable; the claim's control files stay on the host.
@@ -350,6 +382,64 @@ fn cache_mount_refusal() -> Command {
     cmd.arg("-c")
         .arg("echo 'sandbox error: build-cache target cannot be mounted' >&2; exit 1");
     cmd
+}
+
+#[cfg(test)]
+mod validation_tests {
+    //! T-0696: mount-source validation is host-agnostic string work — these
+    //! run on every platform, including the Windows CI runner.
+    use super::*;
+
+    #[test]
+    fn should_allow_legitimate_windows_drive_and_unc_sources() {
+        for ok in [
+            "C:\\work",
+            "C:/work",
+            "c:\\temp",
+            "D:\\",
+            "E:/a b",
+            "\\server\\share\\dir",
+            "/data/work",
+            "/",
+        ] {
+            assert!(!mount_source_has_injection(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn should_refuse_colons_beyond_the_drive_and_control_characters() {
+        for bad in [
+            "C:\\work:evil",
+            "C:/a:b",
+            "C:work",
+            "C:",
+            "1:\\x",
+            "\\server\\share:evil",
+            "/data:evil",
+            ":C",
+            "C:\\a\nb",
+            "C:\\a\rb",
+            "/data\0x",
+        ] {
+            assert!(mount_source_has_injection(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn should_split_bind_specs_after_a_windows_drive() {
+        let cases: [(&str, (&str, Option<&str>)); 7] = [
+            ("C:\\foo:/bar", ("C:\\foo", Some("/bar"))),
+            ("C:\\foo", ("C:\\foo", None)),
+            ("/a:/b", ("/a", Some("/b"))),
+            ("/a", ("/a", None)),
+            ("C:\\foo:ro", ("C:\\foo", Some("ro"))),
+            ("/projects:/work:ro", ("/projects", Some("/work"))),
+            ("C:\\proj:/work:ro", ("C:\\proj", Some("/work"))),
+        ];
+        for (bind, expected) in cases {
+            assert_eq!(split_bind_spec(bind), expected, "{bind}");
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
