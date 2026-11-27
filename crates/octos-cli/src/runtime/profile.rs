@@ -2335,6 +2335,125 @@ mod tests {
         }
     }
 
+    /// T-0698 acceptance evidence, execution level: on a real macOS host the
+    /// first-boot derived sandbox RUNS the default shell, reads the
+    /// workspace, the system paths and an existing shared skill file, and
+    /// genuinely cannot read the home credentials or the chats roots. The
+    /// body compiles everywhere and runs only on macOS (the Nightly macOS
+    /// legs execute it); other platforms return immediately.
+    #[tokio::test]
+    async fn first_boot_shell_reads_exactly_the_derived_grants_on_macos() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        // First boot: neither shared skill tree exists under the home. The
+        // fixture home must sit in the REAL user home: a tempdir lives under
+        // /private/var/folders, which the derived system grants legitimately
+        // cover — a "secret" planted there would be readable for the right
+        // reason and prove nothing.
+        let home = tempfile::Builder::new()
+            .prefix("t0698-first-boot-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
+        let (grants, strict) = derive_sandbox_read_grants(home.path());
+        assert!(strict);
+        // The workspace too lives in the real home (a SIBLING of the
+        // secrets home, so neither grant covers the other): a tempdir under
+        // /private/var/folders would be readable through the system grants
+        // even if the cwd grant vanished (review round 2).
+        let work = tempfile::Builder::new()
+            .prefix("t0698-work-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
+        std::fs::write(work.path().join("note.txt"), "workspace-ok").unwrap();
+        let credentials = home.path().join("credentials");
+        std::fs::write(&credentials, "home-secret").unwrap();
+        let chats_secret = home.path().join("chats").join("abc");
+        std::fs::create_dir_all(&chats_secret).unwrap();
+        let chats_secret = chats_secret.join("secret.txt");
+        std::fs::write(&chats_secret, "chat-secret").unwrap();
+        let config = octos_agent::SandboxConfig {
+            read_allow_paths: grants,
+            strict_read_paths: strict,
+            ..Default::default()
+        };
+        let sandbox = octos_agent::sandbox::create_sandbox(&config);
+        if sandbox.is_noop() {
+            eprintln!("T-0698 evidence: SKIP — no confining backend on this host");
+            return;
+        }
+        let run = |cmd: String| {
+            let cwd = work.path().to_path_buf();
+            let sandbox = &sandbox;
+            async move {
+                let out = sandbox
+                    .wrap_command(&cmd, &cwd)
+                    .output()
+                    .await
+                    .expect("sandboxed command spawns");
+                (
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            }
+        };
+        let cwd = std::fs::canonicalize(work.path()).unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let credentials = home.join("credentials");
+        let chats_secret = home.join("chats").join("abc").join("secret.txt");
+
+        // Positive: the shell itself runs, the workspace and the system
+        // paths stay readable.
+        let (code, err) = run("echo shell-ok".to_string()).await;
+        assert_eq!(code, 0, "default shell must run: {err}");
+        let (code, err) = run(format!("cat {}/note.txt", cwd.display())).await;
+        assert_eq!(code, 0, "workspace must stay readable: {err}");
+        let (code, err) = run("cat /etc/hosts".to_string()).await;
+        assert_eq!(code, 0, "system paths must stay readable: {err}");
+
+        // Negative: the home credentials and the chats roots are NOT
+        // readable — the first boot must not fall back to a global read.
+        let (code, err) = run(format!("cat {}", credentials.display())).await;
+        assert!(code != 0, "home credentials must be unreadable: {err}");
+        eprintln!("T-0698 evidence: cat credentials -> exit {code} (denied)");
+        let (code, err) = run(format!("cat {}", chats_secret.display())).await;
+        assert!(code != 0, "chats root must be unreadable: {err}");
+        eprintln!("T-0698 evidence: cat chats/abc/secret.txt -> exit {code} (denied)");
+
+        // With a shared skill tree present, its files ARE readable — again
+        // under the real home so readability can only come from the derived
+        // grant, never from a system-path overlap.
+        let home2 = tempfile::Builder::new()
+            .prefix("t0698-shared-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
+        let skill = home2
+            .path()
+            .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR)
+            .join("skill.txt");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "skill-ok").unwrap();
+        let (grants2, strict2) = derive_sandbox_read_grants(home2.path());
+        let config2 = octos_agent::SandboxConfig {
+            read_allow_paths: grants2,
+            strict_read_paths: strict2,
+            ..Default::default()
+        };
+        let sandbox2 = octos_agent::sandbox::create_sandbox(&config2);
+        let skill = std::fs::canonicalize(&skill).unwrap();
+        let out = sandbox2
+            .wrap_command(&format!("cat {}", skill.display()), work.path())
+            .output()
+            .await
+            .expect("sandboxed command spawns");
+        assert!(
+            out.status.success(),
+            "an existing shared skill file must be readable: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("T-0698 evidence: cat bundled-app-skills/skill.txt -> exit 0 (readable)");
+    }
+
     /// T-0698: a first boot with NEITHER shared skill tree derives the
     /// system paths under strict — never an empty list (which macOS would
     /// widen into a global `file-read*`).
