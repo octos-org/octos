@@ -160,6 +160,11 @@ jobs:
           exit 1
 
   npm:
+    # shu 2026-11-25 (O-002): npm is best-effort. A missing token, registry
+    # failure or propagation timeout must not fail the release workflow.
+    # Homebrew remains a separate, required job; release.yml still verifies
+    # the GitHub assets and the Homebrew formula.
+    continue-on-error: true
     if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
     runs-on: ubuntu-latest
     env:

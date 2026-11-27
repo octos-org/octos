@@ -86,6 +86,7 @@ test_a2.md
 # User-facing docs only (internal analysis/audits stay local)
 !docs/user-guide.md
 !docs/user-guide-zh.md
+!docs/UPGRADE-v2.1.0.md
 !workstreams/
 !workstreams/open-issue-closure-contract-2026-05-23.md
 !docs/app-skill-dev-guide.md

@@ -435,12 +435,11 @@ jobs:
   distribution-alignment:
     name: Verify distribution alignment
     needs: [verify-release, package-publishers]
-    # The release above is already public by the time the publishers run, so
-    # once npm or Homebrew red, every install channel silently keeps serving
-    # the previous version while the release advertises the new one (v2.0.3
-    # shipped with npm still on latest=2.0.2). This gate runs even when the
-    # publishers failed and holds the release workflow to the observable
-    # distribution state (#2798).
+    # The release above is already public by the time the publishers run.
+    # Homebrew alignment remains required; npm is best-effort by shu's
+    # 2026-11-25 O-002 decision, so its live checks below are warnings only.
+    # This gate still runs when publishers fail so Homebrew cannot silently
+    # keep serving the previous version (#2798).
     if: ${{ !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -467,12 +466,11 @@ jobs:
             exit 0
           fi
           fail=0
-          # When the publishers claim success, a misaligned channel is what the
-          # gate is for (it fails the run). When they did not, their failure is
-          # already the gate signal and the live checks below are diagnostics
-          # only — re-running an old release after a newer one superseded it
-          # would otherwise always red here (latest and the formula have moved
-          # on), and its "re-run" advice could never succeed.
+          # A publisher/upstream failure remains a gate signal for Homebrew;
+          # npm's own live checks are advisory regardless of that result. For
+          # Homebrew, a failed publisher downgrades the live checks to
+          # diagnostics because re-running an old release after a newer one
+          # would otherwise always red on a formula that has moved on.
           level=error
           if [ "$PUBLISHERS" = "skipped" ]; then
             echo "::error::package publishers did not run — an upstream job failed and the release is public without verified distributions. Fix the failing job above; re-running the publishers alone will not align it."
@@ -496,13 +494,11 @@ jobs:
             [ "$attempt" = 3 ] || sleep 10
           done
           if [ "$published" != "$version" ]; then
-            echo "::${level}::@octos-org/octos@${version} is not visible on npm — the ${dist_tag} dist-tag still serves the previous version."
-            [ "$level" = error ] && fail=1
+            echo "::warning::@octos-org/octos@${version} is not visible on npm — the ${dist_tag} dist-tag still serves the previous version (npm is non-blocking, shu 2026-11-25)."
           else
             tagged=$(npm view "@octos-org/octos" dist-tags --json 2>/dev/null | jq -r --arg tag "$dist_tag" '.[$tag] // ""' || true)
             if [ "$tagged" != "$version" ]; then
-              echo "::${level}::npm dist-tag '${dist_tag}' points at '${tagged:-none}', not ${version}."
-              [ "$level" = error ] && fail=1
+              echo "::warning::npm dist-tag '${dist_tag}' points at '${tagged:-none}', not ${version} (npm is non-blocking, shu 2026-11-25)."
             fi
           fi
           # The Homebrew publisher only runs for stable tags — mirror that gate,

@@ -6090,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "octos-agent"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6158,7 +6158,7 @@ dependencies = [
 
 [[package]]
 name = "octos-bus"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "aes 0.8.4",
  "async-imap",
@@ -6204,7 +6204,7 @@ dependencies = [
 
 [[package]]
 name = "octos-cli"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "agent-client-protocol",
  "argon2",
@@ -6293,7 +6293,7 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6310,7 +6310,7 @@ dependencies = [
 
 [[package]]
 name = "octos-diagnostics"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "eyre",
  "octos-core",
@@ -6322,14 +6322,14 @@ dependencies = [
 
 [[package]]
 name = "octos-dora-mcp"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "octos-agent",
 ]
 
 [[package]]
 name = "octos-embed-llama"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "eyre",
@@ -6344,7 +6344,7 @@ dependencies = [
 
 [[package]]
 name = "octos-ffi"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6365,7 +6365,7 @@ dependencies = [
 
 [[package]]
 name = "octos-fleet"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "eyre",
  "octos-core",
@@ -6381,7 +6381,7 @@ dependencies = [
 
 [[package]]
 name = "octos-fleet-worker"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6401,7 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "octos-llm"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6430,7 +6430,7 @@ dependencies = [
 
 [[package]]
 name = "octos-memory"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -6452,7 +6452,7 @@ dependencies = [
 
 [[package]]
 name = "octos-plugin"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6494,7 +6494,7 @@ dependencies = [
 
 [[package]]
 name = "octos-pyo3"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "octos-ffi",
  "pyo3",
@@ -6502,7 +6502,7 @@ dependencies = [
 
 [[package]]
 name = "octos-research"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chromiumoxide",
@@ -6544,7 +6544,7 @@ dependencies = [
 
 [[package]]
 name = "octos-server"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -6580,7 +6580,7 @@ dependencies = [
 
 [[package]]
 name = "octos-services"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6609,7 +6609,7 @@ dependencies = [
 
 [[package]]
 name = "octos-store"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -6629,7 +6629,7 @@ dependencies = [
 
 [[package]]
 name = "octos-swarm"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6649,7 +6649,7 @@ dependencies = [
 
 [[package]]
 name = "octos-uniffi"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "octos-ffi",
  "serde_json",
@@ -6658,7 +6658,7 @@ dependencies = [
 
 [[package]]
 name = "octos-wasm"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "console_error_panic_hook",
@@ -6674,7 +6674,7 @@ dependencies = [
 
 [[package]]
 name = "octos-workflows"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "eyre",
@@ -11044,7 +11044,7 @@ dependencies = [
 
 [[package]]
 name = "wechat-bridge"
-version = "2.1.0-rc.1"
+version = "2.1.0"
 dependencies = [
  "clap",
  "futures-util",
