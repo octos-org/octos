@@ -1,7 +1,7 @@
 # Upgrading to Octos v2.1.0
 
 This release includes the changes from v2.0.3 through the v2.1.0 release
-baseline `eafaec0eddc0ae6f6d4e79332f2ef40ee5ac05cb`. Read the sections that
+baseline `cfab32f0944ecac1897af1346b9fcd19aad343d8`. Read the sections that
 apply to existing serve installations before upgrading.
 
 ## Server Chat workspaces move out of legacy `chats`
