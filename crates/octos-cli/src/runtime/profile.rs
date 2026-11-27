@@ -2357,7 +2357,14 @@ mod tests {
             .unwrap();
         let (grants, strict) = derive_sandbox_read_grants(home.path());
         assert!(strict);
-        let work = tempfile::tempdir().unwrap();
+        // The workspace too lives in the real home (a SIBLING of the
+        // secrets home, so neither grant covers the other): a tempdir under
+        // /private/var/folders would be readable through the system grants
+        // even if the cwd grant vanished (review round 2).
+        let work = tempfile::Builder::new()
+            .prefix("t0698-work-")
+            .tempdir_in(std::env::home_dir().expect("a home dir"))
+            .unwrap();
         std::fs::write(work.path().join("note.txt"), "workspace-ok").unwrap();
         let credentials = home.path().join("credentials");
         std::fs::write(&credentials, "home-secret").unwrap();
