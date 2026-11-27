@@ -16,6 +16,46 @@ const BLOCKED_DOCKER_BIND_SOURCES: &[&str] = &[
     "/dev",
 ];
 
+/// A UNC tail (`server\share[\…]`) with both components present.
+fn valid_unc(unc: &str) -> bool {
+    let mut parts = unc.split('\\');
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(server), Some(share)) if !server.is_empty() && !share.is_empty()
+    )
+}
+
+/// Normalize a mount source for Docker (T-0701). Windows `canonicalize` can
+/// produce VERBATIM paths, which Docker Desktop does not accept as bind
+/// sources — strip the prefix: `\\?\C:\foo` → `C:\foo`,
+/// `\\?\UNC\server\share\x` → `\\server\share\x`. Ordinary
+/// drive/UNC/Unix forms pass through unchanged. Fail-closed (`None`): `\\.\`
+/// device paths, verbatim paths that are not absolute drive/UNC forms
+/// (bare `\\?\C:foo`), and UNC paths missing server or share.
+fn normalize_mount_source(source: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if source.starts_with("\\\\.\\") {
+        return None;
+    }
+    if let Some(rest) = source.strip_prefix("\\\\?\\") {
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            return valid_unc(unc).then(|| std::borrow::Cow::Owned(format!("\\\\{unc}")));
+        }
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            return Some(std::borrow::Cow::Borrowed(rest));
+        }
+        return None;
+    }
+    if let Some(unc) = source.strip_prefix("\\\\") {
+        return valid_unc(unc).then_some(std::borrow::Cow::Borrowed(source));
+    }
+    Some(std::borrow::Cow::Borrowed(source))
+}
+
 /// Strip a legitimate Windows drive-letter prefix (`C:\…` or `C:/…`): its
 /// colon is the drive's, not the mount spec's `source:dest` separator. Bare
 /// `C:foo` is a drive-RELATIVE path (per-drive cwd), not an absolute one, so
@@ -33,26 +73,32 @@ fn strip_windows_drive(source: &str) -> &str {
     source
 }
 
-/// True when `source` cannot be a Docker mount source: control characters
-/// always, and any `:` left after a legitimate Windows drive prefix (it would
-/// split the `-v source:dest` spec — T-0696). This is NOT "allow all colons":
-/// a second colon, a bare `C:foo`, or any Unix colon still fails closed.
+/// True when `source` cannot be a Docker mount source: not normalizable
+/// (device path, malformed verbatim/UNC), control characters, or any `:`
+/// left after a legitimate Windows drive prefix (it would split the `-v
+/// source:dest` spec — T-0696). This is NOT "allow all colons": a second
+/// colon, a bare `C:foo`, or any Unix colon still fails closed.
 fn mount_source_has_injection(source: &str) -> bool {
-    source.contains(['\0', '\n', '\r']) || strip_windows_drive(source).contains(':')
+    let Some(normalized) = normalize_mount_source(source) else {
+        return true;
+    };
+    normalized.contains(['\0', '\n', '\r']) || strip_windows_drive(&normalized).contains(':')
 }
 
 /// Split an extra bind's `source[:dest[:mode]]`, honouring a Windows drive
-/// colon in the source (`C:\foo:/bar` splits after `C:\foo`, not after
-/// `C`). The destination never contains a colon on either host, so a second
-/// separator starts the mode (`:ro`) and is NOT part of the destination —
-/// hidden-folder masks are computed from the returned destination.
-fn split_bind_spec(bind: &str) -> (&str, Option<&str>) {
-    let skipped = bind.len() - strip_windows_drive(bind).len();
-    let mut parts = bind[skipped..].split(':');
+/// colon in the source and normalizing a verbatim prefix (`\\?\C:\foo:/bar`
+/// splits after `C:\foo`). The destination never contains a colon on either
+/// host, so a second separator starts the mode (`:ro`) and is NOT part of
+/// the destination — hidden-folder masks are computed from the returned
+/// destination. `None` when the source cannot be normalized for Docker.
+fn split_bind_spec(bind: &str) -> Option<(String, Option<String>)> {
+    let normalized = normalize_mount_source(bind)?;
+    let skipped = normalized.len() - strip_windows_drive(&normalized).len();
+    let mut parts = normalized[skipped..].split(':');
     let tail = parts.next().unwrap_or_default();
-    let source = &bind[..skipped + tail.len()];
+    let source = &normalized[..skipped + tail.len()];
     let dest = parts.next();
-    (source, dest)
+    Some((source.to_owned(), dest.map(str::to_owned)))
 }
 
 /// Check if a bind mount source is dangerous.
@@ -269,8 +315,21 @@ impl DockerSandbox {
         }
 
         // Workspace mount -- validate path to prevent volume mount injection
-        // via ':' (a Windows drive-letter colon is not the separator).
-        let cwd_str = cwd.to_string_lossy();
+        // via ':' (a Windows drive-letter colon is not the separator), and
+        // normalize a verbatim (`\\?\C:\…`) cwd into the form Docker
+        // Desktop accepts (T-0701). hidden_mounts keeps the original host
+        // path for containment checks.
+        let raw_cwd = cwd.to_string_lossy();
+        let Some(cwd_str) = normalize_mount_source(&raw_cwd) else {
+            tracing::error!(
+                cwd = %raw_cwd,
+                "cwd cannot be normalized for a Docker mount, refusing to execute"
+            );
+            let mut fail = Command::new("sh");
+            fail.arg("-c")
+                .arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
+            return fail;
+        };
         if mount_source_has_injection(&cwd_str) {
             tracing::error!(
                 "cwd contains invalid characters for Docker mount, refusing to execute"
@@ -318,17 +377,29 @@ impl DockerSandbox {
 
         // Extra bind mounts (validated against dangerous sources)
         for bind in &self.config.extra_binds {
-            let (source, dest) = split_bind_spec(bind);
-            if is_blocked_bind_source(source) {
+            let Some((source, dest)) = split_bind_spec(bind) else {
+                tracing::warn!(
+                    bind = %bind,
+                    "skipping bind mount whose source cannot be normalized for Docker"
+                );
+                continue;
+            };
+            if is_blocked_bind_source(&source) {
                 tracing::warn!(
                     bind = %bind,
                     "skipping dangerous bind mount source"
                 );
                 continue;
             }
-            let dest = dest.filter(|dest| !dest.is_empty()).unwrap_or(source);
-            hidden_mounts.push((std::path::PathBuf::from(source), dest.to_owned()));
-            cmd.arg("-v").arg(bind);
+            let dest = dest
+                .filter(|dest| !dest.is_empty())
+                .unwrap_or(source.clone());
+            hidden_mounts.push((std::path::PathBuf::from(&source), dest.clone()));
+            let spec = match dest.is_empty() {
+                true => source,
+                false => format!("{source}:{dest}"),
+            };
+            cmd.arg("-v").arg(spec);
         }
 
         if let Some(slot) = slot {
@@ -337,7 +408,10 @@ impl DockerSandbox {
                 Ok(target) if target.is_dir() => target,
                 _ => return cache_mount_refusal(),
             };
-            let source = target.to_string_lossy();
+            let raw_source = target.to_string_lossy();
+            let Some(source) = normalize_mount_source(&raw_source) else {
+                return cache_mount_refusal();
+            };
             if mount_source_has_injection(&source) || is_blocked_bind_source(&source) {
                 return cache_mount_refusal();
             }
@@ -398,7 +472,10 @@ mod validation_tests {
             "c:\\temp",
             "D:\\",
             "E:/a b",
-            "\\server\\share\\dir",
+            "\\\\server\\share\\dir",
+            "\\\\?\\C:\\work",
+            "\\\\?\\c:/temp",
+            "\\\\?\\UNC\\server\\share\\dir",
             "/data/work",
             "/",
         ] {
@@ -414,30 +491,58 @@ mod validation_tests {
             "C:work",
             "C:",
             "1:\\x",
-            "\\server\\share:evil",
+            "\\\\server\\share:evil",
             "/data:evil",
             ":C",
             "C:\\a\nb",
             "C:\\a\rb",
             "/data\0x",
+            "\\\\.\\pipe\\docker_engine",
+            "\\\\?\\C:foo",
+            "\\\\?\\1:\\x",
+            "\\\\?\\UNC\\server",
+            "\\\\?\\UNC\\server\\",
+            "\\\\server",
         ] {
             assert!(mount_source_has_injection(bad), "{bad}");
         }
     }
 
+    /// T-0701: Docker Desktop never sees a verbatim prefix — the mount spec
+    /// is rebuilt from the normalized source.
+    #[test]
+    fn should_normalize_verbatim_sources_for_docker() {
+        let cases: [(&str, Option<&str>); 6] = [
+            ("\\\\?\\C:\\work", Some("C:\\work")),
+            ("\\\\?\\c:/temp", Some("c:/temp")),
+            ("\\\\?\\UNC\\srv\\shr\\dir", Some("\\\\srv\\shr\\dir")),
+            ("C:\\work", Some("C:\\work")),
+            ("/data/work", Some("/data/work")),
+            ("\\\\.\\pipe\\x", None),
+        ];
+        for (raw, expected) in cases {
+            let got = normalize_mount_source(raw);
+            assert_eq!(got.as_deref(), expected, "{raw}");
+        }
+    }
+
     #[test]
     fn should_split_bind_specs_after_a_windows_drive() {
-        let cases: [(&str, (&str, Option<&str>)); 7] = [
-            ("C:\\foo:/bar", ("C:\\foo", Some("/bar"))),
-            ("C:\\foo", ("C:\\foo", None)),
-            ("/a:/b", ("/a", Some("/b"))),
-            ("/a", ("/a", None)),
-            ("C:\\foo:ro", ("C:\\foo", Some("ro"))),
-            ("/projects:/work:ro", ("/projects", Some("/work"))),
-            ("C:\\proj:/work:ro", ("C:\\proj", Some("/work"))),
+        type Case = (&'static str, Option<(&'static str, Option<&'static str>)>);
+        let cases: [Case; 8] = [
+            ("C:\\foo:/bar", Some(("C:\\foo", Some("/bar")))),
+            ("C:\\foo", Some(("C:\\foo", None))),
+            ("/a:/b", Some(("/a", Some("/b")))),
+            ("/a", Some(("/a", None))),
+            ("C:\\foo:ro", Some(("C:\\foo", Some("ro")))),
+            ("/projects:/work:ro", Some(("/projects", Some("/work")))),
+            ("C:\\proj:/work:ro", Some(("C:\\proj", Some("/work")))),
+            ("\\\\?\\C:\\foo:/bar", Some(("C:\\foo", Some("/bar")))),
         ];
         for (bind, expected) in cases {
-            assert_eq!(split_bind_spec(bind), expected, "{bind}");
+            let got = split_bind_spec(bind);
+            let got = got.as_ref().map(|(s, d)| (s.as_str(), d.as_deref()));
+            assert_eq!(got, expected, "{bind}");
         }
     }
 }
