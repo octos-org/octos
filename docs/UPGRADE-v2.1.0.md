@@ -32,6 +32,16 @@ server root. An ancestor Code workspace—including a standard `_main` data
 directory that is the state home itself—remains allowed. The error names the
 conflicting paths. Resolve the reported layout before restarting.
 
+The session/open reservation follows the same direction, precisely: a Code
+workspace **at or below** the server root, the state home itself, or a
+folder inside the state tree (`~/.octos`, `~/.octos/profiles/<id>`) is
+refused with `chat_workspace_reserved`; an ancestor **above** the state
+home—`$HOME` being the common one—is a valid workspace, because the reserved
+roots inside it (server chats root, profile data dirs, legacy chats) stay
+hidden through the normal reserved-folder containment. Choose `$HOME` in the
+first-run wizard with confidence, or a project folder outside the state
+tree.
+
 Rollback leaves files in the new root intact, but older binaries cannot
 discover Chats stored there. Do not roll back with the expectation that the
 old server will see those new Chats. The exact compatibility contract is in
