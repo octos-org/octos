@@ -192,6 +192,47 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
     assert!(elsewhere.is_dir() && !root_b.exists());
 }
 
+/// T-0718: a skill installed by an EXTERNAL process (`octos skills` CLI)
+/// after the runtime was assembled must be visible to the next
+/// session-runtime lookup without a Core restart — and gone after removal.
+#[tokio::test]
+async fn hot_installed_skill_reaches_the_next_session_lookup_without_restart() {
+    let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
+    let (mut state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
+    with_profile_store(&mut state, &temp.path().join("store"), &profile);
+    let has_skill =
+        |rt: &Arc<crate::runtime::ProfileRuntime>| rt.system_prompt.contains("hot-skill-iris");
+    let before = ensure_session_profile_runtime(&state, Some(PROFILE))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!has_skill(&before));
+
+    // The "external install": plain filesystem writes, no in-process event.
+    let skill = profile.data_dir.join("skills").join("hot-skill-iris");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: hot-skill-iris\ndescription: hot iris\n---\nUse LOCAL-SKILL-IRIS-713.",
+    )
+    .unwrap();
+    let after_install = ensure_session_profile_runtime(&state, Some(PROFILE))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        has_skill(&after_install),
+        "the next lookup must see the externally installed skill"
+    );
+
+    std::fs::remove_dir_all(&skill).unwrap();
+    let after_remove = ensure_session_profile_runtime(&state, Some(PROFILE))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!has_skill(&after_remove), "a removed skill stops injecting");
+}
+
 /// TEST-DIET category 3: a chat's tools refuse `../`, absolute paths and
 /// symlinks that lead out of the chat's folder.
 #[tokio::test]

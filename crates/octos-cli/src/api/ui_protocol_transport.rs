@@ -26268,9 +26268,82 @@ fn insert_profile_runtime_if_current(
     true
 }
 
+/// T-0718: an EXTERNAL installer (`octos skills` runs in its own process)
+/// cannot raise the in-process skill-mutation event, so before handing out
+/// a cached runtime, compare its skill fingerprint against a fresh scan
+/// and rebuild when it drifted. The web install/remove path already
+/// rebuilds eagerly; both paths converge on the same runtime state. On a
+/// rebuild error the stale runtime keeps serving (logged) — a half-written
+/// skill tree must not take chat down.
+async fn ensure_profile_runtime_skills_fresh(
+    state: &AppState,
+    profile_id: &str,
+    runtime: Arc<crate::runtime::ProfileRuntime>,
+) -> Arc<crate::runtime::ProfileRuntime> {
+    // Startup-pinned profiles (no dynamic store) keep restart semantics —
+    // the same answer the committed-runtime race gives them today.
+    if dynamic_profile_runtime_key(state, profile_id).is_none() {
+        return runtime;
+    }
+    let fresh = crate::runtime::profile::skills_layer_fingerprint(
+        &runtime
+            .plugin_dirs
+            .iter()
+            .cloned()
+            .chain([runtime.data_dir.join("skills")])
+            .collect::<Vec<_>>(),
+    );
+    if fresh == runtime.skills_fingerprint {
+        return runtime;
+    }
+    tracing::info!(
+        profile_id = %profile_id,
+        "skill inputs changed since the runtime was assembled; rebuilding"
+    );
+    // Boxed: rebuild re-enters the runtime lookup, and the compiler needs
+    // the indirection to break the type-level future cycle.
+    if let Err(error) = Box::pin(rebuild_profile_runtime_after_skill_mutation(
+        state, profile_id,
+    ))
+    .await
+    {
+        tracing::warn!(error = ?error, profile_id = %profile_id, "skill refresh rebuild failed");
+        return runtime;
+    }
+    let key = dynamic_profile_runtime_key(state, profile_id);
+    if let Some(key) = key
+        && let Some(replacement) = dynamic_profile_runtimes()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+        && !Arc::ptr_eq(&replacement, &runtime)
+    {
+        return replacement;
+    }
+    // Startup-pinned (or a lost race): re-read the pinned slot; fall back to
+    // what we had when nothing was replaced.
+    state
+        .profiles
+        .get(profile_id)
+        .cloned()
+        .filter(|pinned| !Arc::ptr_eq(pinned, &runtime))
+        .unwrap_or(runtime)
+}
+
 pub(crate) async fn ensure_session_profile_runtime(
     state: &AppState,
     active_profile_id: Option<&str>,
+) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
+    ensure_session_profile_runtime_inner(state, active_profile_id, true).await
+}
+
+/// `refresh_skills=false` for the skill-mutation rebuild itself — running
+/// the freshness check there would recurse.
+async fn ensure_session_profile_runtime_inner(
+    state: &AppState,
+    active_profile_id: Option<&str>,
+    refresh_skills: bool,
 ) -> Result<Option<Arc<crate::runtime::ProfileRuntime>>, RpcError> {
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID);
     if let Some(host_profile) = crate::runtime::host_scope::profile() {
@@ -26296,16 +26369,31 @@ pub(crate) async fn ensure_session_profile_runtime(
     let bootstrap_lock = profile_bootstrap_lock(&key);
     let _bootstrap_guard = bootstrap_lock.lock().await;
 
-    if let Some(runtime) = dynamic_profile_runtimes()
+    let cached = dynamic_profile_runtimes()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&key)
-        .cloned()
-    {
-        return Ok(Some(runtime));
+        .cloned();
+    if let Some(runtime) = cached {
+        if !refresh_skills {
+            return Ok(Some(runtime));
+        }
+        // The refresh path re-enters this function inside the mutation
+        // rebuild; the bootstrap lock is not reentrant, and the cached
+        // runtime is already in hand, so drop the guard first.
+        drop(_bootstrap_guard);
+        return Ok(Some(
+            ensure_profile_runtime_skills_fresh(state, profile_id, runtime).await,
+        ));
     }
     if let Some(runtime) = state.profiles.get(profile_id) {
-        return Ok(Some(runtime.clone()));
+        if !refresh_skills {
+            return Ok(Some(runtime.clone()));
+        }
+        drop(_bootstrap_guard);
+        return Ok(Some(
+            ensure_profile_runtime_skills_fresh(state, profile_id, runtime.clone()).await,
+        ));
     }
 
     // #2164: a profile/llm select/upsert/delete that commits while this
@@ -26440,7 +26528,7 @@ fn replace_profile_runtime_if_current(
 }
 
 async fn rebuild_profile_runtime_after_skill_mutation(
-    state: &Arc<AppState>,
+    state: &AppState,
     profile_id: &str,
 ) -> Result<(), RpcError> {
     // #2186: capture the key and generation BEFORE fetching the runtime. The
@@ -26453,7 +26541,9 @@ async fn rebuild_profile_runtime_after_skill_mutation(
     // against profile/llm commits, which is the race this guards.
     let key = dynamic_profile_runtime_key(state, profile_id);
     let generation = key.as_deref().map(current_profile_runtime_generation);
-    let Some(current) = ensure_session_profile_runtime(state, Some(profile_id)).await? else {
+    let Some(current) =
+        ensure_session_profile_runtime_inner(state, Some(profile_id), false).await?
+    else {
         return Ok(());
     };
     let key = key.ok_or_else(|| {

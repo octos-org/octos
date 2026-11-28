@@ -119,10 +119,10 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
             .await
             .expect("tool config store"),
     );
-    let base_tools = octos_agent::ToolRegistry::with_builtins_and_sandbox(
+    let base_tools = Arc::new(octos_agent::ToolRegistry::with_builtins_and_sandbox(
         data_dir,
         octos_agent::create_sandbox(&sandbox),
-    );
+    ));
     let recall = Arc::new(
         octos_memory::RecallStore::open(data_dir, octos_memory::RecallConfig::default())
             .expect("recall store"),
@@ -143,6 +143,10 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
         provider_name: "stub".to_string(),
         credentials: HashMap::new(),
         skills_dir: None,
+        skills_fingerprint: crate::runtime::profile::skills_layer_fingerprint(&[
+            data_dir.join("skills")
+        ]),
+        fingerprint_moved: false,
         plugin_env_template: Vec::new(),
         tool_policy: None,
         default_sandbox: sandbox,
@@ -151,12 +155,27 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
         agent_profile: None,
         format_after_edit: false,
         snapshots: None,
-        tool_specs: Arc::new(base_tools),
+        tool_specs: Arc::clone(&base_tools),
         plugin_tool_names: Vec::new(),
         skill_actions: Vec::new(),
         mcp_client: None,
-        plugin_reload: None,
-        plugin_dirs: Vec::new(),
+        plugin_reload: Some(Arc::new(
+            crate::runtime::profile::ProfilePluginReloadConfig {
+                base_tools: Arc::clone(&base_tools),
+                plugin_dirs: vec![data_dir.join("skills")],
+                plugin_env: Vec::new(),
+                work_dir: data_dir.to_path_buf(),
+                synthesis_config: None,
+                require_signed: false,
+                verified_cache_dir: data_dir.join("verified-cache"),
+                tool_policy: None,
+                context_filter: Vec::new(),
+                host_hooks: Vec::new(),
+                gateway_system_prompt: None,
+                skill_filter: None,
+            },
+        )),
+        plugin_dirs: vec![data_dir.join("skills")],
         plugin_prompt_fragments: Vec::new(),
         plugin_hooks: Vec::new(),
         review_config: None,
