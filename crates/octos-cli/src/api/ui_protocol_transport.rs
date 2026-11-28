@@ -30993,6 +30993,10 @@ async fn handle_session_rollback(
                 tool_call_id: msg.tool_call_id.clone(),
                 tool_name,
                 tool_calls: hydrated_tool_calls(msg),
+                // UPCR-2026-086: rollback's thread rows share the hydrate
+                // shape; the rollback path scans no retained references, so
+                // the outcome stays unknown rather than guessed.
+                is_error: None,
             })
             .collect::<Vec<_>>();
         let (threads, orphans) = build_thread_graph_entries(session);

@@ -1137,6 +1137,124 @@ async fn session_work_mode_is_fixed_at_creation_and_read_back_after_a_restart() 
     assert_eq!(mode(&rows, "local:chat"), Some(Value::Null));
 }
 
+// UPCR-2026-086: hydrate tool rows carry the ledger's recorded outcome, so
+// a reloaded client no longer guesses success/failure from the output text —
+// two identical "Error:" bodies from different calls keep their own outcome.
+#[tokio::test]
+async fn hydrate_tool_rows_carry_the_recorded_outcome_not_a_text_guess() {
+    use octos_core::ui_protocol::{ToolCompletedEvent, UiNotification};
+    use octos_core::{Message, ThreadId, ToolCall};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let session_id = SessionKey("local:h".into());
+    let call = |id: &str, name: &str| ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments: serde_json::json!({}),
+        metadata: None,
+    };
+    {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let mut assistant = Message::assistant_with_thread("running tools", ThreadId("t".into()));
+        assistant.tool_calls = Some(vec![
+            call("call-1", "exec"),
+            call("call-2", "exec"),
+            call("call-3", "edit_file"),
+            call("call-4", "read_file"),
+        ]);
+        sessions.add_message(&session_id, assistant).await.unwrap();
+        for (id, content) in [
+            ("call-1", "Error: probe_fail_726"),
+            // Same tool, same output text, different call: the outcome must
+            // come from the call id, never from the content.
+            ("call-2", "Error: probe_fail_726"),
+            ("call-3", "edited 3 lines"),
+            ("call-4", "file body"),
+            ("call-5", "first try failed"),
+            ("call-5", "retry succeeded"),
+        ] {
+            sessions
+                .add_message(
+                    &session_id,
+                    Message::tool_with_thread(content, id, ThreadId("t".into())),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let ledger = event_ledger(&state).await;
+    for (id, name, success) in [
+        ("call-1", "exec", Some(false)),
+        ("call-2", "exec", Some(true)),
+        ("call-3", "edit_file", Some(false)),
+        // call-4 (read_file) has no retained completion: outcome unknown.
+        // call-5 is reused across turns with opposite outcomes: ambiguous.
+        ("call-5", "exec", Some(false)),
+        ("call-5", "exec", Some(true)),
+    ] {
+        ledger.append_notification(UiNotification::ToolCompleted(ToolCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: octos_core::ui_protocol::TurnId(uuid::Uuid::now_v7()),
+            tool_call_id: id.to_owned(),
+            tool_name: name.to_owned(),
+            success,
+            output_preview: None,
+            duration_ms: None,
+        }));
+    }
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let params = SessionHydrateParams {
+        session_id: session_id.clone(),
+        after: None,
+        include: vec![],
+    };
+    let stores = UiProtocolContractStores::default();
+    let turns = active_turns_registry();
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &stores.approvals,
+        &stores.user_questions,
+        &turns,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        "h".into(),
+        params,
+    )
+    .await;
+    let result = recv_rpc_json(&mut rx).await;
+    let messages = result["result"]["messages"].as_array().unwrap();
+    let row = |id: &str| {
+        messages
+            .iter()
+            .find(|row| row["tool_call_id"] == id)
+            .unwrap_or_else(|| panic!("no hydrated row for {id}"))
+    };
+    assert_eq!(row("call-1")["content"], "Error: probe_fail_726");
+    assert_eq!(row("call-1")["is_error"], true);
+    assert_eq!(row("call-2")["content"], "Error: probe_fail_726");
+    assert_eq!(row("call-2")["is_error"], false);
+    assert_eq!(row("call-3")["content"], "edited 3 lines");
+    assert_eq!(row("call-3")["is_error"], true);
+    // No retained completion: the field is absent ("unknown"), never guessed.
+    assert_eq!(row("call-4")["content"], "file body");
+    assert!(row("call-4").get("is_error").is_none());
+    // Reused id with opposite outcomes: both rows omit is_error rather than
+    // showing one occurrence's result for both.
+    let call5: Vec<_> = messages
+        .iter()
+        .filter(|row| row["tool_call_id"] == "call-5")
+        .collect();
+    assert_eq!(call5.len(), 2);
+    for row in call5 {
+        assert!(row.get("is_error").is_none(), "{row}");
+    }
+}
+
 // ---- UPCR-2026-023 pending-question reconnect + capability gating ----
 
 // ----- UPCR-2026-007: capability advertisement on `SessionOpened` -----

@@ -406,6 +406,8 @@ Current M9 sandbox-parity decision:
   `session/hydrate` message rows (and on `session/rollback`'s trimmed thread),
   which name a tool row's call and tool, are governed by accepted
   [UPCR-2026-039](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_039_HYDRATED_TOOL_CALL_IDENTITY.md).
+- `UPCR-2026-086` — hydrated tool-result outcome (`is_error`), accepted, see
+  [UPCR-2026-086](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_086_HYDRATED_TOOL_RESULT_OUTCOME.md).
   The fields are ungated.
 
 ## 5. Identity Model
@@ -1290,6 +1292,13 @@ rows of `session/rollback`'s `thread` carry them too):
 - `tool_calls`
   On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
   in call order, without the arguments. Omitted when the row made no call.
+
+Optional `is_error` row field from accepted `UPCR-2026-086` (ungated; on the
+`messages` rows of `session/hydrate`): on a tool-result row, the outcome of
+its `tool_call_id` from the retained `tool/completed` notification — `true`
+for `success: false`, `false` otherwise. Derived server-side from the
+canonical ledger, never from the row text; absent when the transcript holds
+no completion for the call ("unknown") and on every non-tool row.
 
 Optional `file_mutations` (UPCR-2026-069, advertised as
 `state.session_file_mutations.v1`, additive and ungated): an oldest-first

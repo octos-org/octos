@@ -3336,6 +3336,14 @@ pub struct HydratedMessage {
     /// when the row made no tool call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<HydratedToolCall>,
+    /// UPCR-2026-086: on a tool-result row, the outcome of its
+    /// `tool_call_id` from the retained `tool/completed` notification —
+    /// `true` for `success: false`, `false` otherwise. Derived server-side
+    /// from the canonical ledger, never from the row's text. Absent when
+    /// the transcript holds no completion for the call ("unknown"), and on
+    /// every non-tool row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
 }
 
 /// One tool call made by an assistant row, in `HydratedMessage.tool_calls`

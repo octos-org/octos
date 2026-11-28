@@ -29,6 +29,20 @@ pub(crate) fn file_mutation(event: &UiProtocolLedgerEvent) -> Option<&UiFileMuta
     }
 }
 
+/// A retained tool completion's `(tool_call_id, success)` outcome — the
+/// hydrate rows derive `is_error` from these (UPCR-2026-086), never from
+/// the row text.
+pub(crate) fn tool_completed_outcome(
+    event: &UiProtocolLedgerEvent,
+) -> Option<(String, Option<bool>)> {
+    match event {
+        UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(completed)) => {
+            Some((completed.tool_call_id.clone(), completed.success))
+        }
+        _ => None,
+    }
+}
+
 fn identity_reference(event: &UiProtocolLedgerEvent) -> bool {
     matches!(event,
         UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(notification))
@@ -49,7 +63,9 @@ impl UiProtocolLedger {
         identities: bool,
     ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         self.retained_references(session_id, through, |event| {
-            file_mutation(event).is_some() || (identities && identity_reference(event))
+            file_mutation(event).is_some()
+                || (identities && identity_reference(event))
+                || tool_completed_outcome(event).is_some()
         })
     }
 

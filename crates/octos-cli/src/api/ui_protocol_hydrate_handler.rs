@@ -192,6 +192,30 @@ async fn handle_session_hydrate(
     } else {
         Vec::new()
     };
+    // UPCR-2026-086: tool outcomes come from the same retained scan that
+    // feeds the canonical identities — keyed by tool_call_id, never by text.
+    // A provider can reuse an id in a later turn; when the retained
+    // completions for one id disagree, the outcome is ambiguous and the row
+    // omits is_error ("unknown") instead of showing one occurrence's result
+    // for both.
+    let tool_outcomes: std::collections::HashMap<String, bool> = {
+        let mut by_id: std::collections::HashMap<String, Vec<bool>> =
+            std::collections::HashMap::new();
+        for event in &retained {
+            if let Some((id, Some(success))) =
+                super::ui_protocol_ledger::tool_completed_outcome(&event.event)
+            {
+                by_id.entry(id).or_default().push(success);
+            }
+        }
+        by_id
+            .into_iter()
+            .filter_map(|(id, outcomes)| {
+                let first = outcomes[0];
+                outcomes.iter().all(|&o| o == first).then_some((id, first))
+            })
+            .collect()
+    };
     let canonical_envelopes = if expose_message_id {
         retained
             .iter()
@@ -322,6 +346,17 @@ async fn handle_session_hydrate(
                             tool_call_id: msg.tool_call_id.clone(),
                             tool_name,
                             tool_calls: hydrated_tool_calls(msg),
+                            // UPCR-2026-086: the row's outcome from the
+                            // retained completion, only for tool rows with a
+                            // recorded result; absent means unknown.
+                            is_error: (msg.role.as_str() == "tool")
+                                .then(|| {
+                                    msg.tool_call_id
+                                        .as_deref()
+                                        .and_then(|id| tool_outcomes.get(id))
+                                        .map(|success| !success)
+                                })
+                                .flatten(),
                         }
                     })
                     .collect::<Vec<_>>(),
