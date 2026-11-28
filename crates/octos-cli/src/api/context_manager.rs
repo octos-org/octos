@@ -422,6 +422,13 @@ pub(crate) struct PromptBuildPolicy {
     pub(crate) include_reasoning: bool,
     pub(crate) supports_media: bool,
     pub(crate) max_prompt_token_estimate: Option<usize>,
+    /// Hard size for the OUTGOING projection, set from the provider window.
+    /// Unlike `max_prompt_token_estimate` (a soft latency cap that drops
+    /// whole history groups), this only degrades older rows of the current
+    /// tool loop — reasoning, tool outputs, long tool-call argument strings —
+    /// which compaction can never summarize because they are pinned behind
+    /// the newest user turn. The ledger is never modified.
+    pub(crate) context_pressure_budget: Option<usize>,
     pub(crate) model_capability_id: String,
     /// UPCR-2026-035: render every earlier `memory_update` context event as
     /// "no memory" instead of its content. Set for a turn on an app peer's
@@ -439,6 +446,7 @@ impl Default for PromptBuildPolicy {
             include_reasoning: false,
             supports_media: false,
             max_prompt_token_estimate: None,
+            context_pressure_budget: None,
             model_capability_id: "text-only-v1".to_owned(),
             redact_memory_events: false,
         }
@@ -3942,6 +3950,9 @@ impl ContextManager {
             }
         }
 
+        if let Some(budget) = policy.context_pressure_budget {
+            relieve_pinned_tail_context_pressure(&mut entries, budget, &mut truncated_item_ids);
+        }
         if let Some(max_tokens) = policy.max_prompt_token_estimate {
             truncate_tool_outputs_for_context_pressure(
                 &mut entries,
@@ -4451,6 +4462,158 @@ fn truncate_tool_outputs_for_context_pressure(
                 push_unique_item_id(truncated_item_ids, item_id.clone());
             }
         }
+    }
+}
+
+/// The newest assistant rounds (and the rows after them) that context
+/// pressure relief never touches: the model is usually still acting on them.
+const CONTEXT_PRESSURE_RAW_RECENT_ROUNDS: usize = 3;
+/// Tool outputs and argument strings longer than twice this are shortened to
+/// it (70% head, 30% tail).
+const CONTEXT_PRESSURE_KEEP_BYTES: usize = 2_400;
+
+fn entry_prompt_tokens(entry: &PromptMessageEntry) -> usize {
+    estimate_messages_tokens(std::slice::from_ref(&entry.message))
+}
+
+/// Fit the outgoing projection into `budget` tokens when compaction could
+/// not: a single request driving a long tool loop is entirely pinned tail.
+/// Older rows (before the newest [`CONTEXT_PRESSURE_RAW_RECENT_ROUNDS`]
+/// assistant rounds) are degraded in three escalating passes, each applied to
+/// every older row, stopping after the first pass that fits: (1) drop
+/// replayed private reasoning, (2)
+/// head/tail-shorten tool outputs, (3) head/tail-shorten long string values
+/// inside tool-call arguments (JSON stays valid; keys and short values are
+/// kept). Each cut is deterministic and annotated, so repeated projections of
+/// the same rows stay byte-identical (prompt-cache friendly) and the model
+/// knows what was elided. Pairing, roles and ordering are unchanged.
+fn relieve_pinned_tail_context_pressure(
+    entries: &mut [PromptMessageEntry],
+    budget: usize,
+    truncated_item_ids: &mut Vec<TranscriptItemId>,
+) {
+    let mut total = entries.iter().map(entry_prompt_tokens).sum::<usize>();
+    if total <= budget {
+        return;
+    }
+    let assistant_rounds = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.message.role == MessageRole::Assistant)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let Some(raw_from) = assistant_rounds
+        .len()
+        .checked_sub(CONTEXT_PRESSURE_RAW_RECENT_ROUNDS)
+        .and_then(|keep| assistant_rounds.get(keep).copied())
+    else {
+        return;
+    };
+    for pass in 0..3 {
+        if total <= budget {
+            return;
+        }
+        // A pass, once needed, covers EVERY older row rather than stopping
+        // at the first fit: a cut frontier that crept forward one row per
+        // request would invalidate the provider's prompt cache from that row
+        // on every time. Whole passes change only the row that just aged out
+        // of the raw window, near the end of the prompt.
+        for entry in entries[..raw_from].iter_mut() {
+            if entry.protected {
+                continue;
+            }
+            let before = entry_prompt_tokens(entry);
+            let changed = match pass {
+                0 => entry
+                    .message
+                    .reasoning_content
+                    .take_if(|reasoning| !reasoning.is_empty())
+                    .is_some(),
+                1 if entry.message.role == MessageRole::Tool => {
+                    match shorten_for_context_pressure(&entry.message.content) {
+                        Some(short) => {
+                            entry.message.content = format!(
+                                "{short}\n[context pressure: this earlier tool output was cut to \
+                                 its head and tail; `recall` with tool_call_id \"{}\" returns \
+                                 the recorded output, or repeat the call.]",
+                                entry.message.tool_call_id.as_deref().unwrap_or_default()
+                            );
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                2 => {
+                    let mut changed = false;
+                    for call in entry.message.tool_calls.iter_mut().flatten() {
+                        changed |= shorten_long_argument_strings(&mut call.arguments);
+                    }
+                    changed
+                }
+                _ => false,
+            };
+            if changed {
+                total = total.saturating_sub(before.saturating_sub(entry_prompt_tokens(entry)));
+                for item_id in &entry.source_item_ids {
+                    push_unique_item_id(truncated_item_ids, item_id.clone());
+                }
+            }
+        }
+    }
+}
+
+fn shorten_for_context_pressure(text: &str) -> Option<String> {
+    if text.len() <= CONTEXT_PRESSURE_KEEP_BYTES * 2 {
+        return None;
+    }
+    let cut = octos_core::truncate_head_tail_report(text, CONTEXT_PRESSURE_KEEP_BYTES, 0.7);
+    cut.truncated.then_some(cut.content)
+}
+
+/// Shorten long string values anywhere inside tool-call arguments. A string
+/// that itself holds JSON (some providers keep arguments as a JSON string) is
+/// shortened inside and re-serialized so it still parses.
+fn shorten_long_argument_strings(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.len() <= CONTEXT_PRESSURE_KEEP_BYTES * 2 {
+                return false;
+            }
+            if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(text)
+                && inner.is_object()
+            {
+                if shorten_long_argument_strings(&mut inner) {
+                    *text = inner.to_string();
+                    return true;
+                }
+                return false;
+            }
+            match shorten_for_context_pressure(text) {
+                Some(short) => {
+                    *text = format!(
+                        "[context pressure: this earlier argument was cut to its head and tail \
+                         here; the call already ran with the full value]\n{short}"
+                    );
+                    true
+                }
+                None => false,
+            }
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for v in values.iter_mut() {
+                changed |= shorten_long_argument_strings(v);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for v in map.values_mut() {
+                changed |= shorten_long_argument_strings(v);
+            }
+            changed
+        }
+        _ => false,
     }
 }
 

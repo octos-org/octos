@@ -862,7 +862,7 @@ fn configured_compaction_read(id: &str) -> ChatResponse {
 #[tokio::test]
 async fn configured_compaction_task_runs_after_large_tool_result_without_provider_overflow() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("visible.txt"), "payload ".repeat(2_000)).unwrap();
+    std::fs::write(dir.path().join("visible.txt"), "payload ".repeat(3_000)).unwrap();
     let policy = configured_compaction_policy();
     let (agent, requests, calls) = configured_compaction_agent(
         dir.path(),
