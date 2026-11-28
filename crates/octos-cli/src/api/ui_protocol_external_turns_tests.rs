@@ -50,6 +50,7 @@ pub(crate) fn scripted() -> Arc<ScriptedLlm> {
 
 pub(crate) struct Fixture {
     pub(crate) state: Arc<AppState>,
+    pub(crate) _hidden: crate::runtime::chat_workspace::HiddenFixtureCleanup,
     pub(crate) ledger: Arc<UiProtocolLedger>,
     pub(crate) contracts: Arc<UiProtocolContractStores>,
     pub(crate) entry: ExternalTurns,
@@ -59,13 +60,14 @@ pub(crate) struct Fixture {
 /// A serve process over `dir`: a second one over the same directory is the
 /// same server after a restart.
 pub(crate) async fn serve(dir: &Path, llm: Arc<ScriptedLlm>) -> Fixture {
-    let (state, _) = state_with_profile_llm(dir, CHAT_PROFILE, llm).await;
+    let (state, _, _hidden) = state_with_profile_llm(dir, CHAT_PROFILE, llm).await;
     let ledger = event_ledger(&state).await;
     let contracts = Arc::new(UiProtocolContractStores::default());
     let entry = ExternalTurns::new(state.clone(), ledger.clone(), contracts.clone());
     let profile = BoundProfile::verify(&state, CHAT_PROFILE).await.unwrap();
     Fixture {
         state,
+        _hidden,
         ledger,
         contracts,
         entry,

@@ -7,10 +7,40 @@ use octos_core::ui_protocol::{
     rpc_error_codes,
 };
 
+/// T-0700: the profile fixture's cleanup handle unregisters the chats root
+/// it registered — a finished test must not leave a registered root whose
+/// folder another test's backend would refuse to account for once the
+/// tempdir is gone (the bwrap / AppContainer "cannot be accounted for"
+/// failures under parallel suites).
+#[tokio::test]
+async fn fixture_cleanup_unregisters_the_profile_chats_root() {
+    let temp = tempfile::tempdir().unwrap();
+    // Registration stores the CANONICAL root — on Windows that is the
+    // verbatim `\\?\C:\…` form, so compare against the canonical temp
+    // path, not the lexical one.
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    let reserved = chat_workspace::reserved_folders();
+    let registered_under = |root: &Path| {
+        reserved
+            .folders()
+            .into_iter()
+            .filter(|folder| folder.starts_with(root))
+            .count()
+    };
+    {
+        let (_state, _profile, cleanup) =
+            state_with_profile_llm(temp.path(), "t0700", unused_llm()).await;
+        assert!(registered_under(&root) > 0);
+        drop(cleanup);
+        assert_eq!(registered_under(&root), 0);
+    }
+}
+
 #[tokio::test]
 async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() {
     let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
-    let (state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
+    let (state, profile, _cleanup) =
+        state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
     let on = ConnectionUiFeatures {
         session_chat_workspace_v1: true,
         session_workspace_cwd: true,
@@ -198,7 +228,8 @@ async fn chat_workspace_is_created_once_bound_to_its_chat_and_deleted_with_it() 
 async fn chat_tools_cannot_leave_the_chat_folder() {
     let (temp, _hidden) = chat_workspace::tempdir_with_hidden_guard();
     chat_workspace::install_missing_root_healer();
-    let (mut state, profile) = state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
+    let (mut state, profile, _cleanup) =
+        state_with_profile_llm(temp.path(), PROFILE, unused_llm()).await;
     with_profile_store(&mut state, &temp.path().join("store"), &profile);
     let (a, b) = (chat_key("a"), chat_key("b"));
     let root_a = create_chat(&state, a.clone()).await.expect("chat a");

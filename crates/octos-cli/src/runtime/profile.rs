@@ -2262,6 +2262,7 @@ mod tests {
     #[tokio::test]
     async fn profile_runtime_does_not_expose_dot_pipeline() {
         let tmp = tempfile::tempdir().unwrap();
+        let _cleanup = super::super::chat_workspace::hidden_fixture_cleanup(tmp.path());
         let data_dir = tmp.path().join("profile-data");
         let graphs = data_dir.join("pipelines");
         std::fs::create_dir_all(&graphs).unwrap();
@@ -2315,6 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn native_research_synthesis_is_retained_for_plugin_reload() {
         let tmp = tempfile::tempdir().unwrap();
+        let _cleanup = super::super::chat_workspace::hidden_fixture_cleanup(tmp.path());
         let profile = fixture_profile("native-research", "OCTOS_NATIVE_RESEARCH_TEST_KEY");
         let rt = ProfileRuntime::bootstrap(&profile, tmp.path(), None, BootstrapRole::Serve)
             .await

@@ -29,6 +29,9 @@ fn host_chat() -> String {
 const TURN_ARRIVAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
 struct Fx {
+    // Declared before _tmp: the registration must outlive every use and end
+    // before the directory disappears (fields drop in declaration order).
+    _cleanup: crate::runtime::chat_workspace::HiddenFixtureCleanup,
     _tmp: tempfile::TempDir,
     state: Arc<AppState>,
     runtime: Arc<crate::runtime::ProfileRuntime>,
@@ -81,6 +84,7 @@ pub(super) fn dev_profile(env_key: &str, env_value: &str) -> crate::profiles::Us
 /// [`fixture`], with `setup` applied to the server state first.
 async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
+    let cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(tmp.path());
     let profile = dev_profile("HOST_TOOLS_TEST_KEY", "test-key");
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -98,6 +102,7 @@ async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
     let apps = tmp.path().join("apps");
     std::fs::create_dir_all(apps.join("news")).unwrap();
     Fx {
+        _cleanup: cleanup,
         state: Arc::new(state),
         runtime,
         data_dir,
@@ -667,6 +672,7 @@ impl octos_llm::LlmProvider for ScriptedHostToolLlm {
 /// peer, and the host's connection with the tool set registered on it.
 async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e {
     let tmp = tempfile::tempdir().unwrap();
+    let _cleanup = crate::runtime::chat_workspace::hidden_fixture_cleanup(tmp.path());
     let data_dir = tmp.path().join("data");
     std::fs::create_dir_all(data_dir.join("memory")).unwrap();
     // The profile's (the system agent's) private memory: no app turn, and no
@@ -732,6 +738,7 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
     )
     .expect("register");
     E2e {
+        _cleanup,
         _tmp: tmp,
         state,
         data_dir,
@@ -743,6 +750,8 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
 }
 
 struct E2e {
+    // Cleanup before TempDir: registration ends before the directory goes.
+    _cleanup: crate::runtime::chat_workspace::HiddenFixtureCleanup,
     _tmp: tempfile::TempDir,
     state: Arc<AppState>,
     data_dir: PathBuf,
