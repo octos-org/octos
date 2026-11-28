@@ -28,9 +28,18 @@ Startup still refuses, rather than guessing or merging data, when the old or
 new server root is a symlink, both roots contain data, the migration source
 contains a configured profile data directory, the server root overlaps a
 legacy `<data_dir>/chats` root, or a Code workspace is **at or below** the
-server root. An ancestor Code workspace—including a standard `_main` data
-directory that is the state home itself—remains allowed. The error names the
-conflicting paths. Resolve the reported layout before restarting.
+server root. The error names the conflicting paths. Resolve the reported
+layout before restarting.
+
+**Code workspace choice in this release:** `session/open` refuses a folder
+that is **at or below** a reserved Chat root, or that **contains** one
+(including `$HOME` on a standard install, which contains the state tree),
+with `-32120 chat_workspace_reserved`. Choose a project folder that does not
+contain the state tree; the first-run wizard guides the choice (the home
+folder is not offered directly, and the refusal shows a folder-swap
+recovery). Widening the classification to allow ancestors above the state
+home — with the reserved roots inside them staying hidden — is tracked as a
+post-2.1.0 change.
 
 Rollback leaves files in the new root intact, but older binaries cannot
 discover Chats stored there. Do not roll back with the expectation that the
