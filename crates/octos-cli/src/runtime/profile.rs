@@ -89,18 +89,58 @@ fn derive_sandbox_read_grants(octos_home: &Path) -> (Vec<String>, bool) {
 /// from the existing [`ProfileRuntime`].
 #[derive(Clone)]
 pub struct ProfilePluginReloadConfig {
-    base_tools: Arc<ToolRegistry>,
-    plugin_dirs: Vec<PathBuf>,
-    plugin_env: Vec<(String, String)>,
-    work_dir: PathBuf,
-    synthesis_config: Option<octos_agent::plugins::SynthesisConfig>,
-    require_signed: bool,
-    verified_cache_dir: PathBuf,
-    tool_policy: Option<ToolPolicy>,
-    context_filter: Vec<String>,
-    host_hooks: Vec<octos_agent::HookConfig>,
-    gateway_system_prompt: Option<String>,
-    skill_filter: Option<octos_agent::SkillFilter>,
+    pub(crate) base_tools: Arc<ToolRegistry>,
+    pub(crate) plugin_dirs: Vec<PathBuf>,
+    pub(crate) plugin_env: Vec<(String, String)>,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) synthesis_config: Option<octos_agent::plugins::SynthesisConfig>,
+    pub(crate) require_signed: bool,
+    pub(crate) verified_cache_dir: PathBuf,
+    pub(crate) tool_policy: Option<ToolPolicy>,
+    pub(crate) context_filter: Vec<String>,
+    pub(crate) host_hooks: Vec<octos_agent::HookConfig>,
+    pub(crate) gateway_system_prompt: Option<String>,
+    pub(crate) skill_filter: Option<octos_agent::SkillFilter>,
+}
+
+/// Fingerprint the inputs a profile's skill layer was assembled from: every
+/// regular file under each plugin dir plus the profile skills dir, as
+/// (path, len, mtime) triples, sorted and hashed. Install, removal and
+/// edits all move the value; a missing dir simply contributes nothing. The
+/// scan is cheap (skill trees are a handful of files) and never follows
+/// symlinks out of the roots.
+pub(crate) fn skills_layer_fingerprint(dirs: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut entries: Vec<(String, u64, u64)> = Vec::new();
+    let mut stack: Vec<PathBuf> = dirs.to_vec();
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                if !meta.file_type().is_symlink() {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            entries.push((path.to_string_lossy().into_owned(), meta.len(), mtime));
+        }
+    }
+    entries.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Shared owner for profile services whose shutdown cannot be tied to one
@@ -493,6 +533,13 @@ pub struct ProfileRuntime {
     /// (`<data_dir>/skills/`). `None` when the profile has no
     /// dashboard-installed skills.
     pub skills_dir: Option<PathBuf>,
+    /// Fingerprint of the skill inputs the prompt/tools were assembled
+    /// from (T-0718). An EXTERNAL installer (the `octos skills` CLI runs
+    /// in another process) cannot raise an in-process mutation event, so
+    /// the serve session paths compare this against a fresh scan and
+    /// rebuild the runtime when it drifted — new chats see hot-installed
+    /// skills without a Core restart, and removed skills stop injecting.
+    pub skills_fingerprint: u64,
 
     /// Env-var pairs every plugin spawn for this profile should
     /// inherit (`OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, etc.).
@@ -947,6 +994,14 @@ impl ProfileRuntime {
                 .with_after_event_debounce(std::time::Duration::from_millis(2000)),
         ));
         let skills_dir_candidate = self.data_dir.join("skills");
+        let skills_fingerprint = skills_layer_fingerprint(
+            &reload
+                .plugin_dirs
+                .iter()
+                .cloned()
+                .chain([skills_dir_candidate.clone()])
+                .collect::<Vec<_>>(),
+        );
 
         // #20b — install the main-tree sovereignty provider for the shell
         // tool. The main tree is the process working directory (the tree the
@@ -981,6 +1036,7 @@ impl ProfileRuntime {
             skills_dir: skills_dir_candidate
                 .exists()
                 .then_some(skills_dir_candidate),
+            skills_fingerprint,
             plugin_env_template: self.plugin_env_template.clone(),
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
@@ -1903,6 +1959,17 @@ impl ProfileRuntime {
         };
 
         super::chat_workspace::register_profile(data_dir);
+        // T-0718: fingerprint the skill inputs this prompt/tools layer is
+        // built from — the session paths rebuild the runtime when an
+        // external installer moves it.
+        let skills_fingerprint = skills_layer_fingerprint(
+            &plugin_reload
+                .plugin_dirs
+                .iter()
+                .cloned()
+                .chain([data_dir.join("skills")])
+                .collect::<Vec<_>>(),
+        );
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -1922,6 +1989,7 @@ impl ProfileRuntime {
             provider_name,
             credentials,
             skills_dir,
+            skills_fingerprint,
             plugin_env_template,
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
@@ -2254,6 +2322,53 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// T-0718: an external installer (another process) writes/removes a
+    /// skill; the fingerprint moves both ways and a rebuilt runtime's prompt
+    /// gains/loses the skill — no Core restart involved.
+    #[tokio::test]
+    async fn hot_skill_install_and_remove_move_the_fingerprint_and_the_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let profile = fixture_profile("hot-skill", "OCTOS_HOT_SKILL_TEST_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("bootstrap should succeed");
+        assert!(!rt.system_prompt.contains("hot-skill-iris"));
+        let fingerprint_of = |rt: &ProfileRuntime| {
+            skills_layer_fingerprint(
+                &rt.plugin_dirs
+                    .iter()
+                    .cloned()
+                    .chain([data_dir.join("skills")])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(fingerprint_of(&rt), rt.skills_fingerprint);
+
+        // External install: plain filesystem writes, no in-process event.
+        let skill = data_dir.join("skills").join("hot-skill-iris");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: hot-skill-iris\ndescription: hot iris\n---\nUse LOCAL-SKILL-IRIS-713.",
+        )
+        .unwrap();
+        assert_ne!(fingerprint_of(&rt), rt.skills_fingerprint);
+        let rebuilt = rt.rebuild_plugin_layer().await.unwrap();
+        assert_ne!(rebuilt.skills_fingerprint, rt.skills_fingerprint);
+        assert_eq!(fingerprint_of(&rebuilt), rebuilt.skills_fingerprint);
+        assert!(
+            rebuilt.system_prompt.contains("hot-skill-iris"),
+            "hot install must enter the rebuilt prompt"
+        );
+
+        // Removal moves it again; the rebuilt prompt drops the skill.
+        std::fs::remove_dir_all(&skill).unwrap();
+        assert_ne!(fingerprint_of(&rebuilt), rebuilt.skills_fingerprint);
+        let rebuilt = rebuilt.rebuild_plugin_layer().await.unwrap();
+        assert!(!rebuilt.system_prompt.contains("hot-skill-iris"));
     }
 
     /// #2691 deliberately retired DOT execution. An old graph on disk must not
