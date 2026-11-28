@@ -743,15 +743,31 @@ const DOCKER_INFO_PROBE_TIMEOUT_SECS: u64 = 3;
 /// answers `false` — the resolution then fails closed for an explicit Docker
 /// mode or degrades for Auto. Factored so tests can drive a stand-in CLI.
 fn probe_docker_linux_containers(docker: &str, timeout: std::time::Duration) -> bool {
-    use std::io::Read;
+    // The answer goes to a temp file, not a pipe: a pipe held open by a
+    // grandchild of the (already exited) CLI would block the post-exit read
+    // with no bound of its own.
+    let out_path = std::env::temp_dir().join(format!(
+        "octos-docker-info-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let Ok(out_file) = std::fs::File::create(&out_path) else {
+        return false;
+    };
     let mut child = match std::process::Command::new(docker)
         .args(["info", "--format", "{{.OSType}}"])
-        .stdout(std::process::Stdio::piped())
+        .stdout(out_file)
         .stderr(std::process::Stdio::null())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => return false,
+        Err(_) => {
+            let _ = std::fs::remove_file(&out_path);
+            return false;
+        }
     };
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
@@ -770,16 +786,15 @@ fn probe_docker_linux_containers(docker: &str, timeout: std::time::Duration) -> 
         }
     };
     let Some(status) = status else {
+        let _ = std::fs::remove_file(&out_path);
         return false;
     };
     if !status.success() {
+        let _ = std::fs::remove_file(&out_path);
         return false;
     }
-    let mut out = String::new();
-    child
-        .stdout
-        .take()
-        .and_then(|mut stdout| stdout.read_to_string(&mut out).ok());
+    let out = std::fs::read_to_string(&out_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
     out == "linux\n"
 }
 
