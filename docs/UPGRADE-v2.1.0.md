@@ -33,23 +33,31 @@ tar xzf "octos-bundle-${TARGET}.tar.gz" -C "${STAGE}/payload"
 # 2. Stop the service (skip if you run the binary directly).
 sudo systemctl stop octos-serve      # macOS: sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
 
-# 3. Swap the whole bundle set (octos, octos-sandbox, tool binaries,
-#    model_catalog.json). Keep the previous set as a rollback copy.
-mv "${PREFIX}" "${PREFIX}.prev"
-cp -a "${STAGE}/payload" "${PREFIX}"
+# 3. Back up exactly the files this bundle replaces (a fresh dated
+#    backup per upgrade), then install the payload over the prefix.
+#    Other programs in the prefix (install.sh, octos-doctor.sh,
+#    unrelated binaries) stay in place.
+BACKUP="${PREFIX}.backup.$(date +%Y%m%d%H%M%S)"
+mkdir -p "${BACKUP}"
+for f in "${STAGE}/payload/"*; do
+  [ -f "$f" ] || continue
+  name=$(basename "$f")
+  [ -f "${PREFIX}/${name}" ] && cp -a "${PREFIX}/${name}" "${BACKUP}/"
+done
+cp -a "${STAGE}/payload/." "${PREFIX}/"
 
 # 4. Restart and check health.
 sudo systemctl start octos-serve     # macOS: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 ~/.octos/bin/octos serve --version   # or: bash octos-doctor.sh from the release
 ```
 
-Rollback restores the previous bundle set and restarts — data directories
-are not rewritten by the swap, so no data rollback is needed:
+Rollback restores the files that upgrade replaced, from the exact dated
+backup it created, and restarts — data directories are not rewritten by the
+swap, so no data rollback is needed:
 
 ```bash
 sudo systemctl stop octos-serve
-rm -rf "${PREFIX}"
-mv "${PREFIX}.prev" "${PREFIX}"
+cp -a "${BACKUP}/." "${PREFIX}/"   # the dated backup dir printed by the upgrade
 sudo systemctl start octos-serve
 ```
 

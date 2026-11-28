@@ -46,6 +46,7 @@ curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/inst
 校验文件随每个 bundle 一起发布：
 
 ```bash
+set -e   # 任一下载或校验失败即停止
 TAG=v2.1.0-rc.1
 TARGET=x86_64-unknown-linux-gnu   # 平台目标见发行页
 curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
