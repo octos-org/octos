@@ -67,8 +67,7 @@ swap, so no data rollback is needed:
 # service restarts only when the copy fully succeeded — a mistyped path or
 # partial copy never leaves a mixed-version install running.
 [ -d "${BACKUP}" ] && [ -n "$(ls -A "${BACKUP}")" ]   || { echo "backup ${BACKUP} is missing or empty" >&2; exit 1; }
-sudo systemctl stop octos-serve
-cp -a "${BACKUP}/." "${PREFIX}/" && sudo systemctl start octos-serve
+sudo systemctl stop octos-serve && cp -a "${BACKUP}/." "${PREFIX}/" && sudo systemctl start octos-serve
 ```
 
 **Chat-workspace constraint before you roll back:** Chats created by the new
