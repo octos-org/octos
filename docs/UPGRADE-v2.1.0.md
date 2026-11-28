@@ -32,12 +32,17 @@ server root. The error names the conflicting paths. Resolve the reported
 layout before restarting.
 
 **Code workspace choice in this release:** `session/open` refuses a folder
-that is **at or below** a reserved Chat root, or that **contains** one
-(including `$HOME` on a standard install, which contains the state tree),
-with `-32120 chat_workspace_reserved`. Choose a project folder that does not
-contain the state tree; the first-run wizard guides the choice (the home
-folder is not offered directly, and the refusal shows a folder-swap
-recovery). Widening the classification to allow ancestors above the state
+that is **at or below** the server Chat root, or that **contains** it — on a
+standard install that makes `$HOME` (which contains the state tree) refused
+with `-32120 chat_workspace_reserved`. For a legacy `<data_dir>/chats` root,
+only a containing folder at or below `data_dir` is refused, so a project
+that holds a custom profile data directory while the server root lives
+elsewhere remains a valid workspace. Choose a project folder that does not
+contain the server Chat root; on the current client the first-run wizard
+still offers the home folder, so select a project subfolder instead — a
+client that no longer offers the home folder directly and shows a
+folder-swap recovery for the refusal ships with the next Octoscode Web
+release. Widening the classification to allow ancestors above the state
 home — with the reserved roots inside them staying hidden — is tracked as a
 post-2.1.0 change.
 
