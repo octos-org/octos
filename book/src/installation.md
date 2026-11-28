@@ -21,6 +21,49 @@ You also need an API key from at least one supported LLM provider.
 | LibreOffice | Office document conversion | `brew install --cask libreoffice` |
 | Poppler | PDF rendering (`pdftoppm`) | `brew install poppler` / `apt install poppler-utils` |
 
+## Prebuilt Release Assets
+
+The fastest install path is the published bundle — no repo clone, Rust, or
+Node.js needed. The release ships `install.sh`, per-platform
+`octos-bundle-<target>` archives (Linux x86-64/ARM64, macOS ARM64, Windows
+x86-64) and a `.sha256` sidecar for each archive, plus `octos-doctor.sh`.
+
+```bash
+# Install the v2.1.0 preview bundle and register the background service:
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+
+# Pin a specific release instead of the default (latest):
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh   | bash -s -- --version v2.1.0-rc.1 --prefix ~/.octos/bin --port 8080
+```
+
+What the script does, in order: download `octos-bundle-<target>` and its
+`.sha256` sidecar, verify the archive against the sidecar
+(`sha256sum -c`-compatible line), extract into `~/.octos/bin` (override with
+`--prefix`), write the configuration, and register the service.
+
+**sudo boundary:** the binary install lives entirely in your home directory,
+but service registration (`octos-serve` systemd unit on Linux,
+`io.octos.serve` LaunchDaemon on macOS) uses `sudo systemctl` / `sudo
+launchctl`. On machines without sudo, skip the service and run directly —
+the checksum sidecar is published next to every bundle:
+
+```bash
+TAG=v2.1.0-rc.1
+TARGET=x86_64-unknown-linux-gnu   # see the release page for your platform
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz.sha256"
+sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
+mkdir -p ~/.octos/bin
+tar xzf "octos-bundle-${TARGET}.tar.gz" -C ~/.octos/bin
+~/.octos/bin/octos serve          # http://127.0.0.1:8080 (dashboard at /admin/)
+```
+
+`install.sh --uninstall` removes services and binaries;
+`install.sh --doctor` checks installation and service health. Upgrading
+swaps the binary for a newer bundle — the exact swap/rollback commands and
+the v2.1.0 Chat-workspace layout constraints are in
+[Upgrading to Octos v2.1.0](../../docs/UPGRADE-v2.1.0.md).
+
 ## Build from Source
 
 ```bash

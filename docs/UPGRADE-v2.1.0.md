@@ -4,6 +4,53 @@ This release includes the changes from v2.0.3 through the v2.1.0 release
 baseline `cfab32f0944ecac1897af1346b9fcd19aad343d8`. Read the sections that
 apply to existing serve installations before upgrading.
 
+## Swap the binary (and how to roll back)
+
+An upgrade replaces the running binary with the new bundle; it does not move
+your data. Recommended order:
+
+```bash
+TAG=v2.1.0-rc.1                      # the release you are upgrading to
+TARGET=x86_64-unknown-linux-gnu      # your platform (see the release page)
+PREFIX=~/.octos/bin                  # install prefix from the original install
+
+# 1. Download the new bundle and verify it against its SHA-256 sidecar.
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz.sha256"
+sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
+
+# 2. Stop the service (skip if you run the binary directly).
+sudo systemctl stop octos-serve      # macOS: sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+
+# 3. Swap the binary. Keep the previous one as a rollback copy.
+cp "${PREFIX}/octos" "${PREFIX}/octos.prev"
+tar xzf "octos-bundle-${TARGET}.tar.gz" -C "${PREFIX}"
+
+# 4. Restart and check health.
+sudo systemctl start octos-serve     # macOS: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
+~/.octos/bin/octos serve --version   # or: bash octos-doctor.sh from the release
+```
+
+Rollback restores the previous binary and restarts — data directories are
+not rewritten by the swap, so no data rollback is needed:
+
+```bash
+sudo systemctl stop octos-serve
+mv "${PREFIX}/octos.prev" "${PREFIX}/octos"
+sudo systemctl start octos-serve
+```
+
+**Chat-workspace constraint before you roll back:** Chats created by the new
+binary live under `<state home>/chat-workspaces/…`, which older binaries do
+not discover (see the next section). Rolling back to a pre-2.1.0 binary is
+safe for configuration and sessions, but those new Chats stay invisible to
+the old server — they reappear after upgrading again.
+
+If you also run a web client: match it to the runtime's companion release.
+The octos-web SPA embedded at `/app/` is deprecated; the supported browser
+client is [Octoscode Web](https://github.com/octos-org/octoscode-web), whose
+getting-started guide lists the compatible runtime versions.
+
 ## Server Chat workspaces move out of legacy `chats`
 
 Runtime-created Profiles now keep server Chat workspaces under

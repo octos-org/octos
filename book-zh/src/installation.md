@@ -21,6 +21,45 @@
 | LibreOffice | Office 文档转换 | `brew install --cask libreoffice` |
 | Poppler | PDF 渲染（`pdftoppm`） | `brew install poppler` / `apt install poppler-utils` |
 
+## 预编译发行资产
+
+最快的安装路径是已发布的 bundle——无需克隆仓库、Rust 或 Node.js。发行版提供
+`install.sh`、各平台 `octos-bundle-<target>` 压缩包（Linux x86-64/ARM64、macOS
+ARM64、Windows x86-64）、每个压缩包对应的 `.sha256` 校验文件，以及
+`octos-doctor.sh`。
+
+```bash
+# 安装 v2.1.0 预览 bundle 并注册后台服务：
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+
+# 用 --version 固定到某个发行版（默认 latest）：
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh \
+  | bash -s -- --version v2.1.0-rc.1 --prefix ~/.octos/bin --port 8080
+```
+
+脚本依次执行：下载 `octos-bundle-<target>` 及其 `.sha256` 校验文件、按校验文件
+验证压缩包、解压到 `~/.octos/bin`（可用 `--prefix` 覆盖）、写入配置并注册服务。
+
+**sudo 边界：** 二进制安装全部在你的主目录内完成，但服务注册（Linux 的
+`octos-serve` systemd 单元、macOS 的 `io.octos.serve` LaunchDaemon）需要
+`sudo systemctl` / `sudo launchctl`。没有 sudo 的机器请跳过服务直接运行——
+校验文件随每个 bundle 一起发布：
+
+```bash
+TAG=v2.1.0-rc.1
+TARGET=x86_64-unknown-linux-gnu   # 平台目标见发行页
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz.sha256"
+sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
+mkdir -p ~/.octos/bin
+tar xzf "octos-bundle-${TARGET}.tar.gz" -C ~/.octos/bin
+~/.octos/bin/octos serve          # http://127.0.0.1:8080（管理仪表板 /admin/）
+```
+
+`install.sh --uninstall` 移除服务与二进制；`install.sh --doctor` 检查安装与服务健康。
+升级就是用新 bundle 替换二进制——精确的替换/回滚命令和 v2.1.0 Chat 工作区布局约束见
+[升级到 Octos v2.1.0](../../docs/UPGRADE-v2.1.0.md)。
+
 ## 从源码编译
 
 ```bash

@@ -67,4 +67,8 @@ octos gateway
 octos serve
 ```
 
-然后在浏览器中打开 `http://localhost:50080`。
+内嵌的运维**管理仪表板**位于 `http://localhost:50080/admin/`。此前内嵌在
+`/app/` 的 octos-web SPA 已弃用，不再是推荐入口——浏览器端请使用
+**[Octoscode Web](https://github.com/octos-org/octoscode-web)**（见它的
+[入门指南](https://github.com/octos-org/octoscode-web/blob/main/docs/getting-started.md)）
+连接到这个运行时，或使用终端客户端 **[Octoscode](https://github.com/octos-org/octoscode)**。

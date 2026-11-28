@@ -24,7 +24,7 @@ Octos operates in three primary modes:
 
 The `octos serve` backend speaks a single versioned **UI Protocol** (JSON-RPC over WebSocket or stdio), so several front-ends share one server:
 
-- **Web** ([octos-web](https://github.com/octos-org/octos-web)): the React SPA embedded at `/app/` (chat, Slides Studio, Sites, Voice). The operator **admin dashboard** at `/admin/` is a separate embedded app in the octos repo (`dashboard/`).
+- **Web** ([Octoscode Web](https://github.com/octos-org/octoscode-web)): the browser client (chat, Slides Studio, Sites, Voice); see its [getting-started guide](https://github.com/octos-org/octoscode-web/blob/main/docs/getting-started.md). The earlier octos-web SPA embedded at `/app/` is deprecated. The operator **admin dashboard** at `/admin/` is a separate embedded app in the octos repo (`dashboard/`).
 - **Terminal** ([octoscode](https://github.com/octos-org/octoscode)): a Rust TUI that connects over the UI Protocol (WebSocket to a running `serve`, or a spawned `serve --stdio` child) with live streaming, approvals, diffs, and onboarding.
 
 ## Key Concepts

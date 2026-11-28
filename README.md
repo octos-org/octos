@@ -42,6 +42,37 @@ This repository is for developers embedding, extending, or integrating the
 harness kernel. Application installation and everyday coding workflows belong
 in the client repositories above.
 
+### Install the Octos runtime (prebuilt)
+
+To host the runtime a client connects to (`octos serve`), install from the
+published release assets — no repo clone or Rust toolchain needed:
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+```
+
+- The script downloads the `octos-bundle-<target>` archive for your platform
+  and verifies it against the `.sha256` sidecar published next to it, then
+  installs under `~/.octos/bin`. Platform targets: Linux x86-64 and ARM64,
+  macOS ARM64, Windows x86-64.
+- `--version TAG` pins a release; the default is the latest release. See
+  `install.sh --help` for `--prefix`, `--port`, `--uninstall` and `--doctor`.
+- **sudo note:** registering the background service (`octos-serve` systemd
+  unit on Linux, LaunchDaemon on macOS) needs sudo. Without sudo, extract the
+  bundle and run the binary directly instead — no service is required:
+
+  ```bash
+  curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+  curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
+  sha256sum -c octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
+  tar xzf octos-bundle-x86_64-unknown-linux-gnu.tar.gz -C ~/.octos/bin
+  ~/.octos/bin/octos serve   # dashboard at http://127.0.0.1:8080
+  ```
+
+- Upgrading means swapping the binary for a newer bundle; see
+  [docs/UPGRADE-v2.1.0.md](docs/UPGRADE-v2.1.0.md) for the exact swap and
+  rollback steps and the Chat-workspace layout notes.
+
 <a id="embed-octos"></a>
 
 ## Build with Octos

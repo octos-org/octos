@@ -223,7 +223,8 @@ Octos 开箱即用支持 18 个 LLM 提供商家族。云端提供商需要设�
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI 自动判定 | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI 兼容 | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI 兼容 | — |
-| `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI 兼容 | `kimi` |
+| `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI 兼容（`https://api.moonshot.ai/v1`） | `kimi` |
+| `moonshot-coding` | `KIMI_CODING_API_KEY` | k3 | OpenAI 兼容（`https://api.kimi.com/coding/v1`，Kimi 编程套餐） | `kimi-coding` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI 兼容 | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI 兼容 | — |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI 兼容 | `minimaxi` |
@@ -264,6 +265,16 @@ Octos 开箱即用支持 18 个 LLM 提供商家族。云端提供商需要设�
 3. 点击"新建 API Key"
 4. 复制密钥
 5. 设置环境变量：`export MOONSHOT_API_KEY="your-key"`
+
+**Kimi 编程套餐（`moonshot-coding`，模型 `k3`）：**
+1. 订阅 Kimi 编程套餐，在 [Kimi 编程控制台](https://www.kimi.com/coding) 获取
+   `sk-kimi-…` 密钥
+2. 设置环境变量：`export KIMI_CODING_API_KEY="sk-kimi-…"`
+3. 该族目标端点为 `https://api.kimi.com/coding/v1`，默认模型 `k3`（别名
+   `kimi-coding`；密钥环境变量回退：`KIMI_API_KEY`、`MOONSHOT_API_KEY`）。
+4. 编程套餐密钥与普通 Moonshot 密钥**不可互换**：编程端点拒绝普通
+   Moonshot 密钥，普通 Moonshot 端点拒绝编程套餐密钥。请选择与密钥匹配的
+   族——两者都不会根据模型名自动探测，编程密钥不会被静默路由到错误端点。
 
 **OpenAI：**
 1. 访问 [OpenAI API Keys](https://platform.openai.com/api-keys)
@@ -321,7 +332,7 @@ Octos 开箱即用支持 18 个 LLM 提供商家族。云端提供商需要设�
 ```json
 {
   "provider": "moonshot",
-  "model": "kimi-2.5",
+  "model": "kimi-k2.5",
   "api_key_env": "KIMI_API_KEY"
 }
 ```
@@ -449,7 +460,7 @@ octos auth logout --provider openai
 ```json
 {
   "provider": "moonshot",
-  "model": "kimi-2.5",
+  "model": "kimi-k2.5",
   "fallback_models": [
     {
       "provider": "deepseek",
@@ -693,7 +704,7 @@ curl -X POST http://localhost:50080/api/admin/profiles \
     "enabled": false,
     "config": {
       "provider": "moonshot",
-      "model": "kimi-2.5",
+      "model": "kimi-k2.5",
       "api_key_env": "KIMI_API_KEY",
       "gateway": {
         "channels": [
@@ -787,7 +798,7 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
-    "model": "kimi-2.5",
+    "model": "kimi-k2.5",
     "api_key_env": "KIMI_API_KEY"
   }'
 ```
@@ -888,7 +899,7 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 用户：有哪些可用的模型？
 
 机器人：[使用 switch_model 工具，action="list"]
-       当前模型：moonshot/kimi-2.5
+       当前模型：moonshot/kimi-k2.5
 
        可用提供商：
          - anthropic（默认：claude-sonnet-4-20250514）[就绪]
@@ -910,7 +921,7 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 机器人：[使用 switch_model 工具，action="switch"，model="deepseek-chat"]
        已切换到 deepseek/deepseek-chat。
-       之前的模型（moonshot/kimi-2.5）已保留为备用。
+       之前的模型（moonshot/kimi-k2.5）已保留为备用。
 ```
 
 ```
@@ -918,7 +929,7 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 机器人：[使用 switch_model 工具，action="switch"，model="gpt-4o"]
        已切换到 openai/gpt-4o。
-       之前的模型（moonshot/kimi-2.5）已保留为备用。
+       之前的模型（moonshot/kimi-k2.5）已保留为备用。
 ```
 
 ### 10.3 故障转移机制

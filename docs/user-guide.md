@@ -315,7 +315,8 @@ Octos supports 18 LLM provider families out of the box. Cloud providers require 
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Anthropic / OpenAI auto-detected | `r9s.ai` |
 | `deepseek` | `DEEPSEEK_API_KEY` | deepseek-chat | OpenAI-compatible | — |
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | — |
-| `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
+| `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible (`https://api.moonshot.ai/v1`) | `kimi` |
+| `moonshot-coding` | `KIMI_CODING_API_KEY` | k3 | OpenAI-compatible (`https://api.kimi.com/coding/v1`, Kimi Coding Plan) | `kimi-coding` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
@@ -356,6 +357,19 @@ Octos supports 18 LLM provider families out of the box. Cloud providers require 
 3. Click "Create new API key" (新建 API Key)
 4. Copy the key
 5. Set it: `export MOONSHOT_API_KEY="your-key"`
+
+**Kimi Coding Plan (`moonshot-coding`, model `k3`):**
+1. Subscribe to the Kimi Coding Plan and get its `sk-kimi-…` key from the
+   [Kimi coding console](https://www.kimi.com/coding)
+2. Set it: `export KIMI_CODING_API_KEY="sk-kimi-…"`
+3. The family targets `https://api.kimi.com/coding/v1` and defaults to the
+   `k3` model (aliases: `kimi-coding`; key env fallbacks: `KIMI_API_KEY`,
+   `MOONSHOT_API_KEY`).
+4. Coding-plan keys and standard Moonshot keys are NOT interchangeable: the
+   coding endpoint rejects ordinary Moonshot keys, and the standard Moonshot
+   endpoint rejects coding-plan keys. Pick the family that matches your key —
+   the two are never auto-detected from a model name, so a coding key cannot
+   be silently routed to the wrong endpoint.
 
 **OpenAI:**
 1. Go to [OpenAI API Keys](https://platform.openai.com/api-keys)
@@ -413,7 +427,7 @@ Set `provider` and `model` in your config:
 ```json
 {
   "provider": "moonshot",
-  "model": "kimi-2.5",
+  "model": "kimi-k2.5",
   "api_key_env": "KIMI_API_KEY"
 }
 ```
@@ -559,7 +573,7 @@ Configure a priority-ordered fallback chain. If the primary provider fails (401,
 ```json
 {
   "provider": "moonshot",
-  "model": "kimi-2.5",
+  "model": "kimi-k2.5",
   "fallback_models": [
     {
       "provider": "deepseek",
@@ -803,7 +817,7 @@ curl -X POST http://localhost:50080/api/admin/profiles \
     "enabled": false,
     "config": {
       "provider": "moonshot",
-      "model": "kimi-2.5",
+      "model": "kimi-k2.5",
       "api_key_env": "KIMI_API_KEY",
       "gateway": {
         "channels": [
@@ -938,7 +952,7 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "moonshot",
-    "model": "kimi-2.5",
+    "model": "kimi-k2.5",
     "api_key_env": "KIMI_API_KEY"
   }'
 ```
@@ -1040,7 +1054,7 @@ The `switch_model` tool allows users to list available LLM providers and switch 
 User: What models are available?
 
 Bot: [uses switch_model tool with action="list"]
-     Current model: moonshot/kimi-2.5
+     Current model: moonshot/kimi-k2.5
 
      Available providers:
        - anthropic (default: claude-sonnet-4-20250514) [ready]
@@ -1062,7 +1076,7 @@ User: Switch to deepseek-chat
 
 Bot: [uses switch_model tool with action="switch", model="deepseek-chat"]
      Switched to deepseek/deepseek-chat.
-     Previous model (moonshot/kimi-2.5) is kept as fallback.
+     Previous model (moonshot/kimi-k2.5) is kept as fallback.
 ```
 
 ```
@@ -1070,7 +1084,7 @@ User: Use GPT-4o instead
 
 Bot: [uses switch_model tool with action="switch", model="gpt-4o"]
      Switched to openai/gpt-4o.
-     Previous model (moonshot/kimi-2.5) is kept as fallback.
+     Previous model (moonshot/kimi-k2.5) is kept as fallback.
 ```
 
 ### 10.3 How Fallback Works
