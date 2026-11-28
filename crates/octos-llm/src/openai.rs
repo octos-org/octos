@@ -612,7 +612,15 @@ impl OpenAIProvider {
                 == ReasoningStyle::EffortAndThinkingToggle
                 && !tools.is_empty();
             let reasoning = if role == "assistant" && deepseek_tool_continuation {
-                m.reasoning_content.as_deref()
+                // DeepSeek checks that the field is PRESENT on every assistant
+                // row of a tool-enabled thinking request and answers HTTP 400
+                // "The `reasoning_content` in the thinking mode must be passed
+                // back to the API" when any row lacks it, e.g. a step the
+                // model answered without thinking, whose empty reasoning was
+                // not retained in history. An empty string satisfies the check
+                // (verified against api.deepseek.com, 2026-11-22), so a
+                // missing value is sent as "" rather than invented reasoning.
+                Some(m.reasoning_content.as_deref().unwrap_or(""))
             } else if role == "assistant" && needs_reasoning_stub {
                 match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
@@ -1974,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn should_preserve_deepseek_reasoning_when_tools_are_sent() {
+    fn should_send_deepseek_reasoning_on_every_assistant_message_when_tools_are_sent() {
         let tools = [ToolSpec {
             name: "read_file".into(),
             description: "Read a workspace file".into(),
@@ -1989,7 +1997,15 @@ mod tests {
             // the actual provider field, including on a prior non-tool answer.
             let assistant: Message =
                 serde_json::from_value(serde_json::to_value(assistant).unwrap()).unwrap();
-            let messages = [assistant, msg("Continue with the available tools")];
+            // A step whose reasoning was not retained: DeepSeek answers HTTP 400
+            // when any assistant message lacks the field, and accepts "".
+            let mut unretained = msg("Prior step without retained reasoning");
+            unretained.role = MessageRole::Assistant;
+            let messages = [
+                assistant,
+                unretained,
+                msg("Continue with the available tools"),
+            ];
             let value = serde_json::to_value(provider.build_request(
                 &messages,
                 &tools,
@@ -2001,6 +2017,7 @@ mod tests {
                 value["messages"][0]["reasoning_content"], "retained provider reasoning\n精确保留",
                 "{model}"
             );
+            assert_eq!(value["messages"][1]["reasoning_content"], "", "{model}");
         }
     }
 
