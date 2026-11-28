@@ -210,8 +210,9 @@ fn rounds_to_have(requests: &[Value], needs: &[Need]) -> Option<usize> {
 }
 
 struct Fx {
-    tmp: tempfile::TempDir,
+    // Cleanup before TempDir: registration ends before the directory goes.
     _cleanup: crate::runtime::chat_workspace::HiddenFixtureCleanup,
+    tmp: tempfile::TempDir,
     state: Arc<AppState>,
     data_dir: PathBuf,
     /// The master session's workspace; an unfenced peer works in it too.
