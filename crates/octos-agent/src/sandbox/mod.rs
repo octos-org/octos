@@ -745,29 +745,26 @@ const DOCKER_INFO_PROBE_TIMEOUT_SECS: u64 = 3;
 fn probe_docker_linux_containers(docker: &str, timeout: std::time::Duration) -> bool {
     // The answer goes to a temp file, not a pipe: a pipe held open by a
     // grandchild of the (already exited) CLI would block the post-exit read
-    // with no bound of its own.
-    let out_path = std::env::temp_dir().join(format!(
-        "octos-docker-info-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let Ok(out_file) = std::fs::File::create(&out_path) else {
+    // with no bound of its own. A NamedTempFile is collision-proof and
+    // private, and never truncates a pre-existing target.
+    let Ok(out) = tempfile::Builder::new()
+        .prefix("octos-docker-info-")
+        .tempfile()
+    else {
         return false;
     };
+    let out_file = out.reopen();
     let mut child = match std::process::Command::new(docker)
         .args(["info", "--format", "{{.OSType}}"])
-        .stdout(out_file)
+        .stdout(match out_file {
+            Ok(file) => std::process::Stdio::from(file),
+            Err(_) => return false,
+        })
         .stderr(std::process::Stdio::null())
         .spawn()
     {
         Ok(child) => child,
-        Err(_) => {
-            let _ = std::fs::remove_file(&out_path);
-            return false;
-        }
+        Err(_) => return false,
     };
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
@@ -786,16 +783,20 @@ fn probe_docker_linux_containers(docker: &str, timeout: std::time::Duration) -> 
         }
     };
     let Some(status) = status else {
-        let _ = std::fs::remove_file(&out_path);
         return false;
     };
     if !status.success() {
-        let _ = std::fs::remove_file(&out_path);
         return false;
     }
-    let out = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&out_path);
-    out == "linux\n"
+    // NamedTempFile removes itself on drop.
+    out.reopen()
+        .ok()
+        .and_then(|mut f| {
+            let mut text = String::new();
+            use std::io::Read;
+            f.read_to_string(&mut text).ok().map(|_| text)
+        })
+        .is_some_and(|text| text == "linux\n")
 }
 
 impl HostBackendProbe for RealHostProbe {
