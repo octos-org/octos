@@ -732,6 +732,57 @@ pub trait HostBackendProbe {
 /// helpers the build target does not even compile.
 struct RealHostProbe;
 
+/// `docker info` answers quickly on a healthy daemon; a stalled daemon or a
+/// remote context must not block serve startup or session creation, so the
+/// probe is bounded (seconds).
+const DOCKER_INFO_PROBE_TIMEOUT_SECS: u64 = 3;
+
+/// Probe the daemon's container OS through `docker info --format {{.OSType}}`,
+/// bounded by `timeout`: the child is polled, killed and reaped on expiry, and
+/// every failure shape (spawn error, nonzero exit, timeout, wrong OSType)
+/// answers `false` — the resolution then fails closed for an explicit Docker
+/// mode or degrades for Auto. Factored so tests can drive a stand-in CLI.
+fn probe_docker_linux_containers(docker: &str, timeout: std::time::Duration) -> bool {
+    use std::io::Read;
+    let mut child = match std::process::Command::new(docker)
+        .args(["info", "--format", "{{.OSType}}"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            // Timeout or wait error: kill and reap so no zombie or runaway
+            // probe survives, and answer unavailable.
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let Some(status) = status else {
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .and_then(|mut stdout| stdout.read_to_string(&mut out).ok());
+    out == "linux\n"
+}
+
 impl HostBackendProbe for RealHostProbe {
     fn sandbox_exec(&self) -> bool {
         which_exists("sandbox-exec")
@@ -777,13 +828,10 @@ impl HostBackendProbe for RealHostProbe {
     fn docker_linux_containers(&self) -> bool {
         // Read-only daemon probe: no pull, no daemon switch, no host change.
         // Any failure (daemon down, pipe missing) answers false — fail closed.
-        std::process::Command::new("docker")
-            .args(["info", "--format", "{{.OSType}}"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|out| out.status.success() && out.stdout == b"linux\n")
-            .unwrap_or(false)
+        probe_docker_linux_containers(
+            "docker",
+            std::time::Duration::from_secs(DOCKER_INFO_PROBE_TIMEOUT_SECS),
+        )
     }
 }
 
@@ -1631,6 +1679,50 @@ fn which_exists(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// T-0709 review: the daemon probe is bounded — a stand-in CLI that
+    /// never answers must be killed and read as unavailable, not block
+    /// session creation.
+    #[cfg(unix)]
+    #[test]
+    fn should_treat_a_stalled_docker_probe_as_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stall = dir.path().join("docker");
+        std::fs::write(&stall, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&stall, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(!super::probe_docker_linux_containers(
+            stall.to_str().unwrap(),
+            std::time::Duration::from_millis(150)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a stalled probe must return promptly"
+        );
+
+        for (body, expected) in [
+            ("#!/bin/sh\necho linux\n", true),
+            ("#!/bin/sh\necho windows\n", false),
+            ("#!/bin/sh\nexit 1\n", false),
+        ] {
+            let docker = dir.path().join("docker");
+            std::fs::write(&docker, body).unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                super::probe_docker_linux_containers(
+                    docker.to_str().unwrap(),
+                    std::time::Duration::from_secs(5)
+                ),
+                expected,
+                "{body}"
+            );
+        }
+        assert!(!super::probe_docker_linux_containers(
+            "/nonexistent/docker",
+            std::time::Duration::from_secs(5)
+        ));
+    }
+
     use super::*;
 
     // -----------------------------------------------------------------------
