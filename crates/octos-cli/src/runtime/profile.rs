@@ -540,6 +540,10 @@ pub struct ProfileRuntime {
     /// rebuild the runtime when it drifted — new chats see hot-installed
     /// skills without a Core restart, and removed skills stop injecting.
     pub skills_fingerprint: u64,
+    /// Transient build marker: the skill inputs moved between the before
+    /// and after fingerprint scans of the build that produced this runtime.
+    /// Never persisted; the rebuild wrapper retries once when set.
+    pub(crate) fingerprint_moved: bool,
 
     /// Env-var pairs every plugin spawn for this profile should
     /// inherit (`OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, etc.).
@@ -894,7 +898,15 @@ impl ProfileRuntime {
                 self.profile_id
             )
         })?;
-        self.rebuild_plugin_layer_using(reload).await
+        let rebuilt = self.rebuild_plugin_layer_using(reload).await?;
+        if rebuilt.fingerprint_moved {
+            // An external install/remove landed mid-build; the first result
+            // pairs stale inputs with a fresh fingerprint. Rebuild once from
+            // the settled inputs — a second move is left for the next lazy
+            // freshness check rather than looping forever.
+            return self.rebuild_plugin_layer_using(reload).await;
+        }
+        Ok(rebuilt)
     }
 
     async fn rebuild_plugin_layer_using(
@@ -1037,6 +1049,7 @@ impl ProfileRuntime {
                 .exists()
                 .then_some(skills_dir_candidate),
             skills_fingerprint,
+            fingerprint_moved: false,
             plugin_env_template: self.plugin_env_template.clone(),
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
@@ -1556,6 +1569,16 @@ impl ProfileRuntime {
                 );
             }
         }
+        // T-0718 review: sample the fingerprint BEFORE the skill inputs are
+        // loaded (plugin_dirs are resolved above; the skills loader and
+        // plugin layer build below) so a mid-build install/remove is caught
+        // by the after scan at the tail.
+        let fingerprint_dirs = plugin_dirs
+            .iter()
+            .cloned()
+            .chain([data_dir.join("skills")])
+            .collect::<Vec<_>>();
+        let before = skills_layer_fingerprint(&fingerprint_dirs);
         let plugin_reload = Arc::new(ProfilePluginReloadConfig {
             base_tools: plugin_base_tools,
             plugin_dirs: plugin_dirs.clone(),
@@ -1959,17 +1982,11 @@ impl ProfileRuntime {
         };
 
         super::chat_workspace::register_profile(data_dir);
-        // T-0718: fingerprint the skill inputs this prompt/tools layer is
-        // built from — the session paths rebuild the runtime when an
-        // external installer moves it.
-        let skills_fingerprint = skills_layer_fingerprint(
-            &plugin_reload
-                .plugin_dirs
-                .iter()
-                .cloned()
-                .chain([data_dir.join("skills")])
-                .collect::<Vec<_>>(),
-        );
+        // T-0718: the runtime carries the BEFORE fingerprint only when the
+        // inputs did not move during the build; otherwise the caller
+        // retries with fresh inputs (see rebuild_plugin_layer).
+        let skills_fingerprint = before;
+        let fingerprint_moved = skills_layer_fingerprint(&fingerprint_dirs) != before;
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
@@ -1990,6 +2007,7 @@ impl ProfileRuntime {
             credentials,
             skills_dir,
             skills_fingerprint,
+            fingerprint_moved,
             plugin_env_template,
             tool_policy: config.tool_policy.clone(),
             default_sandbox,

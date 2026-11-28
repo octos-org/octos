@@ -146,6 +146,7 @@ pub(crate) async fn make_m11e_profile_with_llm_and_sandbox(
         skills_fingerprint: crate::runtime::profile::skills_layer_fingerprint(&[
             data_dir.join("skills")
         ]),
+        fingerprint_moved: false,
         plugin_env_template: Vec::new(),
         tool_policy: None,
         default_sandbox: sandbox,
