@@ -32,15 +32,14 @@ server root. An ancestor Code workspace—including a standard `_main` data
 directory that is the state home itself—remains allowed. The error names the
 conflicting paths. Resolve the reported layout before restarting.
 
-The session/open reservation follows the same direction, precisely: a Code
-workspace **at or below** the server root, the state home itself, or a
-folder inside the state tree (`~/.octos`, `~/.octos/profiles/<id>`) is
-refused with `chat_workspace_reserved`; an ancestor **above** the state
-home—`$HOME` being the common one—is a valid workspace, because the reserved
-roots inside it (server chats root, profile data dirs, legacy chats) stay
-hidden through the normal reserved-folder containment. Choose `$HOME` in the
-first-run wizard with confidence, or a project folder outside the state
-tree.
+The session/open reservation refuses, with `chat_workspace_reserved`, a
+Code workspace that is **at or below** the server Chat root, **inside** the
+state tree (`~/.octos`, `~/.octos/profiles/<id>`), or that **contains** the
+state home (`$HOME` on a standard install): a containing folder holds
+profile state (transcripts, credentials, memory) that the hidden-folder
+containment does not mask. Choose a project folder outside the state tree;
+the first-run wizard guides the choice. Admitting ancestors above the state
+home is blocked on a per-workspace containment design (post-2.1.0).
 
 Rollback leaves files in the new root intact, but older binaries cannot
 discover Chats stored there. Do not roll back with the expectation that the

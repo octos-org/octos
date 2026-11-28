@@ -905,15 +905,22 @@ pub(crate) fn list(data_dir: &Path, profile_id: &str) -> Vec<ChatWorkspace> {
 pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // A filesystem or volume root (`/`, `C:\`, a UNC share root) is an
+    // ancestor of every state home; admitting it would hand the workspace a
+    // far broader filesystem scope than any home or project. Refuse it
+    // outright, whatever the reserved layout is.
+    if path.parent().is_none() {
+        return true;
+    }
     let holds = path.starts_with(&data_dir) && chats_root(&data_dir).starts_with(&path);
-    // T-0730: the server-root check is DIRECTIONAL. A workspace AT or BELOW
-    // the server root is refused — a hidden root cannot hide itself. An
-    // ancestor of the server root is allowed only when it sits above the
-    // state home (`$HOME`, a project): the reserved roots inside it stay
-    // hidden through the normal reserved-folder containment, which is why
-    // the wizard's default `$HOME` choice is a valid main path. An ancestor
-    // that lies INSIDE the state home (`~/.octos`, `~/.octos/profiles/main`)
-    // still holds profile secrets and chat roots directly and stays refused.
+    // T-0730 review (alan0x P1): the server-root check is directional and
+    // explicit. Refused: at/below the server root (a hidden root cannot hide
+    // itself); inside the state tree (`~/.octos`, `~/.octos/profiles/<id>`);
+    // and any folder CONTAINING the state home (`$HOME` on a standard
+    // install) — it holds profile state (transcripts, credentials, memory)
+    // that the process-global hidden set cannot mask without also hiding the
+    // no-hint session workspaces that live under each profile data dir, so
+    // admitting it is blocked on a per-workspace containment design.
     let server_holds = server_root().is_some_and(|root| {
         let root = canonical_dir(&root);
         if path.starts_with(&root) {
@@ -922,7 +929,7 @@ pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
         let Some(state_home) = root.parent() else {
             return false;
         };
-        path.starts_with(state_home) && (root.starts_with(&path) || data_dir.starts_with(&path))
+        path.starts_with(state_home) || state_home.starts_with(&path)
     });
     holds || server_holds || is_in_chat_folder(&data_dir, &path)
 }
@@ -1220,13 +1227,12 @@ mod server_root_tests {
         assert!(chat.root.starts_with(&server_root), "{chat:?}");
     }
 
-    /// T-0730: the reserved classification is DIRECTIONAL. The wizard's
-    /// default `$HOME` choice (an ancestor above the state home) is a valid
-    /// main path — the reserved roots inside it stay hidden — while every
-    /// folder inside the state tree (state home itself, profile dirs, the
-    /// server root and anything below it) stays refused.
+    /// T-0730: the reserved classification is explicit and directional.
+    /// Projects outside the state tree stay valid workspaces; `$HOME`
+    /// (which contains the state home's profile state), the state tree,
+    /// the reserved roots and the filesystem root all stay refused.
     #[test]
-    fn should_allow_ancestors_above_the_state_home_only() {
+    fn should_refuse_the_state_tree_and_what_contains_it() {
         let (temp, hidden) = tempdir_with_hidden_guard();
         let home = temp.path().join("fake-home");
         let state_home = home.join(".octos");
@@ -1237,17 +1243,18 @@ mod server_root_tests {
             configure_server_root(&state_home, std::slice::from_ref(&data_dir), &[]).unwrap();
 
         let allowed = [
-            home.clone(),                      // the wizard default $HOME
             home.join("projects").join("app"), // a project outside the state tree
-            temp.path().to_path_buf(),         // any ancestor above the state home
         ];
         let refused = [
-            state_home.clone(),                       // the state home itself
+            home.clone(),              // $HOME contains the state home's profile state
+            temp.path().to_path_buf(), // any ancestor containing the state home
+            state_home.clone(),        // the state home itself
             state_home.join("profiles").join("main"), // inside the state tree
-            server_root.clone(),                      // the server root itself
-            server_root.join("chat-1"),               // below the server root
-            data_dir.clone(),                         // the profile data dir
-            legacy_chats.clone(),                     // the legacy chats root
+            server_root.clone(),       // the server root itself
+            server_root.join("chat-1"), // below the server root
+            data_dir.clone(),          // the profile data dir
+            legacy_chats.clone(),      // the legacy chats root
+            PathBuf::from("/"),        // the filesystem root is an ancestor of every state home
         ];
         for path in allowed {
             assert!(
@@ -1767,10 +1774,7 @@ mod server_root_tests {
         );
         assert!(!workspace_inside_server_root(&root_dir));
         assert!(workspace_inside_server_root(&server_root));
-        // T-0730: a $HOME-like cwd above the state home stays a VALID
-        // workspace — the new chat root inside it is hidden by the reserved
-        // mounts, which is what the command below proves.
-        assert!(!overlaps_chat_folders(&old_profile, &root_dir));
+        assert!(overlaps_chat_folders(&old_profile, &root_dir));
         assert!(ensure_profile_data_dir_safe(&server_root).is_err());
         let profile_store =
             crate::profiles::ProfileStore::open(&state_home, &runtime_data).expect("profile store");
