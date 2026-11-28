@@ -29,8 +29,9 @@ Node.js needed. The release ships `install.sh`, per-platform
 x86-64) and a `.sha256` sidecar for each archive, plus `octos-doctor.sh`.
 
 ```bash
-# Install the v2.1.0 preview bundle and register the background service:
-curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+# Install the v2.1.0 preview bundle and register the background service
+# (the script defaults to releases/latest, so pin the preview tag):
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash -s -- --version v2.1.0-rc.1
 
 # Pin a specific release instead of the default (latest):
 curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh   | bash -s -- --version v2.1.0-rc.1 --prefix ~/.octos/bin --port 8080
@@ -48,6 +49,7 @@ launchctl`. On machines without sudo, skip the service and run directly —
 the checksum sidecar is published next to every bundle:
 
 ```bash
+set -e   # stop on any failed download or verification
 TAG=v2.1.0-rc.1
 TARGET=x86_64-unknown-linux-gnu   # see the release page for your platform
 curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
@@ -55,7 +57,7 @@ curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bu
 sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
 mkdir -p ~/.octos/bin
 tar xzf "octos-bundle-${TARGET}.tar.gz" -C ~/.octos/bin
-~/.octos/bin/octos serve          # http://127.0.0.1:8080 (dashboard at /admin/)
+~/.octos/bin/octos serve --port 8080   # dashboard at http://127.0.0.1:8080/admin/
 ```
 
 `install.sh --uninstall` removes services and binaries;

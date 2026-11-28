@@ -47,7 +47,7 @@ Python 工具。代理在各 profile 中自动发现；首次制作时再准备 
 无需克隆仓库或 Rust 工具链：
 
 ```bash
-curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash -s -- --version v2.1.0-rc.1
 ```
 
 - 脚本下载适用于你平台的 `octos-bundle-<target>` 压缩包，并按随包发布的
@@ -60,11 +60,13 @@ curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/inst
   无需服务：
 
   ```bash
+  set -e   # 任一下载或校验失败即停止
+  mkdir -p ~/.octos/bin
   curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
   curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
   sha256sum -c octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
   tar xzf octos-bundle-x86_64-unknown-linux-gnu.tar.gz -C ~/.octos/bin
-  ~/.octos/bin/octos serve   # 管理仪表板 http://127.0.0.1:8080
+  ~/.octos/bin/octos serve --port 8080   # 管理仪表板 http://127.0.0.1:8080
   ```
 
 - 升级即用新 bundle 替换二进制；精确的替换/回滚命令和 Chat 工作区布局说明见

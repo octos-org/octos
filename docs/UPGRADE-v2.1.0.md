@@ -6,37 +6,50 @@ apply to existing serve installations before upgrading.
 
 ## Swap the binary (and how to roll back)
 
-An upgrade replaces the running binary with the new bundle; it does not move
-your data. Recommended order:
+An upgrade replaces the running bundle with a newer one; it does not move
+your data. The RC (`v2.1.0-rc.1`) is a **preview** that predates the v2.1.0
+release baseline `cfab32f09` and its Chat-workspace layout, so for the final
+upgrade use the published v2.1.0 tag (or the tag of the release you are
+upgrading to). The bundle carries `octos`, `octos-sandbox`, tool binaries
+and `model_catalog.json` — swap the whole set, never just `octos`, or you
+end up with a mixed-version installation. Recommended order:
 
 ```bash
-TAG=v2.1.0-rc.1                      # the release you are upgrading to
+set -e                               # stop on any failed download or verification
+TAG=v2.1.0                           # the release you are upgrading to (not the RC preview)
 TARGET=x86_64-unknown-linux-gnu      # your platform (see the release page)
 PREFIX=~/.octos/bin                  # install prefix from the original install
+STAGE=~/.octos/bundles/${TAG}        # staged new bundle, its own directory
 
 # 1. Download the new bundle and verify it against its SHA-256 sidecar.
+#    set -e above stops the whole recipe if either curl or sha256sum fails.
+mkdir -p "${STAGE}/payload"
+cd "${STAGE}"
 curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
 curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz.sha256"
 sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
+tar xzf "octos-bundle-${TARGET}.tar.gz" -C "${STAGE}/payload"
 
 # 2. Stop the service (skip if you run the binary directly).
 sudo systemctl stop octos-serve      # macOS: sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
 
-# 3. Swap the binary. Keep the previous one as a rollback copy.
-cp "${PREFIX}/octos" "${PREFIX}/octos.prev"
-tar xzf "octos-bundle-${TARGET}.tar.gz" -C "${PREFIX}"
+# 3. Swap the whole bundle set (octos, octos-sandbox, tool binaries,
+#    model_catalog.json). Keep the previous set as a rollback copy.
+mv "${PREFIX}" "${PREFIX}.prev"
+cp -a "${STAGE}/payload" "${PREFIX}"
 
 # 4. Restart and check health.
 sudo systemctl start octos-serve     # macOS: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 ~/.octos/bin/octos serve --version   # or: bash octos-doctor.sh from the release
 ```
 
-Rollback restores the previous binary and restarts — data directories are
-not rewritten by the swap, so no data rollback is needed:
+Rollback restores the previous bundle set and restarts — data directories
+are not rewritten by the swap, so no data rollback is needed:
 
 ```bash
 sudo systemctl stop octos-serve
-mv "${PREFIX}/octos.prev" "${PREFIX}/octos"
+rm -rf "${PREFIX}"
+mv "${PREFIX}.prev" "${PREFIX}"
 sudo systemctl start octos-serve
 ```
 

@@ -30,7 +30,7 @@ ARM64、Windows x86-64）、每个压缩包对应的 `.sha256` 校验文件，�
 
 ```bash
 # 安装 v2.1.0 预览 bundle 并注册后台服务：
-curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash -s -- --version v2.1.0-rc.1
 
 # 用 --version 固定到某个发行版（默认 latest）：
 curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh \
@@ -53,7 +53,7 @@ curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bu
 sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
 mkdir -p ~/.octos/bin
 tar xzf "octos-bundle-${TARGET}.tar.gz" -C ~/.octos/bin
-~/.octos/bin/octos serve          # http://127.0.0.1:8080（管理仪表板 /admin/）
+~/.octos/bin/octos serve --port 8080   # 管理仪表板 http://127.0.0.1:8080/admin/
 ```
 
 `install.sh --uninstall` 移除服务与二进制；`install.sh --doctor` 检查安装与服务健康。

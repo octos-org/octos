@@ -48,7 +48,7 @@ To host the runtime a client connects to (`octos serve`), install from the
 published release assets — no repo clone or Rust toolchain needed:
 
 ```bash
-curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash -s -- --version v2.1.0-rc.1
 ```
 
 - The script downloads the `octos-bundle-<target>` archive for your platform
@@ -62,11 +62,13 @@ curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/inst
   bundle and run the binary directly instead — no service is required:
 
   ```bash
+  set -e   # stop on any failed download or verification
+  mkdir -p ~/.octos/bin
   curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
   curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
   sha256sum -c octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
   tar xzf octos-bundle-x86_64-unknown-linux-gnu.tar.gz -C ~/.octos/bin
-  ~/.octos/bin/octos serve   # dashboard at http://127.0.0.1:8080
+  ~/.octos/bin/octos serve --port 8080   # dashboard at http://127.0.0.1:8080
   ```
 
 - Upgrading means swapping the binary for a newer bundle; see
