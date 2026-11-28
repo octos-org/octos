@@ -905,9 +905,32 @@ pub(crate) fn list(data_dir: &Path, profile_id: &str) -> Vec<ChatWorkspace> {
 pub(crate) fn overlaps_chat_folders(data_dir: &Path, path: &Path) -> bool {
     let data_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    // A filesystem or volume root (`/`, `C:\`, a UNC share root) is an
+    // ancestor of every state home; admitting it would hand the workspace a
+    // far broader filesystem scope than any home or project. Refuse it
+    // outright, whatever the reserved layout is.
+    if path.parent().is_none() {
+        return true;
+    }
     let holds = path.starts_with(&data_dir) && chats_root(&data_dir).starts_with(&path);
-    let server_holds =
-        server_root().is_some_and(|root| overlaps_path(&canonical_dir(&root), &path));
+    // T-0730 review (alan0x P1): the server-root check is directional and
+    // explicit. Refused: at/below the server root (a hidden root cannot hide
+    // itself); inside the state tree (`~/.octos`, `~/.octos/profiles/<id>`);
+    // and any folder CONTAINING the state home (`$HOME` on a standard
+    // install) — it holds profile state (transcripts, credentials, memory)
+    // that the process-global hidden set cannot mask without also hiding the
+    // no-hint session workspaces that live under each profile data dir, so
+    // admitting it is blocked on a per-workspace containment design.
+    let server_holds = server_root().is_some_and(|root| {
+        let root = canonical_dir(&root);
+        if path.starts_with(&root) {
+            return true;
+        }
+        let Some(state_home) = root.parent() else {
+            return false;
+        };
+        path.starts_with(state_home) || state_home.starts_with(&path)
+    });
     holds || server_holds || is_in_chat_folder(&data_dir, &path)
 }
 
@@ -1202,6 +1225,50 @@ mod server_root_tests {
         )
         .unwrap();
         assert!(chat.root.starts_with(&server_root), "{chat:?}");
+    }
+
+    /// T-0730: the reserved classification is explicit and directional.
+    /// Projects outside the state tree stay valid workspaces; `$HOME`
+    /// (which contains the state home's profile state), the state tree,
+    /// the reserved roots and the filesystem root all stay refused.
+    #[test]
+    fn should_refuse_the_state_tree_and_what_contains_it() {
+        let (temp, hidden) = tempdir_with_hidden_guard();
+        let home = temp.path().join("fake-home");
+        let state_home = home.join(".octos");
+        let data_dir = state_home.join("profiles").join("main").join("data");
+        let legacy_chats = data_dir.join("chats");
+        std::fs::create_dir_all(&legacy_chats).unwrap();
+        let server_root =
+            configure_server_root(&state_home, std::slice::from_ref(&data_dir), &[]).unwrap();
+
+        let allowed = [
+            home.join("projects").join("app"), // a project outside the state tree
+        ];
+        let refused = [
+            home.clone(),              // $HOME contains the state home's profile state
+            temp.path().to_path_buf(), // any ancestor containing the state home
+            state_home.clone(),        // the state home itself
+            state_home.join("profiles").join("main"), // inside the state tree
+            server_root.clone(),       // the server root itself
+            server_root.join("chat-1"), // below the server root
+            data_dir.clone(),          // the profile data dir
+            legacy_chats.clone(),      // the legacy chats root
+            PathBuf::from("/"),        // the filesystem root is an ancestor of every state home
+        ];
+        for path in allowed {
+            assert!(
+                !overlaps_chat_folders(&data_dir, &path),
+                "{path:?} must stay a valid workspace"
+            );
+        }
+        for path in refused {
+            assert!(
+                overlaps_chat_folders(&data_dir, &path),
+                "{path:?} must stay refused"
+            );
+        }
+        drop(hidden);
     }
 
     #[test]

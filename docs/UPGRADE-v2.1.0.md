@@ -46,6 +46,15 @@ release. Widening the classification to allow ancestors above the state
 home — with the reserved roots inside them staying hidden — is tracked as a
 post-2.1.0 change.
 
+The session/open reservation refuses, with `chat_workspace_reserved`, a
+Code workspace that is **at or below** the server Chat root, **inside** the
+state tree (`~/.octos`, `~/.octos/profiles/<id>`), or that **contains** the
+state home (`$HOME` on a standard install): a containing folder holds
+profile state (transcripts, credentials, memory) that the hidden-folder
+containment does not mask. Choose a project folder outside the state tree;
+the first-run wizard guides the choice. Admitting ancestors above the state
+home is blocked on a per-workspace containment design (post-2.1.0).
+
 Rollback leaves files in the new root intact, but older binaries cannot
 discover Chats stored there. Do not roll back with the expectation that the
 old server will see those new Chats. The exact compatibility contract is in
