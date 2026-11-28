@@ -67,7 +67,7 @@ use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{lookup_event_sink_context, write_event_to_sink};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
-use crate::progress::ProgressEvent;
+use crate::progress::{ProgressEvent, ProgressReporter};
 use crate::task_supervisor::{TaskRuntimeState, TaskTerminalGuard};
 use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
 use crate::tools::{
@@ -2862,7 +2862,8 @@ impl Agent {
                 })
                 .collect();
             let calls: Vec<&octos_core::ToolCall> = response.tool_calls.iter().collect();
-            join_parallel_handles(handles, &calls, tool_timeout).await
+            let reporter = self.reporter();
+            join_parallel_handles(handles, &calls, tool_timeout, reporter.as_ref()).await
         } else if all_exclusive {
             // Serial admission: run each tool in LLM call order, bail out of
             // the remaining calls if any one errors and emit synthetic
@@ -3175,6 +3176,7 @@ impl Agent {
                         tool_id = %tool_call.id,
                         "serial tool execution timed out"
                     );
+                    report_timed_out(self.reporter().as_ref(), tool_call, elapsed_secs);
                     timed_out_result(tool_call, elapsed_secs)
                 }
             };
@@ -3243,7 +3245,9 @@ impl Agent {
             .collect();
         let safe_refs: Vec<&octos_core::ToolCall> =
             safe_calls.iter().map(|(_, tool_call)| *tool_call).collect();
-        let safe_results = join_parallel_handles(handles, &safe_refs, tool_timeout).await;
+        let reporter = self.reporter();
+        let safe_results =
+            join_parallel_handles(handles, &safe_refs, tool_timeout, reporter.as_ref()).await;
 
         // Phase-1 verdict: a Safe failure with the cascade bit set (real
         // error / hook denial / panic / timeout — NOT a `ToolInputError`,
@@ -3329,6 +3333,7 @@ async fn join_parallel_handles(
     handles: Vec<JoinHandle<ToolCallResult>>,
     calls: &[&octos_core::ToolCall],
     tool_timeout: Option<Duration>,
+    reporter: &dyn ProgressReporter,
 ) -> Vec<ToolCallResult> {
     match tool_timeout {
         Some(dur) => {
@@ -3352,6 +3357,7 @@ async fn join_parallel_handles(
                             stopped_within_grace = stopped,
                             "tool execution timed out -- abort requested with bounded cleanup wait"
                         );
+                        report_timed_out(reporter, tc, elapsed_secs);
                         results.push(timed_out_result(tc, elapsed_secs));
                     }
                 }
@@ -3454,6 +3460,31 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
         // a cancelled peer raised no error of its own — do not further cascade
         false,
     )
+}
+
+/// Report a call the dispatcher stopped at its timeout as a failed completion.
+///
+/// The aborted task never reaches its own `ToolCompleted` report. Without
+/// this one the UI keeps the call's activity chip forever, and the loop's
+/// idle-progress watchdog counts the whole tool run as idle time: a command
+/// allowed 300s or more ended the turn with "[needs_replan] Idle progress
+/// timeout" the moment it timed out, instead of handing the timeout back to
+/// the model. A bounded timeout is progress, not a wedged loop.
+fn report_timed_out(
+    reporter: &dyn ProgressReporter,
+    tool_call: &octos_core::ToolCall,
+    elapsed_secs: u64,
+) {
+    reporter.report(ProgressEvent::ToolCompleted {
+        name: tool_call.name.clone(),
+        tool_id: tool_call.id.clone(),
+        success: false,
+        output_preview: format!(
+            "Tool '{}' timed out after {} seconds",
+            tool_call.name, elapsed_secs
+        ),
+        duration: Duration::from_secs(elapsed_secs),
+    });
 }
 
 /// Build a synthetic tool-result message for a call that was still pending
@@ -3733,6 +3764,81 @@ mod tests {
                 success: true,
                 ..Default::default()
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReporter(std::sync::Mutex<Vec<crate::progress::ProgressEvent>>);
+
+    impl crate::progress::ProgressReporter for RecordingReporter {
+        fn report(&self, event: crate::progress::ProgressEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_count_a_timed_out_call_as_loop_progress_in_both_dispatch_paths() {
+        // A call aborted at its timeout never reaches its task's own completion
+        // report. Unreported, the whole tool run counted as idle time, so a
+        // command allowed 300s or more ended the turn with "[needs_replan] Idle
+        // progress timeout" as soon as it timed out.
+        for (tool, call_id) in [
+            ("slow_tool", "call_parallel"),
+            ("drop_aware_exclusive_tool", "call_serial"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tools = ToolRegistry::new();
+            tools.register(SleepingTool);
+            tools.register(DropAwareExclusiveTool {
+                dropped: Arc::new(AtomicBool::new(false)),
+            });
+            let agent = no_chat_agent(dir.path(), "timeout-progress", tools)
+                .await
+                .with_config(crate::AgentConfig {
+                    default_interactive_tool_timeout_secs: 1,
+                    tool_timeout_secs: 1,
+                    ..Default::default()
+                });
+            let idle = Duration::from_secs(super::super::activity::DEFAULT_IDLE_TIMEOUT_SECS);
+            let Some(long_ago) = std::time::Instant::now().checked_sub(idle * 2) else {
+                return; // monotonic clock too young to backdate; nothing to prove
+            };
+            let activity = Arc::new(super::super::activity::LoopActivityState::new(long_ago));
+            let recorder = Arc::new(RecordingReporter::default());
+            agent.set_reporter(Arc::new(
+                super::super::activity::ActivityTrackingReporter::new(
+                    activity.clone(),
+                    recorder.clone(),
+                ),
+            ));
+            let response = ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![tool_call(call_id, tool)],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            };
+            let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+
+            assert!(
+                messages[0].content.contains("timed out"),
+                "{tool}: {:?}",
+                messages[0].content
+            );
+            assert_eq!(success, [(call_id.to_string(), false)]);
+            assert!(
+                recorder.0.lock().unwrap().iter().any(|event| matches!(
+                    event,
+                    crate::progress::ProgressEvent::ToolCompleted { tool_id, success: false, .. }
+                        if tool_id == call_id
+                )),
+                "{tool}: the timed-out call must be reported as completed"
+            );
+            assert!(
+                !activity.has_timed_out(idle),
+                "{tool}: the watchdog must see the timed-out call as progress"
+            );
         }
     }
 
