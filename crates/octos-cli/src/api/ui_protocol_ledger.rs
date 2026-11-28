@@ -81,7 +81,9 @@ const LIVE_BROADCAST_CAPACITY: usize = 256;
 
 #[path = "ui_protocol_retained_references.rs"]
 mod retained_references;
-pub(crate) use retained_references::{file_mutation, hydrate_references_error};
+pub(crate) use retained_references::{
+    file_mutation, hydrate_references_error, tool_completed_outcome,
+};
 
 // ---------- Public configuration ----------
 
