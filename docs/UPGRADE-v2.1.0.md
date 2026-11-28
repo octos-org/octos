@@ -4,6 +4,83 @@ This release includes the changes from v2.0.3 through the v2.1.0 release
 baseline `cfab32f0944ecac1897af1346b9fcd19aad343d8`. Read the sections that
 apply to existing serve installations before upgrading.
 
+## Swap the binary (and how to roll back)
+
+An upgrade replaces the running bundle with a newer one; it does not move
+your data. The RC (`v2.1.0-rc.1`) is a **preview** that predates the v2.1.0
+release baseline `cfab32f09` and its Chat-workspace layout, so for the final
+upgrade use the published v2.1.0 tag (or the tag of the release you are
+upgrading to). The bundle carries `octos`, `octos-sandbox`, tool binaries
+and `model_catalog.json` — swap the whole set, never just `octos`, or you
+end up with a mixed-version installation. Recommended order:
+
+```bash
+set -e                               # stop on any failed download or verification
+TAG=v2.1.0                           # the release you are upgrading to (not the RC preview)
+TARGET=x86_64-unknown-linux-gnu      # your platform (see the release page)
+PREFIX=~/.octos/bin                  # install prefix from the original install
+STAGE=~/.octos/bundles/${TAG}        # staged new bundle, its own directory
+
+# The set -e above stops the recipe on any failed step; unset variables
+# would be caught by adding -u — both guards are deliberate.
+
+# 1. Download the new bundle and verify it against its SHA-256 sidecar.
+#    set -e above stops the whole recipe if either curl or sha256sum fails.
+mkdir -p "${STAGE}/payload"
+cd "${STAGE}"
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz"
+curl -fSLO "https://github.com/octos-org/octos/releases/download/${TAG}/octos-bundle-${TARGET}.tar.gz.sha256"
+sha256sum -c "octos-bundle-${TARGET}.tar.gz.sha256"
+tar xzf "octos-bundle-${TARGET}.tar.gz" -C "${STAGE}/payload"
+
+# 2. Stop the service (skip if you run the binary directly).
+sudo systemctl stop octos-serve      # macOS: sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+
+# 3. Back up exactly the files this bundle replaces (a fresh dated
+#    backup per upgrade), then install the payload over the prefix.
+#    Other programs in the prefix (install.sh, octos-doctor.sh,
+#    unrelated binaries) stay in place.
+BACKUP="${PREFIX}.backup.$(date +%Y%m%d%H%M%S)"
+mkdir -p "${BACKUP}"
+for f in "${STAGE}/payload/"*; do
+  [ -f "$f" ] || continue
+  name=$(basename "$f")
+  [ -f "${PREFIX}/${name}" ] && cp -a "${PREFIX}/${name}" "${BACKUP}/"
+done
+cp -a "${STAGE}/payload/." "${PREFIX}/"
+
+# 4. Restart and check health.
+sudo systemctl start octos-serve     # macOS: sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
+~/.octos/bin/octos serve --version   # or: bash octos-doctor.sh from the release
+```
+
+Rollback restores the files that upgrade replaced, from the exact dated
+backup it created, and restarts — data directories are not rewritten by the
+swap, so no data rollback is needed:
+
+```bash
+# A fresh shell does not have these set — the commands below must abort
+# rather than touch the filesystem root if either is empty.
+: "${BACKUP:?set BACKUP to the dated backup dir printed by the upgrade}"
+: "${PREFIX:?set PREFIX to your install prefix}"
+# The backup must exist and hold files BEFORE the service stops, and the
+# service restarts only when the copy fully succeeded — a mistyped path or
+# partial copy never leaves a mixed-version install running.
+[ -d "${BACKUP}" ] && [ -n "$(ls -A "${BACKUP}")" ]   || { echo "backup ${BACKUP} is missing or empty" >&2; exit 1; }
+sudo systemctl stop octos-serve && cp -a "${BACKUP}/." "${PREFIX}/" && sudo systemctl start octos-serve
+```
+
+**Chat-workspace constraint before you roll back:** Chats created by the new
+binary live under `<state home>/chat-workspaces/…`, which older binaries do
+not discover (see the next section). Rolling back to a pre-2.1.0 binary is
+safe for configuration and sessions, but those new Chats stay invisible to
+the old server — they reappear after upgrading again.
+
+If you also run a web client: match it to the runtime's companion release.
+The octos-web SPA embedded at `/app/` is deprecated; the supported browser
+client is [Octoscode Web](https://github.com/octos-org/octoscode-web), whose
+getting-started guide lists the compatible runtime versions.
+
 ## Server Chat workspaces move out of legacy `chats`
 
 Runtime-created Profiles now keep server Chat workspaces under

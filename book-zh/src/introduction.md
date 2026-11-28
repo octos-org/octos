@@ -24,7 +24,7 @@ Octos 有三种主要运行模式：
 
 `octos serve` 后端使用单一的带版本 **UI Protocol**（基于 WebSocket 或 stdio 的 JSON-RPC），因此多个前端共享同一个服务器：
 
-- **Web**（[octos-web](https://github.com/octos-org/octos-web)）：内嵌在 `/app/` 的 React SPA（聊天、Slides Studio、Sites、语音）。位于 `/admin/` 的运维**管理仪表板**是 octos 仓库中一个独立的内嵌应用（`dashboard/`）。
+- **Web**（[Octoscode Web](https://github.com/octos-org/octoscode-web)）：浏览器客户端（聊天、Slides Studio、Sites、语音），见它的[入门指南](https://github.com/octos-org/octoscode-web/blob/main/docs/getting-started.md)。此前内嵌在 `/app/` 的 octos-web SPA 已弃用。位于 `/admin/` 的运维**管理仪表板**是 octos 仓库中一个独立的内嵌应用（`dashboard/`）。
 - **终端**（[octoscode](https://github.com/octos-org/octoscode)）：通过 UI Protocol 连接的 Rust TUI（WebSocket 连到运行中的 `serve`，或拉起一个 `serve --stdio` 子进程），支持实时流式、审批、diff 与引导。
 
 ## 核心概念

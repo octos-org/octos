@@ -41,6 +41,37 @@ Python 工具。代理在各 profile 中自动发现；首次制作时再准备 
 本仓库面向嵌入、扩展或集成 Harness 内核的开发者。应用安装和日常编码操作，
 请查看上面的客户端仓库。
 
+### 安装 Octos 运行时（预编译）
+
+要托管客户端所连接的运行时（`octos serve`），直接从已发布的发行资产安装——
+无需克隆仓库或 Rust 工具链：
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/install.sh | bash -s -- --version v2.1.0-rc.1
+```
+
+- 脚本下载适用于你平台的 `octos-bundle-<target>` 压缩包，并按随包发布的
+  `.sha256` 校验文件验证，然后安装到 `~/.octos/bin`。平台目标：Linux
+  x86-64/ARM64、macOS ARM64、Windows x86-64。
+- `--version TAG` 固定发行版；默认 latest。`install.sh --help` 查看
+  `--prefix`、`--port`、`--uninstall`、`--doctor`。
+- **sudo 说明：** 注册后台服务（Linux 的 `octos-serve` systemd 单元、macOS 的
+  LaunchDaemon）需要 sudo。没有 sudo 时请解压 bundle 直接运行二进制——
+  无需服务：
+
+  ```bash
+  set -e   # 任一下载或校验失败即停止
+  mkdir -p ~/.octos/bin
+  curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz
+  curl -fSLO https://github.com/octos-org/octos/releases/download/v2.1.0-rc.1/octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
+  sha256sum -c octos-bundle-x86_64-unknown-linux-gnu.tar.gz.sha256
+  tar xzf octos-bundle-x86_64-unknown-linux-gnu.tar.gz -C ~/.octos/bin
+  ~/.octos/bin/octos serve --port 8080   # 管理仪表板 http://127.0.0.1:8080
+  ```
+
+- 升级即用新 bundle 替换二进制；精确的替换/回滚命令和 Chat 工作区布局说明见
+  [docs/UPGRADE-v2.1.0.md](docs/UPGRADE-v2.1.0.md)。
+
 ## 基于 Octos 构建应用
 
 用 Octos 构建编码应用、带 Agent 能力的桌面应用、研究服务、工作流引擎，或一组

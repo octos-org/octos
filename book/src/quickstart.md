@@ -67,4 +67,11 @@ If you built with the `api` feature, start the web dashboard:
 octos serve
 ```
 
-Then open `http://localhost:50080` in your browser — it lands on the octos-web app (`/app/`). The admin dashboard stays available at `/admin/`.
+The built-in operator **admin dashboard** stays available at
+`http://localhost:50080/admin/`. The octos-web SPA previously embedded at
+`/app/` is deprecated and is no longer the recommended entry point — use
+**[Octoscode Web](https://github.com/octos-org/octoscode-web)** as the browser
+client (see its
+[getting-started guide](https://github.com/octos-org/octoscode-web/blob/main/docs/getting-started.md))
+and connect it to this runtime, or the terminal client
+**[Octoscode](https://github.com/octos-org/octoscode)**.
