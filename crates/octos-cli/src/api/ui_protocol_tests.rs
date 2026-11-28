@@ -1171,6 +1171,8 @@ async fn hydrate_tool_rows_carry_the_recorded_outcome_not_a_text_guess() {
             ("call-2", "Error: probe_fail_726"),
             ("call-3", "edited 3 lines"),
             ("call-4", "file body"),
+            ("call-5", "first try failed"),
+            ("call-5", "retry succeeded"),
         ] {
             sessions
                 .add_message(
@@ -1187,6 +1189,9 @@ async fn hydrate_tool_rows_carry_the_recorded_outcome_not_a_text_guess() {
         ("call-2", "exec", Some(true)),
         ("call-3", "edit_file", Some(false)),
         // call-4 (read_file) has no retained completion: outcome unknown.
+        // call-5 is reused across turns with opposite outcomes: ambiguous.
+        ("call-5", "exec", Some(false)),
+        ("call-5", "exec", Some(true)),
     ] {
         ledger.append_notification(UiNotification::ToolCompleted(ToolCompletedEvent {
             session_id: session_id.clone(),
@@ -1238,6 +1243,16 @@ async fn hydrate_tool_rows_carry_the_recorded_outcome_not_a_text_guess() {
     // No retained completion: the field is absent ("unknown"), never guessed.
     assert_eq!(row("call-4")["content"], "file body");
     assert!(row("call-4").get("is_error").is_none());
+    // Reused id with opposite outcomes: both rows omit is_error rather than
+    // showing one occurrence's result for both.
+    let call5: Vec<_> = messages
+        .iter()
+        .filter(|row| row["tool_call_id"] == "call-5")
+        .collect();
+    assert_eq!(call5.len(), 2);
+    for row in call5 {
+        assert!(row.get("is_error").is_none(), "{row}");
+    }
 }
 
 // ---- UPCR-2026-023 pending-question reconnect + capability gating ----

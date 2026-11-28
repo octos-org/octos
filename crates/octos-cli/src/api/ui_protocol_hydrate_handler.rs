@@ -194,14 +194,28 @@ async fn handle_session_hydrate(
     };
     // UPCR-2026-086: tool outcomes come from the same retained scan that
     // feeds the canonical identities — keyed by tool_call_id, never by text.
-    // A later completion for a reused id wins (the provider can reuse ids).
-    let tool_outcomes: std::collections::HashMap<String, bool> = retained
-        .iter()
-        .filter_map(|event| {
-            super::ui_protocol_ledger::tool_completed_outcome(&event.event)
-                .and_then(|(id, success)| success.map(|success| (id, success)))
-        })
-        .collect();
+    // A provider can reuse an id in a later turn; when the retained
+    // completions for one id disagree, the outcome is ambiguous and the row
+    // omits is_error ("unknown") instead of showing one occurrence's result
+    // for both.
+    let tool_outcomes: std::collections::HashMap<String, bool> = {
+        let mut by_id: std::collections::HashMap<String, Vec<bool>> =
+            std::collections::HashMap::new();
+        for event in &retained {
+            if let Some((id, Some(success))) =
+                super::ui_protocol_ledger::tool_completed_outcome(&event.event)
+            {
+                by_id.entry(id).or_default().push(success);
+            }
+        }
+        by_id
+            .into_iter()
+            .filter_map(|(id, outcomes)| {
+                let first = outcomes[0];
+                outcomes.iter().all(|&o| o == first).then_some((id, first))
+            })
+            .collect()
+    };
     let canonical_envelopes = if expose_message_id {
         retained
             .iter()
