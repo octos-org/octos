@@ -9,6 +9,7 @@
 //! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
 //! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
 //! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//!    4b. Keenable (`KEENABLE_API_KEY`) — independent web index
 //! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
 //! 6. DuckDuckGo HTML results page — on unless `OCTOS_ALLOW_SERP_SCRAPE=0`
 //! 7. Headless-Chrome (CDP) Bing — same switch
@@ -566,7 +567,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Free sources first: GDELT and Google News RSS for news (dated, multi-language), a self-hosted SearXNG if configured; then Tavily, Exa, Brave, You.com, Perplexity (auto-detected from keys). Search-results pages are not scraped unless the operator enables it; with nothing configured a general query returns no results plus how to add SearXNG or a key. Optional lang, region, since, category."
+        "Search the web for information. Free sources first: GDELT and Google News RSS for news (dated, multi-language), a self-hosted SearXNG if configured; then Tavily, Exa, Brave, You.com, Keenable, Perplexity (auto-detected from keys). Search-results pages are not scraped unless the operator enables it; with nothing configured a general query returns no results plus how to add SearXNG or a key. Optional lang, region, since, category."
     }
 
     fn tags(&self) -> &[&str] {
@@ -846,6 +847,61 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Keenable
+        // An empty `KEENABLE_API_KEY=` counts as unset. A bare-URL query is skipped: Keenable
+        // would fetch that page instead of searching.
+        if let Some(api_key) = self
+            .provider_key("keenable", "KEENABLE_API_KEY")
+            .filter(|key| !key.trim().is_empty())
+            .filter(|_| !is_bare_url_query(&input.query))
+        {
+            let result = self.keenable_search(&input.query, count, &api_key).await;
+            if let Err(ref err) = result {
+                warn!(
+                    provider = "keenable",
+                    fallback_reason = "error",
+                    error = %err,
+                    "web_search rotation"
+                );
+            }
+            if let Ok(ref r) = result {
+                // Match the "no results" line at the start only: a query or snippet can
+                // contain the same words.
+                if r.success && !r.output.starts_with("No results found for:") {
+                    info!(
+                        provider = "keenable",
+                        used_provider = "keenable",
+                        query = %input.query,
+                        "web_search"
+                    );
+                    return result;
+                }
+                if is_quota_or_rate_limit_error(r) {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "keenable",
+                        fallback_reason = "quota",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else if !r.success {
+                    let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+                    warn!(
+                        provider = "keenable",
+                        fallback_reason = "error",
+                        error = %snippet,
+                        "web_search rotation"
+                    );
+                } else {
+                    info!(
+                        provider = "keenable",
+                        fallback_reason = "empty",
+                        "web_search rotation"
+                    );
+                }
+            }
+        }
+
         // Perplexity Sonar as last resort (AI-synthesized, costs money).
         // M8.10-B: previously this branch returned UNCONDITIONALLY, so a quota
         // error from Perplexity surfaced directly to the LLM (issue #575
@@ -992,6 +1048,7 @@ impl WebSearchTool {
             ("exa", "EXA_API_KEY"),
             ("brave", "BRAVE_API_KEY"),
             ("you", "YDC_API_KEY"),
+            ("keenable", "KEENABLE_API_KEY"),
             ("perplexity", "PERPLEXITY_API_KEY"),
         ] {
             if has(id, env) {
@@ -1459,6 +1516,40 @@ impl WebSearchTool {
             success: true,
             ..Default::default()
         })
+    }
+
+    // --- Keenable ---
+
+    async fn keenable_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
+        let response = self
+            .client
+            .post("https://api.keenable.ai/v1/search")
+            .header("X-API-Key", api_key)
+            .json(&serde_json::json!({
+                "query": query,
+                "max_results": count.min(20),
+                // Keenable snippets default to ~2 KB; the output keeps 300 bytes.
+                "snippet_max_length": 300,
+            }))
+            .send()
+            .await
+            .wrap_err("failed to call Keenable Search API")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                output: keenable_error_output(status, &body),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let keenable: KeenableResponse = response
+            .json()
+            .await
+            .wrap_err("failed to parse Keenable response")?;
+        Ok(format_keenable_results(query, keenable))
     }
 
     // --- Brave Search ---
@@ -2097,4 +2188,201 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KeenableResponse {
+    #[serde(default)]
+    results: Vec<KeenableResult>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KeenableResult {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    snippet: String,
+}
+
+/// Error text for a non-2xx Keenable answer: the status and the error `code` only. The body
+/// text of a 401 mentions per-IP rate limits, which `is_quota_or_rate_limit_error` would read
+/// as quota, so a bad or missing key must not carry it.
+fn keenable_error_output(status: reqwest::StatusCode, body: &str) -> String {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+        .filter(|c| {
+            !c.is_empty()
+                && c.len() <= 64
+                && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        });
+    match code {
+        Some(code) => format!("Keenable API error ({status}, {code})"),
+        None => format!("Keenable API error ({status})"),
+    }
+}
+
+/// True when the whole query is one http(s) URL. Keenable fetches such a page and returns it
+/// with a `warning` instead of searching, so it is not a search.
+fn is_bare_url_query(query: &str) -> bool {
+    let query = query.trim();
+    (query.starts_with("http://") || query.starts_with("https://"))
+        && !query.chars().any(char::is_whitespace)
+}
+
+/// Formats Keenable hits like the other keyed providers. `description` is
+/// often empty, so the `snippet` excerpt is shown, falling back to it.
+fn format_keenable_results(query: &str, response: KeenableResponse) -> ToolResult {
+    let results: Vec<&KeenableResult> = response
+        .results
+        .iter()
+        .filter(|r| r.url.starts_with("http"))
+        .collect();
+    if results.is_empty() {
+        return ToolResult {
+            output: format!("No results found for: {query}"),
+            success: true,
+            ..Default::default()
+        };
+    }
+    let mut output = format!("Results for: {query}\n\n");
+    for (i, r) in results.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n   {}\n", i + 1, r.title.trim(), r.url));
+        let text = if r.snippet.trim().is_empty() {
+            r.description.trim()
+        } else {
+            r.snippet.trim()
+        };
+        if !text.is_empty() {
+            // Snippets are multi-line Markdown. Collapse the whitespace first so a line of
+            // page text that starts with a URL is never read as a result URL (deep-search
+            // takes any line starting with `http` as one), then truncate.
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let truncated = octos_core::truncated_utf8(&flat, 300, "...");
+            output.push_str(&format!("   {truncated}\n"));
+        }
+        output.push('\n');
+    }
+    ToolResult {
+        output,
+        success: true,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod keenable_tests {
+    use super::*;
+
+    fn response(json: &str) -> KeenableResponse {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn should_flatten_multiline_snippets_so_no_line_looks_like_a_result_url() {
+        let out = format_keenable_results(
+            "rust",
+            response(
+                r#"{"results":[{"title":"T","url":"https://a.example/x","description":"",
+                "snippet":"intro line\nhttps://evil.example/inside\n\n  more   text"}]}"#,
+            ),
+        );
+        assert!(
+            out.output
+                .contains("intro line https://evil.example/inside more text")
+        );
+        // Only the result URL itself starts a line, as the other providers print it.
+        let url_lines: Vec<_> = out
+            .output
+            .lines()
+            .filter(|l| {
+                let l = l.trim();
+                l.starts_with("http://") || l.starts_with("https://")
+            })
+            .collect();
+        assert_eq!(url_lines, vec!["   https://a.example/x"]);
+    }
+
+    #[test]
+    fn should_cut_a_long_flattened_snippet_without_splitting_a_character() {
+        let long = "é ".repeat(400);
+        let json = format!(
+            r#"{{"results":[{{"title":"T","url":"https://a.example/x","snippet":"{long}"}}]}}"#
+        );
+        let out = format_keenable_results("q", response(&json));
+        assert!(out.output.contains("..."));
+        assert!(out.output.starts_with("Results for: q"));
+    }
+
+    #[test]
+    fn should_report_no_results_with_the_leading_marker() {
+        let out = format_keenable_results("q", response(r#"{"results":[]}"#));
+        assert!(out.success);
+        assert!(out.output.starts_with("No results found for:"));
+    }
+
+    #[test]
+    fn should_not_classify_a_bad_key_as_quota() {
+        let body = r#"{"error":"Authentication failed","code":"invalid_api_key",
+            "keyless":"/v1/search/public works without a key, rate-limited per IP."}"#;
+        let output = keenable_error_output(reqwest::StatusCode::UNAUTHORIZED, body);
+        assert_eq!(
+            output,
+            "Keenable API error (401 Unauthorized, invalid_api_key)"
+        );
+        let bad_key = ToolResult {
+            output,
+            success: false,
+            ..Default::default()
+        };
+        assert!(!is_quota_or_rate_limit_error(&bad_key));
+    }
+
+    #[test]
+    fn should_still_rotate_on_a_real_rate_limit() {
+        let output = keenable_error_output(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"code":"rate_limit_exceeded"}"#,
+        );
+        let limited = ToolResult {
+            output,
+            success: false,
+            ..Default::default()
+        };
+        assert!(is_quota_or_rate_limit_error(&limited));
+        let credits = keenable_error_output(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            r#"{"code":"insufficient_credits"}"#,
+        );
+        assert!(is_quota_or_rate_limit_error(&ToolResult {
+            output: credits,
+            success: false,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn should_ignore_an_unsafe_error_code_and_a_non_json_body() {
+        let status = reqwest::StatusCode::BAD_GATEWAY;
+        assert_eq!(
+            keenable_error_output(status, "<html>rate limit</html>"),
+            "Keenable API error (502 Bad Gateway)"
+        );
+        assert_eq!(
+            keenable_error_output(status, r#"{"code":"a b: quota"}"#),
+            "Keenable API error (502 Bad Gateway)"
+        );
+    }
+
+    #[test]
+    fn should_treat_only_a_single_url_as_a_bare_url_query() {
+        assert!(is_bare_url_query("https://example.com/a"));
+        assert!(is_bare_url_query("  http://example.com  "));
+        assert!(!is_bare_url_query("https://example.com what is this"));
+        assert!(!is_bare_url_query("example.com"));
+    }
 }

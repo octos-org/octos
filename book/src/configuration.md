@@ -343,6 +343,7 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 | `BRAVE_API_KEY` | Brave Search API key |
 | `PERPLEXITY_API_KEY` | Perplexity Sonar API key |
 | `YDC_API_KEY` | You.com API key |
+| `KEENABLE_API_KEY` | Keenable Search API key |
 
 ### Channels
 

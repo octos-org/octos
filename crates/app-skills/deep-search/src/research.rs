@@ -205,6 +205,7 @@ fn keyed_available() -> Vec<Provider> {
         (Provider::Perplexity, "PERPLEXITY_API_KEY"),
         (Provider::Brave, "BRAVE_API_KEY"),
         (Provider::You, "YDC_API_KEY"),
+        (Provider::Keenable, "KEENABLE_API_KEY"),
     ]
     .into_iter()
     .filter(|(_, k)| env_nonempty(k).is_some())
@@ -526,6 +527,22 @@ async fn run_provider(
             .await?;
             parse_you(&text)?
         }
+        Provider::Keenable => {
+            // Keenable fetches a query that is a bare URL instead of searching it, and
+            // returns that page with a `warning`. That is not a search, so skip it.
+            if is_bare_url_query(query) {
+                return Err("Keenable skipped: the query is a URL, not search terms".to_string());
+            }
+            let text = get_text(
+                client
+                    .post("https://api.keenable.ai/v1/search")
+                    .header("X-API-Key", key("KEENABLE_API_KEY")?)
+                    .json(&keenable_body(query, count, since)),
+                "Keenable",
+            )
+            .await?;
+            parse_keenable(&text)?
+        }
         Provider::DuckDuckGo => {
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
@@ -681,6 +698,58 @@ pub(crate) fn parse_tavily(text: &str) -> Result<ProviderOut, String> {
     Ok(ProviderOut {
         hits,
         answer,
+        ..Default::default()
+    })
+}
+
+/// True when the whole query is one http(s) URL.
+fn is_bare_url_query(query: &str) -> bool {
+    let query = query.trim();
+    (query.starts_with("http://") || query.starts_with("https://"))
+        && !query.chars().any(char::is_whitespace)
+}
+
+/// Keenable request body. Default snippets run to several KB, so `snippet_max_length` bounds
+/// them server-side. `since` becomes `published_after`; the API leaves out undated pages, so
+/// stale ones cannot slip into a "last 7 days" report.
+fn keenable_body(
+    query: &str,
+    count: u8,
+    since: Option<&octos_research::date::Since>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "query": query,
+        "max_results": count.min(20),
+        "snippet_max_length": 500,
+    });
+    if let Some(since) = since {
+        body["published_after"] = serde_json::json!(since
+            .cutoff
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    body
+}
+
+pub(crate) fn parse_keenable(text: &str) -> Result<ProviderOut, String> {
+    let data = json(text, "Keenable")?;
+    let hits = data["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            // `description` is often empty; `snippet` carries the page excerpt.
+            let snippet = match s(r, "snippet") {
+                "" => s(r, "description"),
+                text => text,
+            };
+            let mut h = hit(s(r, "url"), s(r, "title"), snippet, "keenable")?;
+            h.published = octos_research::date::to_iso(s(r, "published_at"));
+            Some(h)
+        })
+        .collect();
+    Ok(ProviderOut {
+        hits,
+        answer: String::new(),
         ..Default::default()
     })
 }
@@ -936,6 +1005,43 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 27, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn should_parse_keenable_hits_from_snippet_and_published_at() {
+        let out = parse_keenable(
+            r#"{"query":"q","mode":"pro","results":[
+                {"title":"A","url":"https://a.example/x","description":"","snippet":"page text","published_at":"2026-09-26T08:00:00Z"},
+                {"title":"B","url":"https://b.example/y","description":"fallback","snippet":""},
+                {"title":"no url","url":"","snippet":"dropped"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(out.hits.len(), 2);
+        assert_eq!(out.hits[0].snippet, "page text");
+        assert_eq!(out.hits[0].provider, "keenable");
+        assert!(out.hits[0].published.is_some());
+        assert_eq!(out.hits[1].snippet, "fallback");
+        assert!(parse_keenable("not json").is_err());
+    }
+
+    #[test]
+    fn should_bound_keenable_snippets_and_forward_since() {
+        let plain = keenable_body("rust async", 50, None);
+        assert_eq!(plain["max_results"], 20);
+        assert_eq!(plain["snippet_max_length"], 500);
+        assert!(plain.get("published_after").is_none());
+
+        let since = octos_research::date::Since::parse("7d", now()).unwrap();
+        let body = keenable_body("rust async", 5, Some(&since));
+        assert_eq!(body["published_after"], "2026-09-20T12:00:00Z");
+    }
+
+    #[test]
+    fn should_not_send_a_bare_url_to_keenable_as_a_search() {
+        assert!(is_bare_url_query(" https://example.com/page?a=1 "));
+        assert!(!is_bare_url_query("https://example.com is it down"));
+        assert!(!is_bare_url_query("rust async"));
     }
 
     #[test]

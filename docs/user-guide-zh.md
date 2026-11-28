@@ -508,11 +508,12 @@ octos auth logout --provider openai
 | DuckDuckGo | *（无需）* | 免费 | 始终可用，HTML 抓取作为兜底 |
 | Brave Search | `BRAVE_API_KEY` | 免费额度：每月 2K 次 | REST API |
 | You.com | `YDC_API_KEY` | 付费 | 丰富的 JSON 结果和摘要 |
+| Keenable | `KEENABLE_API_KEY` | 每月 100,000 次免费，之后每 1,000 次 $4（[定价](https://docs.keenable.ai/pricing)） | 独立网页索引，结果带页面摘录；未设置或为空时不启用 |
 | Perplexity Sonar | `PERPLEXITY_API_KEY` | 付费 | AI 合成答案并附带引用 |
 
 ### 5.2 提供商选择
 
-提供商按顺序尝试：**DuckDuckGo → Brave → You.com → Perplexity**。第一个返回非空结果的提供商获胜。如果全部失败，返回 DuckDuckGo 结果作为兜底。
+提供商按顺序尝试：**DuckDuckGo → Brave → You.com → Keenable → Perplexity**。第一个返回非空结果的提供商获胜。如果全部失败，返回 DuckDuckGo 结果作为兜底。
 
 **配额/限流时自动轮换（M8.10b，#578）**：当前提供商若返回配额耗尽或限流错误（HTTP 402、429 或服务自定义错误串），`web_search` 在调用过程中即切换到下一个已配置的提供商，而不是把错误抛给 Agent。这让该工具在配额波动下仍然稳定，无需 Agent 端重试逻辑。
 
@@ -2185,6 +2186,7 @@ chmod +x .octos/skills/translator/main
 | `BRAVE_API_KEY` | Brave 搜索 API 密钥 |
 | `PERPLEXITY_API_KEY` | Perplexity Sonar API 密钥 |
 | `YDC_API_KEY` | You.com API 密钥 |
+| `KEENABLE_API_KEY` | Keenable Search API 密钥 |
 | **通道** | |
 | `TELEGRAM_BOT_TOKEN` | Telegram 机器人令牌 |
 | `DISCORD_BOT_TOKEN` | Discord 机器人令牌 |
