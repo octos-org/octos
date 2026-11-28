@@ -6,6 +6,12 @@ Categories: **1** cross-system user-visible chain; **2** cross-feature interacti
 
 Concrete `EmbedQueueFull` shedding/backfill tests live in `octos-embed-llama` and `octos-agent` (T-0317), not in this crate; the llm-side bounded scheduling/queue interactions that do exist are listed below.
 
+## Agent progress and media boundaries
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| User input and a completed assistant turn close the previous tool-image batch. `src/tool_media.rs` | `current_batch_only_does_not_resend_images_after_a_user_resume`<br>`completed_assistant_closes_current_batch_but_system_note_does_not` |
+
 ## Provider request/response and streaming protocols
 
 | Test (exact `cargo test --list` name) | Category | Property guarded |

@@ -4,6 +4,14 @@
 
 实测基线：T-0551 后静态清单 **117 = 94 lib + 23 integration**（含 main 后续新增的 13 个 lib 与 `read_image_wire` 1 个 integration 覆盖补录；本 PR 自身只新增 1 个 lib 与 6 个 integration）。Linux 实际列出 116，因为 `tests/validator_runner.rs` 的唯一测试为 `#[cfg(windows)]`。其余 354 项的逐 target 删除证据见 [TESTS-INTEGRATION-AUDIT.md](TESTS-INTEGRATION-AUDIT.md)；不得以 lib 集合代替 integration 审计。固定类别3五行核问直接列出唯一测试名，integration 表不再重复这些行。
 
+## Agent progress and media boundaries
+
+| Scenario group | Retained Rust tests |
+|---|---|
+| Empty streaming chunks do not count as model progress. `src/agent/activity.rs` | `should_ignore_empty_chunks_for_stream_activity` |
+| Durable evidence distinguishes terminal handoff, stalled work and a genuine resumed repair. `src/agent/iteration_evidence_tests.rs` | `verified_blocker_ends_the_attempt_with_undelivered_outputs`<br>`a_blocked_attempt_cannot_replace_the_final_pass_or_omit_a_required_check`<br>`unchanged_completion_claims_reach_a_durable_handoff_without_counting_polls`<br>`durable_handoff_still_allows_deliberately_resumed_repair_tools`<br>`large_dependency_inventories_are_checked_on_restart_without_satisfying_delivery_paths` |
+| Timeout and budget exits retain real progress and distinguish empty heartbeats from tool output. `src/agent/loop_runner_tests.rs` | `should_preserve_failed_progress_when_conversation_activity_times_out`<br>`should_not_classify_model_text_as_a_runtime_timeout`<br>`should_keep_artifacts_usage_and_tool_rows_when_idle_budget_stops`<br>`should_record_only_nonempty_tool_bytes_as_stream_activity`<br>`should_timeout_empty_stream_heartbeats_without_losing_a_real_stall_guard`<br>`should_keep_a_slow_stream_of_real_tool_arguments_alive` |
+
 ## T-0581 第二轮：同链路合并与共享 setup
 
 当前静态清单 **122 = 100 lib + 22 integration**（含 #1796 新增的 5 个 lib 与 #3326 新增的 3 个隐藏目录 fail-closed 回归）；Linux 实际 121（唯一缺席为 Windows validator），macOS 实际 121（缺席 Linux real-bwrap），Windows 实际 117（另缺席 real-bwrap、两个 Unix spawn 及 Unix backend 构造）。只处理上述第一轮保留项，不恢复已删测试。三项同链路合并均先迁入全部探针和断言，再删除重复测试名：
