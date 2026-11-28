@@ -2366,6 +2366,7 @@ pub(crate) fn charge_peer_token_budget(
 
 /// Stage a peer with an optional cumulative token budget. The budget is
 /// durable before `brief.md` makes the peer visible to OUP clients.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_peer_with_budget(
     peers_root: &Path,
@@ -2400,8 +2401,8 @@ pub(crate) fn stage_peer_with_budget(
     )
 }
 
-/// [`stage_peer_with_budget`], for a peer whose handoff declares the files its
-/// first model request must bring ([`first_inputs`]). They are checked against
+/// Stage a peer with a budget and any declared files its first model request
+/// must bring ([`first_inputs`]). The files are checked against
 /// the peer's working directory and recorded before `brief.md`, so a peer that
 /// becomes visible already carries them; a required one that is not there
 /// refuses the staging.
