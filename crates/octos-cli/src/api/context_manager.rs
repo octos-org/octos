@@ -4543,14 +4543,13 @@ fn relieve_pinned_tail_context_pressure(
                         None => false,
                     }
                 }
-                2 => entry
-                    .message
-                    .tool_calls
-                    .iter_mut()
-                    .flatten()
-                    .fold(false, |changed, call| {
-                        shorten_long_argument_strings(&mut call.arguments) || changed
-                    }),
+                2 => {
+                    let mut changed = false;
+                    for call in entry.message.tool_calls.iter_mut().flatten() {
+                        changed |= shorten_long_argument_strings(&mut call.arguments);
+                    }
+                    changed
+                }
                 _ => false,
             };
             if changed {
@@ -4600,12 +4599,20 @@ fn shorten_long_argument_strings(value: &mut serde_json::Value) -> bool {
                 None => false,
             }
         }
-        serde_json::Value::Array(values) => values.iter_mut().fold(false, |changed, v| {
-            shorten_long_argument_strings(v) || changed
-        }),
-        serde_json::Value::Object(map) => map.values_mut().fold(false, |changed, v| {
-            shorten_long_argument_strings(v) || changed
-        }),
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for v in values.iter_mut() {
+                changed |= shorten_long_argument_strings(v);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for v in map.values_mut() {
+                changed |= shorten_long_argument_strings(v);
+            }
+            changed
+        }
         _ => false,
     }
 }
