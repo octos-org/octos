@@ -2181,7 +2181,6 @@ pub(crate) struct ConnectionUiFeatures {
     /// capabilities and rejected with typed transport reasons if called.
     stdio_transport: bool,
 }
-
 impl ConnectionUiFeatures {
     fn from_headers_and_query(headers: &HeaderMap, query: Option<&str>) -> Self {
         Self {

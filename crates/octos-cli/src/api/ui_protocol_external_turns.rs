@@ -302,40 +302,11 @@ impl ExternalTurns {
         self.ledger.subscribe(&chat.session_id)
     }
 
-    /// Wait on `events`, subscribed before `turn_id` started, until it ends;
-    /// then what became of it and the last reply it persisted.
-    pub(crate) async fn ended(
+    pub(crate) fn reply(
         &self,
         chat: &BoundChat,
         turn_id: &TurnId,
-        mut events: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
-    ) -> Result<(TurnRecord, Option<String>), RpcError> {
-        use tokio::sync::broadcast::error::RecvError;
-        loop {
-            match events.recv().await {
-                Ok(event) => match event.event {
-                    UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(ended))
-                        if ended.turn_id == *turn_id => {}
-                    UiProtocolLedgerEvent::Notification(UiNotification::TurnError(ended))
-                        if ended.turn_id == *turn_id => {}
-                    _ => continue,
-                },
-                // Its end may be among the events missed.
-                Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => {
-                    return Err(RpcError::internal_error(
-                        "the session's ledger closed before the turn ended",
-                    ));
-                }
-            }
-            match self.record(chat, turn_id).await? {
-                TurnRecord::NotStarted | TurnRecord::Running => continue,
-                ended => break Ok((ended, self.reply(chat, turn_id)?)),
-            }
-        }
-    }
-
-    fn reply(&self, chat: &BoundChat, turn_id: &TurnId) -> Result<Option<String>, RpcError> {
+    ) -> Result<Option<String>, RpcError> {
         let thread = turn_id.0.to_string();
         let mut reply = None;
         for event in self
@@ -446,6 +417,11 @@ impl ExternalTurns {
             .map_err(|(Refused::Scope(error) | Refused::Error(error))| error)?;
         responded.audit(&self.state, &self.contracts).await;
         Ok(responded.result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_connection(&self) -> Arc<dyn TurnConnection> {
+        self.connection.clone()
     }
 
     fn caller(&self) -> ExternalCaller {

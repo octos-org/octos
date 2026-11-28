@@ -60,6 +60,36 @@ pub(crate) struct ImChannelId {
 #[async_trait::async_trait]
 pub(crate) trait ImChannel: Send + Sync {
     fn id(&self) -> ImChannelId;
+    /// Whether approvals may be shown as buttons. Channels without buttons
+    /// never get an approval projected: their users answer in the PWA.
+    fn buttons(&self) -> bool {
+        false
+    }
+    /// Send `text` with one row of `(label, callback data)` buttons,
+    /// returning the platform's id of the sent message for later edits.
+    async fn send_buttons(
+        &self,
+        _chat: i64,
+        _text: &str,
+        _reply_to: Option<i64>,
+        _buttons: &[(String, String)],
+    ) -> eyre::Result<Option<i64>> {
+        eyre::bail!("this channel has no buttons")
+    }
+    /// Replace a message this channel sent (invalidate its buttons).
+    async fn edit(&self, _chat: i64, _message_id: i64, _text: &str) -> eyre::Result<()> {
+        eyre::bail!("this channel cannot edit")
+    }
+    /// ACK a button press. A failure is the caller's to surface truthfully;
+    /// the ACK is never retried blind.
+    async fn answer_callback(
+        &self,
+        _callback_id: &str,
+        _text: &str,
+        _alert: bool,
+    ) -> eyre::Result<()> {
+        eyre::bail!("this channel has no callbacks")
+    }
     /// Send a turn's result.
     async fn send(&self, chat: i64, text: &str, reply_to: Option<i64>) -> eyre::Result<()>;
     /// Answer a message while it is handled: a refusal or a command's reply.
@@ -98,6 +128,41 @@ pub(crate) struct ImMessage {
     pub(crate) sent_at: Option<DateTime<Utc>>,
     pub(crate) text: String,
     pub(crate) attachments: usize,
+}
+
+/// A button press on a bridge message. The platform gives no message id
+/// the press could be confused with; the callback data's nonce, not any
+/// id, names the approval.
+#[derive(Debug, Clone)]
+pub(crate) struct ImCallback {
+    pub(crate) chat: i64,
+    pub(crate) sender: ImSender,
+    /// The platform's id of the press, for the ACK.
+    pub(crate) callback_id: String,
+    /// The button message's platform id, used only to edit that message.
+    pub(crate) message_id: Option<i64>,
+    pub(crate) data: String,
+}
+
+/// How long a projected approval answers button presses (T-0690).
+pub(crate) const APPROVAL_TTL: Duration = Duration::from_secs(600);
+
+/// The callback data of an approval button: `imp:<nonce>:a` (approve) or
+/// `imp:<nonce>:d` (deny). The nonce is random, one-time and bound to the
+/// approval id in the bridge's table; nothing in it is trusted alone.
+pub(crate) const CALLBACK_PREFIX: &str = "imp:";
+
+/// One approval the bridge offered as buttons, by its one-time nonce.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingButton {
+    pub(crate) approval_id: ApprovalId,
+    pub(crate) chat: i64,
+    pub(crate) session_id: SessionKey,
+    pub(crate) turn_id: TurnId,
+    /// The button message's platform id, once the channel told it.
+    pub(crate) message_id: Option<i64>,
+    /// When the bridge saw the approval; TTL counts from the server's event.
+    pub(crate) observed_at: DateTime<Utc>,
 }
 
 /// A chat on the bridge's channel, its one sender, and the octos chat they
@@ -178,6 +243,10 @@ pub(crate) struct ServeImBridge {
     /// The chats, neither bound nor direct, already told they are not
     /// linked: each is told once while the bridge runs (T-0665).
     told_unlinked: StdMutex<HashSet<i64>>,
+    /// Projected approvals by their one-time callback nonce (T-0690).
+    buttons: StdMutex<HashMap<String, PendingButton>>,
+    /// How long a projected approval answers a button press.
+    approval_ttl: Duration,
 }
 
 impl ServeImBridge {
@@ -189,6 +258,7 @@ impl ServeImBridge {
         allowed: Vec<i64>,
         bindings: Vec<ImBinding>,
         ttl: Duration,
+        approval_ttl: Duration,
     ) -> Result<Arc<Self>, String> {
         if allowed.is_empty() {
             return Err("no allowed senders; list who may use the bridge".into());
@@ -233,6 +303,8 @@ impl ServeImBridge {
             ttl,
             running: StdMutex::default(),
             told_unlinked: StdMutex::default(),
+            buttons: StdMutex::default(),
+            approval_ttl,
         }))
     }
 
@@ -394,9 +466,289 @@ impl ServeImBridge {
             .insert(session, (turn_id.clone(), message_id));
         let bridge = self.clone();
         Handled::Started(tokio::spawn(async move {
-            let outcome = bridge.turns.ended(&binding.target, &turn_id, events).await;
+            let outcome = bridge.watch_turn(&binding, &turn_id, events).await;
+            // The turn is over: its unanswered approvals are moot (the store
+            // cancels them); their buttons must not stay tappable.
+            bridge
+                .invalidate_turn_buttons(&turn_id, "This approval is no longer open.")
+                .await;
             bridge.deliver(binding, message_id, turn_id, outcome).await
         }))
+    }
+
+    /// Follow the turn's ledger events, projecting its approval requests as
+    /// buttons and invalidating them as they resolve, until the turn ends.
+    /// Same end semantics as `ExternalTurns::ended`, plus the approval watch.
+    async fn watch_turn(
+        &self,
+        binding: &ImBinding,
+        turn_id: &TurnId,
+        mut events: tokio::sync::broadcast::Receiver<LedgeredUiProtocolEvent>,
+    ) -> Result<(TurnRecord, Option<String>), RpcError> {
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            match events.recv().await {
+                Ok(event) => match event.event {
+                    UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(e))
+                        if e.turn_id == *turn_id =>
+                    {
+                        self.project_approval(binding, e).await
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e)) => {
+                        let text = match e.decision {
+                            ApprovalDecision::Approve => "Approved.",
+                            _ => "Denied.",
+                        };
+                        self.invalidate_button(&e.approval_id, text).await;
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(e)) => {
+                        self.invalidate_button(&e.approval_id, "This approval was cancelled.")
+                            .await;
+                    }
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(e))
+                        if e.turn_id == *turn_id => {}
+                    UiProtocolLedgerEvent::Notification(UiNotification::TurnError(e))
+                        if e.turn_id == *turn_id => {}
+                    _ => continue,
+                },
+                // Its end may be among the events missed.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {
+                    return Err(RpcError::internal_error(
+                        "the session's ledger closed before the turn ended",
+                    ));
+                }
+            }
+            let chat = &binding.target;
+            match self.turns.record(chat, turn_id).await? {
+                TurnRecord::NotStarted | TurnRecord::Running => continue,
+                ended => break Ok((ended, self.turns.reply(chat, turn_id)?)),
+            }
+        }
+    }
+
+    /// Offer a pending approval of the running turn as buttons, or, for a
+    /// high-risk one (permission tiers, network, writes outside the
+    /// workspace, credentials/connectors), only a pointer to the PWA. A send
+    /// failure drops the projection; the approval stays pending in the PWA.
+    async fn project_approval(&self, binding: &ImBinding, event: ApprovalRequestedEvent) {
+        let text = format!("Approval requested: {}\n{}", event.title, event.body);
+        // Buttons only for a manifest-attested low/medium risk. "unspecified"
+        // (the manifest said nothing), "high" and "max" — permission tiers,
+        // network, writes outside the workspace, credentials/connectors —
+        // never get an IM answer path: the PWA only.
+        if !matches!(event.risk.as_deref(), Some("low" | "medium")) {
+            let guidance = format!("{text}\nThis is a high-risk approval; answer it in octos.");
+            self.answer_or_send(binding.chat, &guidance, None).await;
+            return;
+        }
+        if !self.channel.buttons() {
+            let guidance = format!("{text}\nAnswer this approval in octos.");
+            self.answer_or_send(binding.chat, &guidance, None).await;
+            return;
+        }
+        let nonce = format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                format!("{}:{}", event.approval_id.0, uuid::Uuid::new_v4()).as_bytes()
+            )
+        );
+        let nonce = nonce[..16].to_owned();
+        let entry = PendingButton {
+            approval_id: event.approval_id.clone(),
+            chat: binding.chat,
+            session_id: binding.target.session_id().clone(),
+            turn_id: event.turn_id.clone(),
+            message_id: None,
+            observed_at: Utc::now(),
+        };
+        self.lock_buttons().insert(nonce.clone(), entry);
+        let buttons = [
+            ("Approve".to_owned(), format!("{CALLBACK_PREFIX}{nonce}:a")),
+            ("Deny".to_owned(), format!("{CALLBACK_PREFIX}{nonce}:d")),
+        ];
+        match self
+            .channel
+            .send_buttons(binding.chat, &text, None, &buttons)
+            .await
+        {
+            Ok(message_id) => {
+                let mut buttons = self.lock_buttons();
+                if let Some(entry) = buttons.get_mut(&nonce) {
+                    entry.message_id = message_id;
+                }
+            }
+            Err(error) => {
+                self.lock_buttons().remove(&nonce);
+                tracing::warn!(chat = binding.chat, %error, "IM approval projection not sent");
+            }
+        }
+    }
+
+    /// Replace a projected approval's message with `text` and forget it:
+    /// answered elsewhere, cancelled with its turn, or expired.
+    fn take_button(&self, approval_id: &ApprovalId) -> Option<PendingButton> {
+        let mut buttons = self.lock_buttons();
+        let nonce = buttons
+            .iter()
+            .find(|(_, e)| e.approval_id == *approval_id)
+            .map(|(nonce, _)| nonce.clone())?;
+        buttons.remove(&nonce)
+    }
+
+    async fn invalidate_button(&self, approval_id: &ApprovalId, text: &str) {
+        let Some(entry) = self.take_button(approval_id) else {
+            return;
+        };
+        if let Some(message_id) = entry.message_id {
+            if let Err(error) = self.channel.edit(entry.chat, message_id, text).await {
+                tracing::warn!(chat = entry.chat, %error, "IM approval message not invalidated");
+            }
+        }
+    }
+
+    async fn invalidate_turn_buttons(&self, turn_id: &TurnId, text: &str) {
+        let stale: Vec<PendingButton> = self
+            .lock_buttons()
+            .values()
+            .filter(|entry| entry.turn_id == *turn_id)
+            .cloned()
+            .collect();
+        for entry in stale {
+            self.invalidate_button(&entry.approval_id, text).await;
+        }
+    }
+
+    /// Expire projected approvals past their TTL, editing their messages.
+    /// The sweeper calls this; tests call it directly.
+    pub(crate) async fn expire_stale_buttons(&self) {
+        let now = Utc::now();
+        let stale: Vec<PendingButton> = self
+            .lock_buttons()
+            .values()
+            .filter(|entry| {
+                now.signed_duration_since(entry.observed_at)
+                    .to_std()
+                    .is_ok_and(|age| age > self.approval_ttl)
+            })
+            .cloned()
+            .collect();
+        for entry in stale {
+            self.invalidate_button(&entry.approval_id, "This approval expired.")
+                .await;
+        }
+    }
+
+    /// Answer a button press (T-0690). Every check is re-read: the binding,
+    /// the sender, the nonce's entry, the running turn, the TTL, and the
+    /// server's own approval state through `respond_approval`'s typed errors.
+    /// Anything off is answered loudly and changes nothing.
+    pub(crate) async fn handle_callback(&self, callback: ImCallback) {
+        let refused = 'checks: {
+            let Some(binding) = self.binding(callback.chat) else {
+                break 'checks "This chat is not linked to octos.";
+            };
+            match callback.sender {
+                ImSender::Person(id) if id == binding.sender && self.allowed.contains(&id) => {}
+                _ => break 'checks "You are not allowed to answer this approval.",
+            }
+            let Some(rest) = callback.data.strip_prefix(CALLBACK_PREFIX) else {
+                break 'checks "This approval is no longer valid.";
+            };
+            let Some((nonce, decision)) = rest.rsplit_once(':') else {
+                break 'checks "This approval is no longer valid.";
+            };
+            let Some(entry) = self.lock_buttons().get(nonce).cloned() else {
+                break 'checks "This approval is no longer valid.";
+            };
+            if entry.chat != callback.chat
+                || entry.session_id != *binding.target.session_id()
+                || self
+                    .running_turn(&entry.session_id)
+                    .is_none_or(|(running, _)| running != entry.turn_id)
+            {
+                self.invalidate_button(&entry.approval_id, "This approval is no longer open.")
+                    .await;
+                break 'checks "This approval is no longer open.";
+            }
+            if Utc::now()
+                .signed_duration_since(entry.observed_at)
+                .to_std()
+                .is_ok_and(|age| age > self.approval_ttl)
+            {
+                self.invalidate_button(&entry.approval_id, "This approval expired.")
+                    .await;
+                break 'checks "This approval expired; answer it in octos if it is still open.";
+            }
+            let decision = match decision {
+                "a" => ApprovalDecision::Approve,
+                "d" => ApprovalDecision::Deny,
+                _ => break 'checks "This approval is no longer valid.",
+            };
+            let params = octos_core::ui_protocol::ApprovalRespondParams {
+                session_id: entry.session_id.clone(),
+                approval_id: entry.approval_id.clone(),
+                decision: decision.clone(),
+                approval_scope: None,
+                client_note: None,
+            };
+            match self.turns.respond_approval(&binding.target, params).await {
+                Ok(_) => {
+                    let text = if decision == ApprovalDecision::Approve {
+                        "Approved."
+                    } else {
+                        "Denied."
+                    };
+                    // The server decided it: the button message shows the
+                    // truth immediately, then the press is ACKed. An ACK the
+                    // channel never answered leaves the spinner — say so;
+                    // the message already shows the final state.
+                    self.invalidate_button(&entry.approval_id, text).await;
+                    if let Err(error) = self
+                        .channel
+                        .answer_callback(&callback.callback_id, text, false)
+                        .await
+                    {
+                        tracing::warn!(chat = callback.chat, %error, "IM approval ACK failed");
+                        self.answer_or_send(
+                            callback.chat,
+                            "The answer was recorded; this notice may not have gone through — the approval message shows the final state.",
+                            None,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chat = callback.chat,
+                        error = %error.message,
+                        "IM approval answer refused by the server"
+                    );
+                    self.invalidate_button(&entry.approval_id, "This approval is no longer open.")
+                        .await;
+                    break 'checks "This approval is no longer open.";
+                }
+            }
+        };
+        // Loud, and nothing was decided.
+        if let Err(error) = self
+            .channel
+            .answer_callback(&callback.callback_id, refused, true)
+            .await
+        {
+            tracing::warn!(chat = callback.chat, %error, "IM refusal callback ACK failed");
+        }
+    }
+
+    async fn answer_or_send(&self, chat: i64, text: &str, reply_to: Option<i64>) {
+        if let Err(error) = self.channel.send(chat, text, reply_to).await {
+            tracing::warn!(chat, %error, "IM message not sent");
+        }
+    }
+
+    fn lock_buttons(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingButton>> {
+        self.buttons.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     async fn deliver(

@@ -17,6 +17,11 @@ const STOP_TOO_LATE: &str = "Nothing sent before this /stop is running.";
 pub(crate) struct FakeChannel {
     sent: StdMutex<Vec<(i64, String, Option<i64>)>>,
     fail: std::sync::atomic::AtomicBool,
+    /// Each `send_buttons`: the chat and its buttons' callback data.
+    pub(crate) buttoned: StdMutex<Vec<(i64, Vec<String>)>>,
+    /// Each callback ACK: whether it was an alert.
+    pub(crate) acked: StdMutex<Vec<bool>>,
+    pub(crate) fail_ack: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -35,6 +40,35 @@ impl ImChannel for FakeChannel {
             .lock()
             .unwrap()
             .push((chat, text.into(), reply_to));
+        Ok(())
+    }
+
+    fn buttons(&self) -> bool {
+        true
+    }
+
+    async fn send_buttons(
+        &self,
+        chat: i64,
+        _text: &str,
+        _reply_to: Option<i64>,
+        buttons: &[(String, String)],
+    ) -> eyre::Result<Option<i64>> {
+        let data = buttons.iter().map(|(_, data)| data.clone()).collect();
+        self.buttoned.lock().unwrap().push((chat, data));
+        Ok(Some(1000 + self.buttoned.lock().unwrap().len() as i64))
+    }
+
+    async fn edit(&self, chat: i64, _message_id: i64, text: &str) -> eyre::Result<()> {
+        self.sent.lock().unwrap().push((chat, text.into(), None));
+        Ok(())
+    }
+
+    async fn answer_callback(&self, _id: &str, _text: &str, alert: bool) -> eyre::Result<()> {
+        if self.fail_ack.load(std::sync::atomic::Ordering::SeqCst) {
+            eyre::bail!("the platform did not answer the callback");
+        }
+        self.acked.lock().unwrap().push(alert);
         Ok(())
     }
 }
@@ -58,6 +92,15 @@ pub(crate) fn message(id: i64, text: &str) -> ImMessage {
     }
 }
 
+/// A served chat and its scripted model, on a temp profile.
+async fn setup(key: &str) -> (tempfile::TempDir, Arc<ScriptedLlm>, Fixture, BoundChat) {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = scripted();
+    let fx = serve(dir.path(), llm.clone()).await;
+    let chat = fx.chat(&unique(key)).await;
+    (dir, llm, fx, chat)
+}
+
 fn binding(chat: i64, sender: i64, target: &BoundChat) -> ImBinding {
     ImBinding {
         channel: FakeChannel::default().id(),
@@ -68,7 +111,11 @@ fn binding(chat: i64, sender: i64, target: &BoundChat) -> ImBinding {
 }
 
 /// A bridge on `fx` with my chat bound to `target`.
-fn bridge(fx: &Fixture, target: &BoundChat) -> (Arc<ServeImBridge>, Arc<FakeChannel>) {
+fn bridge(
+    fx: &Fixture,
+    target: &BoundChat,
+    approval_ttl: Duration,
+) -> (Arc<ServeImBridge>, Arc<FakeChannel>) {
     let channel = Arc::new(FakeChannel::default());
     let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
     let bridge = ServeImBridge::new(
@@ -77,6 +124,7 @@ fn bridge(fx: &Fixture, target: &BoundChat) -> (Arc<ServeImBridge>, Arc<FakeChan
         vec![ME],
         vec![binding(ME, ME, target)],
         TTL,
+        approval_ttl,
     );
     (bridge.unwrap(), channel)
 }
@@ -98,7 +146,7 @@ async fn a_bound_message_runs_once_and_its_result_goes_back_to_its_chat() {
     let llm = scripted();
     let fx = serve(dir.path(), llm.clone()).await;
     let chat = fx.chat(&unique("im")).await;
-    let (bridge, channel) = bridge(&fx, &chat);
+    let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
 
     assert_eq!(
         delivered(bridge.handle(message(1, "hello")).await).await,
@@ -169,38 +217,23 @@ async fn the_bridge_refuses_in_the_chat_what_it_cannot_tie_to_its_one_person() {
     };
     let refused = [
         (vec![], vec![binding(ME, ME, &chat)], "no allowed senders"),
-        (
-            vec![ME],
-            vec![binding(ME, SOMEONE, &chat)],
-            "is not allowed",
-        ),
-        (
-            vec![777_000],
-            vec![binding(ME, 777_000, &chat)],
-            "speaks for many",
-        ),
+        (vec![ME], vec![binding(ME, SOMEONE, &chat)], "is not allowed"),
+        (vec![777_000], vec![binding(ME, 777_000, &chat)], "speaks for many"),
         (vec![ME], vec![elsewhere], "another channel"),
-        (
-            vec![ME],
-            vec![binding(ME, ME, &chat), binding(ME, ME, &second)],
-            "bound twice",
-        ),
-        (
-            vec![ME, SOMEONE],
-            vec![binding(ME, ME, &chat), binding(SOMEONE, SOMEONE, &chat)],
-            "bound to two chats",
-        ),
+        (vec![ME], vec![binding(ME, ME, &chat), binding(ME, ME, &second)], "bound twice"),
+        (vec![ME, SOMEONE], vec![binding(ME, ME, &chat), binding(SOMEONE, SOMEONE, &chat)], "bound to two chats"),
     ];
     for (allowed, bindings, why) in refused {
         let channel = Arc::new(FakeChannel::default());
-        let error = ServeImBridge::new(turns(), channel, allowed, bindings, TTL).err();
+        let error =
+            ServeImBridge::new(turns(), channel, allowed, bindings, TTL, APPROVAL_TTL).err();
         assert!(
             error.as_deref().unwrap_or_default().contains(why),
             "{error:?}"
         );
     }
 
-    let (bridge, channel) = bridge(&fx, &chat);
+    let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
     let refusals = [
         (
             ImMessage {
@@ -293,7 +326,7 @@ async fn a_revoked_chat_gets_no_result() {
     let llm = scripted();
     let fx = serve(dir.path(), llm.clone()).await;
     let chat = fx.chat(&unique("im")).await;
-    let (bridge, channel) = bridge(&fx, &chat);
+    let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
 
     let held = bridge.handle(message(1, "hold")).await;
     bridge.revoke(ME);
@@ -318,7 +351,7 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
     {
         let fx = serve(dir.path(), llm.clone()).await;
         let chat = fx.chat(&key).await;
-        let (bridge, channel) = bridge(&fx, &chat);
+        let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
         assert_eq!(
             delivered(bridge.handle(message(1, "before")).await).await,
             Delivery::Sent
@@ -360,7 +393,7 @@ async fn after_a_restart_a_redelivered_message_runs_nothing_again() {
     }
     let fx = restart(dir.path(), llm.clone()).await;
     let chat = BoundChat::verify(fx.profile.clone(), key.clone()).unwrap();
-    let (bridge, channel) = bridge(&fx, &chat);
+    let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
     let recorded = fx.entry.reconcile(&fx.profile).await;
     assert_eq!(recorded.len(), 1);
     assert_eq!(*recorded[0].2.as_ref().unwrap(), TurnRecord::Completed);
@@ -405,7 +438,15 @@ async fn a_deleted_chat_runs_nothing_more() {
     let channel = Arc::new(FakeChannel::default());
     let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
     let bindings = vec![binding(ME, ME, &first), binding(MINE, ME, &second)];
-    let bridge = ServeImBridge::new(turns, channel.clone(), vec![ME], bindings, TTL).unwrap();
+    let bridge = ServeImBridge::new(
+        turns,
+        channel.clone(),
+        vec![ME],
+        bindings,
+        TTL,
+        APPROVAL_TTL,
+    )
+    .unwrap();
     let in_chat = |chat, id, text| ImMessage {
         chat,
         ..message(id, text)
@@ -471,7 +512,7 @@ async fn a_stop_decision_lasts_while_its_stop_can_be_accepted() {
         let turns = ExternalTurns::new(fx.state.clone(), fx.ledger.clone(), fx.contracts.clone());
         let channel = Arc::new(FakeChannel::default());
         let bindings = vec![binding(chat, ME, target)];
-        ServeImBridge::new(turns, channel, vec![ME], bindings, ttl)
+        ServeImBridge::new(turns, channel, vec![ME], bindings, ttl, APPROVAL_TTL)
     };
     assert!(bridge(ME, &first, MAX_TTL + Duration::from_secs(1)).is_err());
     // On one profile: a bridge that accepts a message for a day, and one
@@ -510,4 +551,107 @@ async fn a_stop_decision_lasts_while_its_stop_can_be_accepted() {
     for message in [stop(MINE, 1, now), stop(MINE, 2, ahead)] {
         assert!(matches!(reopened.handle(message).await, Handled::Repeated));
     }
+}
+
+/// Start a held turn on `bridge`: its turn id, delivery task and owner
+/// connection (the approvals the tests raise belong to it).
+async fn held_turn(
+    bridge: &Arc<ServeImBridge>,
+    chat: &BoundChat,
+) -> (TurnId, tokio::task::JoinHandle<Delivery>, u64) {
+    let turn_id = turn_id_for(&binding(ME, ME, chat), 1);
+    let Handled::Started(delivery) = bridge.handle(message(1, "hold")).await else {
+        panic!("the turn did not start");
+    };
+    (
+        turn_id,
+        delivery,
+        bridge.turns.test_connection().connection_id().0,
+    )
+}
+
+/// The `at`-th projected approval's nonce (projections accumulate).
+async fn projected(channel: &FakeChannel, at: usize) -> String {
+    until_some("approval button projection", || {
+        let buttoned = channel.buttoned.lock().unwrap();
+        Some(buttoned.get(at)?.1[0].strip_prefix(CALLBACK_PREFIX)?[..16].to_owned())
+    })
+    .await
+}
+
+/// The first send/edit containing ANY needle; two needles cover racing
+/// terminal texts ("cancelled" from the interrupt, the sweep's other text).
+async fn sent_with(channel: &FakeChannel, needles: &[&str]) {
+    until_some(&format!("channel send/edit containing {needles:?}"), || {
+        let sent = channel.sent.lock().unwrap();
+        sent.iter().any(|(_, t, _)| needles.iter().any(|n| t.contains(n))).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn approval_buttons_decide_once_and_everything_stale_fails_closed() {
+    let (_dir, llm, fx, chat) = setup("im-approve").await;
+    let (bridge, channel) = bridge(&fx, &chat, APPROVAL_TTL);
+    let (turn_id, delivery, owner) = held_turn(&bridge, &chat).await;
+    let raise = |risk| {
+        raise_external_approval(&fx.contracts, &fx.ledger, chat.session_id(), &turn_id, owner, "shell", risk)
+    };
+    let approve = raise("low");
+    let nonce = projected(&channel, 0).await;
+    let mut wrong = im_press(ME, ImSender::Person(ME), &nonce, "a");
+    wrong.sender = ImSender::Person(SOMEONE);
+    bridge.handle_callback(wrong).await;
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), "deadbeefdeadbeef", "a")).await;
+    assert_eq!(channel.acked.lock().unwrap().as_slice(), [true, true]);
+    assert!(!approve.is_finished());
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
+    assert_eq!(approve.await.unwrap(), ToolApprovalDecision::Approve);
+    sent_with(&channel, &["Approved."]).await;
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
+    assert_eq!(channel.acked.lock().unwrap().len(), 4);
+    channel
+        .fail_ack
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let deny = raise("low");
+    let nonce = projected(&channel, 1).await;
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "d")).await;
+    assert_eq!(deny.await.unwrap(), ToolApprovalDecision::Deny);
+    sent_with(&channel, &["may not have gone through"]).await;
+    llm.release.add_permits(1);
+    assert_eq!(delivery.await.unwrap(), Delivery::Sent);
+}
+
+#[tokio::test]
+async fn expired_stopped_and_risky_approvals_are_fail_closed() {
+    let (_dir, llm, fx, chat) = setup("im-expire").await;
+    let (bridge, channel) = bridge(&fx, &chat, Duration::from_millis(20));
+    let (turn_id, delivery, owner) = held_turn(&bridge, &chat).await;
+    let raise = |turn_id, risk| {
+        raise_external_approval(&fx.contracts, &fx.ledger, chat.session_id(), turn_id, owner, "shell", risk)
+    };
+    let expired = raise(&turn_id, "low");
+    let nonce = projected(&channel, 0).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
+    sent_with(&channel, &["expired"]).await;
+    drop(expired);
+    llm.release.add_permits(1);
+    delivery.await.unwrap();
+    let turn_id = turn_id_for(&binding(ME, ME, &chat), 2);
+    let Handled::Started(_) = bridge.handle(message(2, "hold")).await else {
+        panic!("the turn did not start");
+    };
+    let risky = raise(&turn_id, "high");
+    sent_with(&channel, &["high-risk"]).await;
+    assert_eq!(channel.buttoned.lock().unwrap().len(), 1); // the expired one only
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), "deadbeefdeadbeef", "a")).await;
+    assert!(!risky.is_finished());
+    let stopped = raise(&turn_id, "low");
+    let nonce = projected(&channel, 1).await;
+    bridge.handle(message(3, "/stop")).await;
+    sent_with(&channel, &["no longer open", "was cancelled"]).await;
+    bridge.handle_callback(im_press(ME, ImSender::Person(ME), &nonce, "a")).await;
+    assert!(channel.acked.lock().unwrap().iter().all(|alert| *alert));
+    drop(stopped);
 }
