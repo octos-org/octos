@@ -21,6 +21,9 @@ TARGET=x86_64-unknown-linux-gnu      # your platform (see the release page)
 PREFIX=~/.octos/bin                  # install prefix from the original install
 STAGE=~/.octos/bundles/${TAG}        # staged new bundle, its own directory
 
+# The set -e above stops the recipe on any failed step; unset variables
+# would be caught by adding -u — both guards are deliberate.
+
 # 1. Download the new bundle and verify it against its SHA-256 sidecar.
 #    set -e above stops the whole recipe if either curl or sha256sum fails.
 mkdir -p "${STAGE}/payload"
@@ -56,8 +59,12 @@ backup it created, and restarts — data directories are not rewritten by the
 swap, so no data rollback is needed:
 
 ```bash
+# A fresh shell does not have these set — the commands below must abort
+# rather than touch the filesystem root if either is empty.
+: "${BACKUP:?set BACKUP to the dated backup dir printed by the upgrade}"
+: "${PREFIX:?set PREFIX to your install prefix}"
 sudo systemctl stop octos-serve
-cp -a "${BACKUP}/." "${PREFIX}/"   # the dated backup dir printed by the upgrade
+cp -a "${BACKUP}/." "${PREFIX}/"
 sudo systemctl start octos-serve
 ```
 
