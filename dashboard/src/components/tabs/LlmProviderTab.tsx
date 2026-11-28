@@ -9,6 +9,7 @@ import _PROVIDER_MODELS from '../../providers.json'
 
 const CUSTOM_FAMILY = '__custom_family__'
 const CUSTOM_MODEL = '__custom_model__'
+const CUSTOM_ROUTE = '__custom_route__'
 
 /** An API host that serves one or more models. Empty base_url = family default. */
 interface ModelEndpoint {
@@ -59,20 +60,22 @@ function findModelEntry(provider: string | null | undefined, modelId: string | n
   return matchedId ? models.find((m) => m.id === matchedId) : undefined
 }
 
-/** Find the endpoint in `model.endpoints` that matches (base_url, api_key_env). */
+/** A route ID is only a hint: edited hosts or credentials are custom routes. */
 function findMatchingEndpoint(
   model: ModelEntry | undefined,
   route: LlmRouteConfig | null | undefined,
+  provider: string | null | undefined,
 ): ModelEndpoint | undefined {
   if (!model?.endpoints) return undefined
+  const matches = (endpoint: ModelEndpoint) =>
+    (endpoint.base_url || '') === (route?.base_url || '') &&
+    (endpoint.api_key_env || getApiKeyEnvName(provider)) ===
+      (route?.api_key_env || getApiKeyEnvName(provider))
   if (route?.route_id) {
-    const byId = model.endpoints.find((e) => e.id === route.route_id)
+    const byId = model.endpoints.find((e) => e.id === route.route_id && matches(e))
     if (byId) return byId
   }
-  return model.endpoints.find((e) =>
-    (e.base_url || '') === (route?.base_url || '') &&
-    (!e.api_key_env || e.api_key_env === route?.api_key_env)
-  )
+  return model.endpoints.find(matches)
 }
 
 function getModelIds(provider: string, fetched?: Record<string, string[]>, baseUrl?: string | null): string[] {
@@ -139,10 +142,15 @@ function buildRouteForModel(
   provider: string | null | undefined,
   modelId: string | null | undefined,
   route: LlmRouteConfig | null | undefined,
+  previousModelId?: string | null,
 ): LlmRouteConfig {
   const model = findModelEntry(provider, modelId)
-  const matched = findMatchingEndpoint(model, route)
-  if (matched) return buildRouteFromEndpoint(provider, matched)
+  const previousEndpoint = findMatchingEndpoint(findModelEntry(provider, previousModelId), route, provider)
+  // Preserve custom routes and protocol overrides in full. Catalog routes must
+  // also belong to the new model; otherwise choose that model's default route.
+  if (route && (route.api_type || !previousEndpoint || findMatchingEndpoint(model, route, provider))) {
+    return { ...route }
+  }
   return buildRouteFromEndpoint(provider, model?.endpoints?.[0])
 }
 
@@ -153,7 +161,7 @@ function getRouteLabel(
 ): string {
   const model = findModelEntry(provider, modelId)
   return (
-    findMatchingEndpoint(model, route)?.label ||
+    findMatchingEndpoint(model, route, provider)?.label ||
     nullable(route?.label) ||
     'Official API'
   )
@@ -305,7 +313,7 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
       {
         ...primary,
         model_id: modelId,
-        route: buildRouteForModel(primaryProvider, modelId, null),
+        route: buildRouteForModel(primaryProvider, modelId, primary.route, primaryModel),
       },
       fallbacks,
     )
@@ -392,17 +400,9 @@ export default function LlmProviderTab({ config, onChange, profileId }: Props) {
   const changeFallbackModel = (idx: number, modelId: string) => {
     const fb = fallbacks[idx]
     if (!fb) return
-    const nextRoute = buildRouteForModel(fb.family_id, modelId, null)
-    const envName = nextRoute.api_key_env || getFallbackEnvName(fb.family_id || '', idx, fallbacks, primaryEnv)
     updateFallback(idx, {
       model_id: modelId,
-      route: {
-        route_id: nextRoute.route_id,
-        label: nextRoute.label,
-        api_key_env: envName,
-        base_url: nextRoute.base_url,
-        api_type: null,
-      },
+      route: buildRouteForModel(fb.family_id, modelId, fb.route, fb.model_id),
     })
   }
 
@@ -795,8 +795,9 @@ function EndpointSelect({ provider, modelId, route, onRouteChange }: {
   const list = model?.endpoints ?? []
   if (list.length === 0) return null
 
-  const matched = findMatchingEndpoint(model, route)
-  const value = matched?.id ?? list[0]?.id ?? ''
+  const matched = findMatchingEndpoint(model, route, provider)
+  const isCustom = !!route && !matched
+  const value = isCustom ? CUSTOM_ROUTE : matched?.id ?? list[0]?.id ?? ''
 
   return (
     <div className="space-y-3">
@@ -806,6 +807,11 @@ function EndpointSelect({ provider, modelId, route, onRouteChange }: {
           onChange={(e) => onRouteChange(e.target.value)}
           className="input"
         >
+          {isCustom && (
+            <option value={CUSTOM_ROUTE} disabled>
+              Custom: {route.label || 'API route'}{route.base_url ? ` — ${route.base_url}` : ''}
+            </option>
+          )}
           {list.map((ep) => (
             <option key={ep.id} value={ep.id}>
               {ep.label}{ep.base_url ? ` — ${ep.base_url}` : ''}
